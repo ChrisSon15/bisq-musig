@@ -170,6 +170,21 @@ pub struct ContractualTxids {
     pub sellers_redirect: Txid,
 }
 
+macro_rules! access {
+    ($name:ident, $pattern:pat $(if $guard:expr)?) => {
+        {
+            use ClosureType::*;
+            use TradeState::*;
+            #[expect(path_statements, reason="HACK to prevent `unused_imports` warning")]
+            Cooperative;
+            match $name.state {
+                $pattern $(if $guard)? => Ok(()),
+                _ => Err(ProtocolErrorKind::AccessDenied)
+            }
+        }
+    };
+}
+
 impl TradeModel {
     pub fn new(trade_id: String, my_role: Role) -> Self {
         let mut trade_model = Self { trade_id, my_role, ..Default::default() };
@@ -267,11 +282,12 @@ impl TradeModel {
         Ok(())
     }
 
-    pub fn get_my_key_shares(&self) -> Option<ExchangedKeys<'_, ByRef>> {
-        Some(ExchangedKeys {
-            buyer_payout: self.keys.buyer_payout_ctx.my_key_share().ok()?.pub_key(),
-            seller_payout: self.keys.seller_payout_ctx.my_key_share().ok()?.pub_key(),
-            multisig_script: self.keys.my_multisig_script_key.as_ref()?,
+    pub fn my_key_shares(&self) -> Result<ExchangedKeys<'_, ByRef>> {
+        Ok(ExchangedKeys {
+            buyer_payout: self.keys.buyer_payout_ctx.my_key_share()?.pub_key(),
+            seller_payout: self.keys.seller_payout_ctx.my_key_share()?.pub_key(),
+            multisig_script: self.keys.my_multisig_script_key.as_ref()
+                .ok_or(ProtocolErrorKind::MissingScriptKey)?,
         })
     }
 
@@ -344,12 +360,12 @@ impl TradeModel {
         Ok(())
     }
 
-    pub fn get_my_addresses(&self) -> Option<ExchangedAddresses<'_, ByRef>> {
+    pub fn my_addresses(&self) -> Result<ExchangedAddresses<'_, ByRef>> {
         let my_txs = if self.am_buyer() { &self.buyer_txs } else { &self.seller_txs };
-        Some(ExchangedAddresses {
-            warning_tx_fee_bump: my_txs.warning.builder.anchor_address().ok()?,
-            redirect_tx_fee_bump: my_txs.redirect.builder.anchor_address().ok()?,
-            claim_tx_payout: my_txs.claim.builder.payout_address().ok()?,
+        Ok(ExchangedAddresses {
+            warning_tx_fee_bump: my_txs.warning.builder.anchor_address()?,
+            redirect_tx_fee_bump: my_txs.redirect.builder.anchor_address()?,
+            claim_tx_payout: my_txs.claim.builder.payout_address()?,
         })
     }
 
@@ -371,12 +387,12 @@ impl TradeModel {
         Ok(())
     }
 
-    pub fn get_my_half_deposit_psbt(&self) -> Option<&Psbt> {
-        if self.am_buyer() {
-            self.deposit_tx.builder.buyers_half_psbt().ok()
+    pub fn my_half_deposit_psbt(&self) -> Result<&Psbt> {
+        Ok(if self.am_buyer() {
+            self.deposit_tx.builder.buyers_half_psbt()?
         } else {
-            self.deposit_tx.builder.sellers_half_psbt().ok()
-        }
+            self.deposit_tx.builder.sellers_half_psbt()?
+        })
     }
 
     pub fn set_peer_half_deposit_psbt(&mut self, half_deposit_psbt: Psbt) {
@@ -473,26 +489,26 @@ impl TradeModel {
         Ok(())
     }
 
-    pub fn get_my_nonce_shares(&self) -> Option<ExchangedNonces<'_, ByRef>> {
-        Some(ExchangedNonces {
+    pub fn my_nonce_shares(&self) -> Result<ExchangedNonces<'_, ByRef>> {
+        Ok(ExchangedNonces {
             swap_tx_input:
-            self.swap_tx.input_sig_ctx.my_nonce_share().ok()?,
+            self.swap_tx.input_sig_ctx.my_nonce_share()?,
             buyers_warning_tx_buyer_input:
-            self.buyer_txs.warning.buyer_input_sig_ctx.my_nonce_share().ok()?,
+            self.buyer_txs.warning.buyer_input_sig_ctx.my_nonce_share()?,
             buyers_warning_tx_seller_input:
-            self.buyer_txs.warning.seller_input_sig_ctx.my_nonce_share().ok()?,
+            self.buyer_txs.warning.seller_input_sig_ctx.my_nonce_share()?,
             sellers_warning_tx_buyer_input:
-            self.seller_txs.warning.buyer_input_sig_ctx.my_nonce_share().ok()?,
+            self.seller_txs.warning.buyer_input_sig_ctx.my_nonce_share()?,
             sellers_warning_tx_seller_input:
-            self.seller_txs.warning.seller_input_sig_ctx.my_nonce_share().ok()?,
+            self.seller_txs.warning.seller_input_sig_ctx.my_nonce_share()?,
             buyers_redirect_tx_input:
-            self.buyer_txs.redirect.input_sig_ctx.my_nonce_share().ok()?,
+            self.buyer_txs.redirect.input_sig_ctx.my_nonce_share()?,
             sellers_redirect_tx_input:
-            self.seller_txs.redirect.input_sig_ctx.my_nonce_share().ok()?,
+            self.seller_txs.redirect.input_sig_ctx.my_nonce_share()?,
             buyers_claim_tx_input:
-            self.buyer_txs.claim.input_sig_ctx.my_nonce_share().ok()?,
+            self.buyer_txs.claim.input_sig_ctx.my_nonce_share()?,
             sellers_claim_tx_input:
-            self.seller_txs.claim.input_sig_ctx.my_nonce_share().ok()?,
+            self.seller_txs.claim.input_sig_ctx.my_nonce_share()?,
         })
     }
 
@@ -556,20 +572,20 @@ impl TradeModel {
         Ok(())
     }
 
-    pub fn get_my_partial_signatures_on_peer_txs(&self) -> Option<ExchangedSigs<'_, ByRef>> {
+    pub fn my_partial_signatures_on_peer_txs(&self) -> Result<ExchangedSigs<'_, ByRef>> {
         let peer_txs = if self.am_buyer() { &self.seller_txs } else { &self.buyer_txs };
         let ready_to_release = self.state == TradeState::BuyerReadyToRelease || !self.am_buyer();
         let contractual_txids_needed = self.state == TradeState::Init;
 
-        Some(ExchangedSigs {
+        Ok(ExchangedSigs {
             peers_warning_tx_buyer_input_partial_signature:
-            peer_txs.warning.buyer_input_sig_ctx.my_partial_sig().ok()?,
+            peer_txs.warning.buyer_input_sig_ctx.my_partial_sig()?,
             peers_warning_tx_seller_input_partial_signature:
-            peer_txs.warning.seller_input_sig_ctx.my_partial_sig().ok()?,
+            peer_txs.warning.seller_input_sig_ctx.my_partial_sig()?,
             peers_redirect_tx_input_partial_signature:
-            peer_txs.redirect.input_sig_ctx.my_partial_sig().ok()?,
+            peer_txs.redirect.input_sig_ctx.my_partial_sig()?,
             peers_claim_tx_input_partial_signature:
-            peer_txs.claim.input_sig_ctx.my_partial_sig().ok()?,
+            peer_txs.claim.input_sig_ctx.my_partial_sig()?,
             swap_tx_input_partial_signature:
             self.swap_tx.input_sig_ctx.my_partial_sig().ok().filter(|_| ready_to_release),
             swap_tx_input_sighash:
@@ -645,8 +661,9 @@ impl TradeModel {
         self.update_state(TradeState::Deposit)
     }
 
-    pub fn get_deposit_psbt(&self) -> Option<&Psbt> {
-        self.deposit_tx.builder.psbt().ok().filter(|_| self.state >= TradeState::Deposit)
+    pub fn deposit_psbt(&self) -> Result<&Psbt> {
+        access!(self, _ if self.state >= Deposit)?;
+        Ok(self.deposit_tx.builder.psbt()?)
     }
 
     pub fn combine_deposit_psbts(&mut self, other: Psbt) -> Result<()> {
@@ -654,8 +671,9 @@ impl TradeModel {
         Ok(())
     }
 
-    pub fn get_signed_deposit_tx(&self) -> Option<Transaction> {
-        self.deposit_tx.builder.signed_tx().ok().filter(|_| self.state >= TradeState::Deposit)
+    pub fn signed_deposit_tx(&self) -> Result<Transaction> {
+        access!(self, _ if self.state >= Deposit)?;
+        Ok(self.deposit_tx.builder.signed_tx()?)
     }
 
     pub fn set_swap_tx_input_peers_partial_signature(&mut self, sig: PartialSignature) {
@@ -667,10 +685,13 @@ impl TradeModel {
         Ok(())
     }
 
-    pub fn get_my_private_key_share_for_peer_output(&self) -> Option<&Scalar> {
-        self.keys.peers_payout_ctx().my_key_share().ok()?.prv_key().ok().filter(|_|
-            matches!(self.state, TradeState::SellerReadyToRelease |
-                TradeState::TradeClosed(ClosureType::Forced | ClosureType::Cooperative)))
+    pub fn my_private_key_share_for_peer_output(&self) -> Result<&Scalar> {
+        // TODO: Consider changing the `Musig` gRPC API not to reveal our key share for the peer's
+        //  output if the trade was force-closed (at least if we're the buyer), since otherwise that
+        //  is a belated cooperative closure, but `CustomPayoutSigned -> TradeClosed(Cooperative)`
+        //  is not a legal state transition for the buyer. Then we could tighten access here.
+        access!(self, SellerReadyToRelease | TradeClosed(Forced | Cooperative))?;
+        Ok(self.keys.peers_payout_ctx().my_key_share()?.prv_key()?)
     }
 
     pub fn set_peer_private_key_share_for_my_output(&mut self, prv_key_share: Scalar) -> Result<()> {
@@ -690,12 +711,13 @@ impl TradeModel {
         Ok(())
     }
 
-    pub fn get_signed_swap_tx(&self) -> Option<&Transaction> {
+    pub fn signed_swap_tx(&self) -> Result<&Transaction> {
         // TODO: Consider changing the `Musig` gRPC API not to reveal the signed Swap Tx until the
-        //  trade has actually been force closed, instead of when the seller is ready to release.
-        //  Then we could filter more strictly here.
-        self.swap_tx.builder.signed_tx().ok().filter(|_| matches!(self.state,
-            TradeState::SellerReadyToRelease | TradeState::TradeClosed(ClosureType::Forced)))
+        //  trade has actually been force-closed, instead of when the seller is ready to release.
+        //  (We don't want the buyer to be able to broadcast the Swap Tx under the seller's feet if
+        //  he didn't intend to force-close it.) Then we could tighten access here.
+        access!(self, SellerReadyToRelease | TradeClosed(Forced))?;
+        Ok(self.swap_tx.builder.signed_tx()?)
     }
 
     pub fn recover_seller_private_key_share_for_buyer_output(&mut self, swap_tx: &Transaction) -> Result<()> {
@@ -762,9 +784,9 @@ impl TradeModel {
         self.update_state(TradeState::CustomPayoutSigned)
     }
 
-    pub fn get_custom_payout_psbt(&self) -> Option<&Psbt> {
-        self.custom_payout_tx.builder.psbt().ok().filter(|_| matches!(self.state,
-            TradeState::CustomPayoutSigned | TradeState::TradeClosed(ClosureType::Custom)))
+    pub fn custom_payout_psbt(&self) -> Result<&Psbt> {
+        access!(self, CustomPayoutSigned | TradeClosed(Custom))?;
+        Ok(self.custom_payout_tx.builder.psbt()?)
     }
 
     pub fn combine_custom_payout_psbts(&mut self, other: Psbt) -> Result<()> {
@@ -772,9 +794,9 @@ impl TradeModel {
         Ok(())
     }
 
-    pub fn get_signed_custom_payout_tx(&self) -> Option<Transaction> {
-        self.custom_payout_tx.builder.signed_tx().ok().filter(|_| matches!(self.state,
-            TradeState::CustomPayoutSigned | TradeState::TradeClosed(ClosureType::Custom)))
+    pub fn signed_custom_payout_tx(&self) -> Result<Transaction> {
+        access!(self, CustomPayoutSigned | TradeClosed(Custom))?;
+        Ok(self.custom_payout_tx.builder.signed_tx()?)
     }
 }
 
@@ -827,6 +849,8 @@ pub enum ProtocolErrorKind {
     MissingTradeWallet,
     #[error("missing script key")]
     MissingScriptKey,
+    #[error("access denied")]
+    AccessDenied,
     #[error("illegal state transition for {role:?}: {old_state} -> {new_state}")]
     IllegalStateTransition { role: Role, old_state: TradeState, new_state: TradeState },
     #[error("insufficient redirection funds (available {available_msat} msat, used {used_msat} msat)")]

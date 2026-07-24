@@ -42,8 +42,7 @@ impl musig_server::Musig for MusigImpl {
         handle_request(request, move |request| {
             let mut trade_model = TradeModel::new(request.trade_id, request.my_role.try_proto_into()?);
             trade_model.init_my_key_shares()?;
-            let my_key_shares = trade_model.get_my_key_shares()
-                .ok_or_else(|| Status::internal("missing key shares"))?;
+            let my_key_shares = trade_model.my_key_shares()?;
             let response = PubKeySharesResponse {
                 buyer_output_pub_key_share: my_key_shares.buyer_payout.serialize().into(),
                 seller_output_pub_key_share: my_key_shares.seller_payout.serialize().into(),
@@ -82,12 +81,9 @@ impl musig_server::Musig for MusigImpl {
 
             let redirection_amount_msat = trade_model.redirection_amount_msat()?
                 .check_in_signed_range()?;
-            let my_addresses = trade_model.get_my_addresses()
-                .ok_or_else(|| Status::internal("missing addresses"))?;
-            let my_half_deposit_psbt = trade_model.get_my_half_deposit_psbt()
-                .ok_or_else(|| Status::internal("missing half deposit PSBT"))?;
-            let my_nonce_shares = trade_model.get_my_nonce_shares()
-                .ok_or_else(|| Status::internal("missing nonce shares"))?;
+            let my_addresses = trade_model.my_addresses()?;
+            let my_half_deposit_psbt = trade_model.my_half_deposit_psbt()?;
+            let my_nonce_shares = trade_model.my_nonce_shares()?;
 
             Ok(NonceSharesMessage {
                 half_deposit_psbt: my_half_deposit_psbt.serialize(),
@@ -116,8 +112,7 @@ impl musig_server::Musig for MusigImpl {
                 trade_model.aggregate_nonce_shares()?;
                 trade_model.sign_partial()?;
             }
-            let my_partial_signatures = trade_model.get_my_partial_signatures_on_peer_txs()
-                .ok_or_else(|| Status::internal("missing partial signatures"))?;
+            let my_partial_signatures = trade_model.my_partial_signatures_on_peer_txs()?;
 
             Ok(my_partial_signatures.into())
         })
@@ -137,8 +132,7 @@ impl musig_server::Musig for MusigImpl {
             trade_model.aggregate_partial_signatures()?;
             trade_model.compute_my_signed_prepared_txs()?;
             trade_model.sign_deposit_psbt()?;
-            let deposit_psbt = trade_model.get_deposit_psbt()
-                .ok_or_else(|| Status::internal("missing deposit PSBT"))?;
+            let deposit_psbt = trade_model.deposit_psbt()?;
 
             Ok(DepositPsbt { deposit_psbt: deposit_psbt.serialize() })
         })
@@ -152,8 +146,7 @@ impl musig_server::Musig for MusigImpl {
             let peers_deposit_psbt = request.peers_deposit_psbt
                 .ok_or_else(|| Status::not_found("missing request.peers_deposit_psbt"))?;
             trade_model.combine_deposit_psbts(peers_deposit_psbt.deposit_psbt.try_proto_into()?)?;
-            let deposit_tx = trade_model.get_signed_deposit_tx()
-                .ok_or_else(|| Status::internal("missing signed deposit tx"))?;
+            let deposit_tx = trade_model.signed_deposit_tx()?;
 
             info!("*** BROADCAST DEPOSIT TX ***"); // TODO: Implement broadcast.
 
@@ -181,10 +174,8 @@ impl musig_server::Musig for MusigImpl {
             }
             if request.seller_ready_to_release {
                 trade_model.set_seller_ready_to_release()?;
-                let swap_tx = trade_model.get_signed_swap_tx()
-                    .ok_or_else(|| Status::internal("missing signed swap tx"))?;
-                let prv_key_share = trade_model.get_my_private_key_share_for_peer_output()
-                    .ok_or_else(|| Status::internal("missing private key share"))?;
+                let swap_tx = trade_model.signed_swap_tx()?;
+                let prv_key_share = trade_model.my_private_key_share_for_peer_output()?;
 
                 Ok(SwapTxSignatureResponse {
                     swap_tx: consensus::serialize(swap_tx),
@@ -219,13 +210,11 @@ impl musig_server::Musig for MusigImpl {
             } else {
                 // Peer unresponsive -- force-close our trade by publishing the swap tx. For seller only.
                 trade_model.close_trade(ClosureType::Forced)?;
-                trade_model.get_signed_swap_tx()
-                    .ok_or_else(|| Status::internal("missing signed swap tx"))?;
+                trade_model.signed_swap_tx()?;
 
                 info!("*** BROADCAST SWAP TX ***"); // TODO: Implement broadcast.
             }
-            let my_prv_key_share = trade_model.get_my_private_key_share_for_peer_output()
-                .ok_or_else(|| Status::internal("missing private key share"))?;
+            let my_prv_key_share = trade_model.my_private_key_share_for_peer_output()?;
 
             Ok(CloseTradeResponse { peer_output_prv_key_share: my_prv_key_share.serialize().into() })
         })
@@ -240,8 +229,7 @@ impl musig_server::Musig for MusigImpl {
                 FeeRate::from_sat_per_kwu(request.fee_rate.check_in_signed_range()?));
             trade_model.compute_custom_payout_tx()?;
             trade_model.sign_custom_payout_psbt()?;
-            let psbt = trade_model.get_custom_payout_psbt()
-                .ok_or_else(|| Status::internal("missing custom payout PSBT"))?;
+            let psbt = trade_model.custom_payout_psbt()?;
 
             Ok(CustomPayoutPsbt {
                 psbt: psbt.serialize(),
@@ -260,8 +248,7 @@ impl musig_server::Musig for MusigImpl {
             // Sign custom payout PSBT again to finalize it:
             trade_model.sign_custom_payout_psbt()?;
             trade_model.close_trade(ClosureType::Custom)?;
-            let custom_payout_tx = trade_model.get_signed_custom_payout_tx()
-                .ok_or_else(|| Status::internal("missing signed custom payout tx"))?;
+            let custom_payout_tx = trade_model.signed_custom_payout_tx()?;
 
             info!("*** BROADCAST CUSTOM PAYOUT TX ***"); // TODO: Implement broadcast.
 
