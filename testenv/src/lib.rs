@@ -18,7 +18,7 @@ use bdk_wallet::bitcoin::{Address, Amount, BlockHash, Network, Transaction, Txid
 use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse};
 use bdk_wallet::{PersistedWallet, serde_json};
 use bmp_tracing::tracing;
-use chain::{ChainApi, ChainFunding, ChainScanner};
+use chain::{ChainApi, ChainScanner};
 use electrsd::corepc_node::Node;
 use electrsd::electrum_client::{Client, ElectrumApi};
 use electrsd::{ElectrsD, corepc_node};
@@ -679,16 +679,6 @@ impl Testchain {
 impl ChainApi for Testchain {
     fn transaction_broadcast(&self, tx: &Transaction) -> Result<Txid> {
         broadcast_via(&self.client, tx)
-    }
-}
-
-impl ChainFunding for Testchain {
-    fn send_to_address(&self, _address: &Address, _amount: Amount) -> Result<()> {
-        anyhow::bail!("send_to_address is not implemented for Testchain")
-    }
-
-    fn generate_to_address(&self, _blocks: u32, _address: &Address) -> Result<()> {
-        anyhow::bail!("generate_to_address is not implemented for Testchain")
     }
 }
 

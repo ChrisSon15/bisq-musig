@@ -6,7 +6,7 @@ use bdk_kyoto::{
     BuilderExt as _, Info, Receiver, ScanType, TrustedPeer, UnboundedReceiver, Update, Warning,
 };
 use bdk_wallet::Wallet;
-use bdk_wallet::bitcoin::{Address, Amount, Transaction, Txid};
+use bdk_wallet::bitcoin::{Transaction, Txid};
 use bdk_wallet::chain::DescriptorId;
 use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse};
 use tokio::select;
@@ -14,12 +14,6 @@ use tokio::select;
 pub trait ChainApi: Send + Sync {
     fn transaction_broadcast(&self, tx: &Transaction) -> anyhow::Result<Txid>;
 }
-/// Optional funding helpers used by the wallet test bootstrap path.
-pub trait ChainFunding: Send + Sync {
-    fn send_to_address(&self, address: &Address, amount: Amount) -> anyhow::Result<()>;
-    fn generate_to_address(&self, blocks: u32, address: &Address) -> anyhow::Result<()>;
-}
-
 /// Abstraction over the read-side of a chain backend: pre-populating a transaction cache and
 /// performing a full keychain scan. Wallet-level sync routines compose these primitives instead
 /// of taking a hard dependency on a specific chain client (e.g. `BdkElectrumClient`).

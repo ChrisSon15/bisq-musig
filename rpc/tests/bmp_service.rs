@@ -15,19 +15,17 @@
 //!   ```
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client as BitcoinCoreClient};
 use bdk_electrum::BdkElectrumClient;
 use bdk_electrum::electrum_client::Client as ElectrumClient;
-use bdk_wallet::bitcoin::{Address, Amount};
-use chain::ChainFunding;
+use bdk_wallet::bitcoin::Amount;
 use protocol::protocol_musig_adaptor::{BMPContext, BMPProtocol, ProtocolRole, Round1Parameter};
-use rpc::bmp_wallet_service::BmpWalletServiceImpl;
 use rpc::pb::bmp_protocol::bmp_protocol_service_server::{
     BmpProtocolService, BmpProtocolServiceServer,
 };
 use rpc::pb::bmp_protocol::{self, InitializeRequest, InitializeResponse, Role};
-use rpc::pb::bmp_wallet::wallet_server::WalletServer as BmpWalletServer;
 use rpc::pb::convert::TryProtoInto as _;
 use rpc::server::{MusigImpl, MusigServer, WalletImpl, WalletServer};
 use rpc::wallet::WalletServiceImpl;
@@ -39,36 +37,43 @@ use tonic::{Request, Response, Result, Status, transport};
 use tracing::info;
 use wallet::protocol_wallet_api::MemWallet;
 
-struct BitcoinCoreChainApi {
-    client: Arc<BitcoinCoreClient>,
-}
+/// Create a fresh in-memory wallet, fund it from the given bitcoind RPC client, and sync until
+/// the funds confirm. Previously abstracted behind the `chain::ChainFunding` trait; inlined here
+/// as this integration test is its only caller.
+fn funded_mem_wallet(
+    client: BdkElectrumClient<ElectrumClient>,
+    rpc: &BitcoinCoreClient,
+) -> anyhow::Result<MemWallet> {
+    use bdk_bitcoind_rpc::bitcoincore_rpc::RpcApi as _;
 
-impl ChainFunding for BitcoinCoreChainApi {
-    fn send_to_address(&self, address: &Address, amount: Amount) -> anyhow::Result<()> {
-        bdk_bitcoind_rpc::bitcoincore_rpc::RpcApi::send_to_address(
-            self.client.as_ref(),
-            address,
-            amount,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .map(|_| ())
-        .map_err(Into::into)
-    }
+    const MAX_RETRIES: u32 = 20;
+    const RETRY_DELAY_MS: u64 = 500;
 
-    fn generate_to_address(&self, blocks: u32, address: &Address) -> anyhow::Result<()> {
-        bdk_bitcoind_rpc::bitcoincore_rpc::RpcApi::generate_to_address(
-            self.client.as_ref(),
-            blocks.into(),
-            address,
-        )
-        .map(|_| ())
-        .map_err(Into::into)
+    let mut wallet = MemWallet::new(client)?;
+    let address = wallet.reveal_next_address();
+    rpc.send_to_address(
+        &address,
+        Amount::from_btc(10f64).unwrap(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?;
+    rpc.generate_to_address(1, &address)?;
+
+    for attempt in 0..MAX_RETRIES {
+        wallet.sync()?;
+        if wallet.balance() > Amount::from_sat(0) {
+            info!("Wallet funded after {attempt} retries");
+            return Ok(wallet);
+        }
+        if attempt < MAX_RETRIES - 1 {
+            std::thread::sleep(Duration::from_millis(RETRY_DELAY_MS));
+        }
     }
+    anyhow::bail!("Wallet failed to sync funded balance after {MAX_RETRIES} attempts")
 }
 
 pub struct BmpServiceImpl {
@@ -100,10 +105,7 @@ impl BmpProtocolService for BmpServiceImpl {
         let client = BdkElectrumClient::new(ElectrumClient::new(&self.electrum_url).unwrap());
         let client2 = BdkElectrumClient::new(ElectrumClient::new(&self.electrum_url).unwrap());
 
-        let chain_api = BitcoinCoreChainApi {
-            client: self.bitcoin_rpc_client.clone(),
-        };
-        let mock_wallet = MemWallet::funded_wallet_from_rpc(&chain_api, client)
+        let mock_wallet = funded_mem_wallet(client, self.bitcoin_rpc_client.as_ref())
             .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
 
         info!(
@@ -274,7 +276,6 @@ fn spawn_musigd(
         .spawn_connection(client.clone());
 
     let bmp_protocol_impl = BmpServiceImpl::new(client, electrum_url);
-    let bmp_wallet_service = BmpWalletServiceImpl::default();
 
     let incoming = TcpIncoming::from(listener);
     let handle = task::spawn(async move {
@@ -282,7 +283,6 @@ fn spawn_musigd(
             .add_service(MusigServer::new(musig))
             .add_service(WalletServer::new(wallet))
             .add_service(BmpProtocolServiceServer::new(bmp_protocol_impl))
-            .add_service(BmpWalletServer::new(bmp_wallet_service))
             .serve_with_incoming(incoming)
             .await
     });

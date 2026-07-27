@@ -1,7 +1,6 @@
 use std::io::Write as _;
 use std::mem;
 use std::sync::LazyLock;
-use std::time::Duration;
 
 use bdk_electrum::BdkElectrumClient;
 use bdk_electrum::bdk_core::bitcoin::bip32::Xpriv;
@@ -135,34 +134,6 @@ impl MemWallet {
 
     pub fn next_unused_address(&mut self) -> AddressInfo {
         self.wallet.next_unused_address(KeychainKind::External)
-    }
-
-    pub fn funded_wallet_from_rpc<R>(
-        rpc: &R,
-        client: BdkElectrumClient<Client>,
-    ) -> anyhow::Result<Self>
-    where
-        R: chain::ChainFunding,
-    {
-        const MAX_RETRIES: u32 = 20;
-        const RETRY_DELAY_MS: u64 = 500;
-
-        let mut wallet = Self::new(client)?;
-        let address = wallet.reveal_next_address();
-        rpc.send_to_address(&address, Amount::from_btc(10f64).unwrap())?;
-        rpc.generate_to_address(1, &address)?;
-
-        for attempt in 0..MAX_RETRIES {
-            wallet.sync()?;
-            if wallet.balance() > Amount::from_sat(0) {
-                tracing::info!("Wallet funded after {} retries", attempt);
-                return Ok(wallet);
-            }
-            if attempt < MAX_RETRIES - 1 {
-                std::thread::sleep(Duration::from_millis(RETRY_DELAY_MS));
-            }
-        }
-        anyhow::bail!("Wallet failed to sync funded balance after {MAX_RETRIES} attempts")
     }
 }
 

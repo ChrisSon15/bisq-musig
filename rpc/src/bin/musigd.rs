@@ -4,8 +4,6 @@ use std::sync::Arc;
 use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client as BitcoinCoreClient};
 use bmp_tracing::tracing::info;
 use clap::Parser;
-use rpc::bmp_wallet_service::BmpWalletServiceImpl;
-use rpc::pb::bmp_wallet::wallet_server::WalletServer as BmpWalletServer;
 use rpc::server::{MusigImpl, MusigServer, WalletImpl, WalletServer};
 use rpc::wallet::WalletServiceImpl;
 use tonic::transport::Server;
@@ -52,13 +50,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     wallet.wallet_service.clone().spawn_connection(Arc::new(rpc_client));
 
-    let bmp_wallet_service = BmpWalletServiceImpl::default();
-
     info!(port = cli.port, "Starting gRPC server.");
     Server::builder()
         .add_service(MusigServer::new(musig))
         .add_service(WalletServer::new(wallet))
-        .add_service(BmpWalletServer::new(bmp_wallet_service))
         .serve(addr)
         .await?;
 

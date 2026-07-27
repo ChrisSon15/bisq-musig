@@ -89,7 +89,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "src/main/proto/rpc.proto",
                 "src/main/proto/wallet.proto",
                 "src/main/proto/bmp_protocol.proto",
-                "src/main/proto/bmp_wallet.proto",
             ],
             &["src/main/proto"],
         )?;
