@@ -28,10 +28,11 @@ public class TradeProtocolClient {
         try {
             var client = new TradeProtocolClient(channel);
             client.testMusigService_twoParties(0, TradeType.TAKER_IS_BUYER, ClosureType.COOPERATIVE);
-            client.testMusigService_twoParties(1, TradeType.TAKER_IS_BUYER, ClosureType.UNCOOPERATIVE);
+            client.testMusigService_twoParties(1, TradeType.TAKER_IS_BUYER, ClosureType.FORCED);
             client.testMusigService_twoParties(2, TradeType.TAKER_IS_SELLER, ClosureType.COOPERATIVE);
-            client.testMusigService_twoParties(3, TradeType.TAKER_IS_SELLER, ClosureType.UNCOOPERATIVE);
+            client.testMusigService_twoParties(3, TradeType.TAKER_IS_SELLER, ClosureType.FORCED);
             client.testMusigService_twoParties(4, TradeType.TAKER_IS_BUYER, ClosureType.MEDIATED);
+            client.testMusigService_twoParties(5, TradeType.TAKER_IS_BUYER, ClosureType.FORCED_AFTER_MEDIATION);
         } finally {
             channel.shutdown();
         }
@@ -41,11 +42,8 @@ public class TradeProtocolClient {
         TAKER_IS_BUYER, TAKER_IS_SELLER
     }
 
-    /**
-     * Clean (unmediated) closure types.
-     **/
     private enum ClosureType {
-        COOPERATIVE, UNCOOPERATIVE, MEDIATED
+        COOPERATIVE, FORCED, MEDIATED, FORCED_AFTER_MEDIATION
     }
 
     private void testMusigService_twoParties(int tradeNum, TradeType tradeType, ClosureType closureType) {
@@ -316,8 +314,22 @@ public class TradeProtocolClient {
                     .build());
             System.out.println("Got reply: " + sellersCloseTradeResponse);
             // ***************************
-        } else if (closureType == ClosureType.UNCOOPERATIVE) {
+        } else if (closureType == ClosureType.FORCED | closureType == ClosureType.FORCED_AFTER_MEDIATION) {
             // Seller attempts to send Message F to buyer, then waits...
+
+            if (closureType == ClosureType.FORCED_AFTER_MEDIATION) {
+                // Meanwhile, buyer accepts solution from mediator (fiat received, 50% seller security deposit penalty).
+
+                var buyersCustomPayoutPsbt = stub.signCustomPayoutTx(CustomPayoutPsbtRequest.newBuilder()
+                        .setTradeId(buyerTradeId)
+                        .setSellersPayoutAmountExcludingFee(15_000)
+                        .setFeeRate(3_750) // 15.0 sats per vbyte
+                        .build());
+                System.out.println("Got reply: " + buyersCustomPayoutPsbt);
+
+                // Buyer sends Custom Payout PSBT to seller, who cannot use it since he is already committed to a
+                // non-mediated closure, through his second call to 'SignSwapTx' with the ready-to-release flag set.
+            }
 
             // Seller never gets expected Message G from buyer -- gives up waiting.
 
