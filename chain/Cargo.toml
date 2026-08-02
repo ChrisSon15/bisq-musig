@@ -5,11 +5,10 @@ edition = "2024"
 
 [dependencies]
 anyhow = { workspace = true }
+bdk_kyoto = { workspace = true }
 bdk_wallet = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-bdk_kyoto = { workspace = true }
-
 
 [lints]
 workspace = true
