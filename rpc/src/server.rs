@@ -173,20 +173,16 @@ impl musig_server::Musig for MusigImpl {
                 return Err(Status::failed_precondition("operation only available for seller"));
             }
             if request.seller_ready_to_release {
+                trade_model.compute_signed_swap_tx()?;
                 trade_model.set_seller_ready_to_release()?;
-                let swap_tx = trade_model.signed_swap_tx()?;
                 let prv_key_share = trade_model.my_private_key_share_for_peer_output()?;
 
-                Ok(SwapTxSignatureResponse {
-                    swap_tx: consensus::serialize(swap_tx),
-                    peer_output_prv_key_share: prv_key_share.serialize().into(),
-                })
+                Ok(SwapTxSignatureResponse { peer_output_prv_key_share: Some(prv_key_share.serialize().into()) })
             } else {
                 trade_model.set_swap_tx_input_peers_partial_signature(
                     request.swap_tx_input_peers_partial_signature.try_proto_into()?);
                 trade_model.aggregate_swap_tx_partial_signatures()?;
                 trade_model.set_buyer_ready_to_release()?;
-                trade_model.compute_signed_swap_tx()?;
 
                 Ok(SwapTxSignatureResponse::default())
             }
@@ -214,9 +210,13 @@ impl musig_server::Musig for MusigImpl {
 
                 info!("*** BROADCAST SWAP TX ***"); // TODO: Implement broadcast.
             }
-            let my_prv_key_share = trade_model.my_private_key_share_for_peer_output()?;
+            let my_prv_key_share = trade_model.my_private_key_share_for_peer_output().ok();
+            let swap_tx = trade_model.signed_swap_tx().ok();
 
-            Ok(CloseTradeResponse { peer_output_prv_key_share: my_prv_key_share.serialize().into() })
+            Ok(CloseTradeResponse {
+                peer_output_prv_key_share: my_prv_key_share.map(|s| s.serialize().into()),
+                swap_tx: swap_tx.map(consensus::serialize),
+            })
         })
     }
 

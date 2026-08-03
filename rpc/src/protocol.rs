@@ -567,7 +567,7 @@ impl TradeModel {
     }
 
     pub fn sign_swap_tx_input_partial(&mut self, sighash: TapSighash) -> Result<()> {
-        let sighash = self.swap_tx.input_sighash.insert(sighash);
+        let sighash = self.swap_tx.input_sighash.get_or_insert(sighash);
         self.swap_tx.input_sig_ctx.sign_partial(*sighash)?;
         Ok(())
     }
@@ -686,11 +686,7 @@ impl TradeModel {
     }
 
     pub fn my_private_key_share_for_peer_output(&self) -> Result<&Scalar> {
-        // TODO: Consider changing the `Musig` gRPC API not to reveal our key share for the peer's
-        //  output if the trade was force-closed (at least if we're the buyer), since otherwise that
-        //  is a belated cooperative closure, but `CustomPayoutSigned -> TradeClosed(Cooperative)`
-        //  is not a legal state transition for the buyer. Then we could tighten access here.
-        access!(self, SellerReadyToRelease | TradeClosed(Forced | Cooperative))?;
+        access!(self, SellerReadyToRelease | TradeClosed(Cooperative))?;
         Ok(self.keys.peers_payout_ctx().my_key_share()?.prv_key()?)
     }
 
@@ -712,11 +708,7 @@ impl TradeModel {
     }
 
     pub fn signed_swap_tx(&self) -> Result<&Transaction> {
-        // TODO: Consider changing the `Musig` gRPC API not to reveal the signed Swap Tx until the
-        //  trade has actually been force-closed, instead of when the seller is ready to release.
-        //  (We don't want the buyer to be able to broadcast the Swap Tx under the seller's feet if
-        //  he didn't intend to force-close it.) Then we could tighten access here.
-        access!(self, SellerReadyToRelease | TradeClosed(Forced))?;
+        access!(self, TradeClosed(Forced))?;
         Ok(self.swap_tx.builder.signed_tx()?)
     }
 
@@ -737,6 +729,12 @@ impl TradeModel {
     }
 
     pub fn set_seller_ready_to_release(&mut self) -> Result<bool> {
+        // NOTE: It is somewhat unsafe for the seller to start closing the trade near to (or after)
+        //  the timelock expiry of the buyer's Warning Tx, since in case of an unresponsive buyer
+        //  and subsequent force-closure, the Swap Tx could then be replaced by it, without the
+        //  seller realising, but the seller won't have a signed Penalty Tx in that case.
+        // TODO: Consider adding a protection against such late closures.
+
         // Regardless of role, make sure we have the Swap Tx final signature before proceeding:
         self.swap_tx.builder.signed_tx()?;
         self.update_state(TradeState::SellerReadyToRelease)

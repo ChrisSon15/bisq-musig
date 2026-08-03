@@ -345,7 +345,7 @@ public class TradeProtocolClient {
             // *** BUYER CLOSES TRADE ***
             var buyersCloseTradeResponse = stub.closeTrade(CloseTradeRequest.newBuilder()
                     .setTradeId(buyerTradeId)
-                    .setSwapTx(swapTxSignatureResponse.getSwapTx())
+                    .setSwapTx(sellersCloseTradeResponse.getSwapTx())
                     .build());
             System.out.println("Got reply: " + buyersCloseTradeResponse);
             // **************************

@@ -134,8 +134,8 @@ message SwapTxSignatureRequest {
 }
 
 message SwapTxSignatureResponse {
-  bytes swapTx = 1;
-  bytes peerOutputPrvKeyShare = 2;
+  //bytes swapTx = 1; // removed
+  optional bytes peerOutputPrvKeyShare = 2;
 }
 
 message CloseTradeRequest {
@@ -145,7 +145,8 @@ message CloseTradeRequest {
 }
 
 message CloseTradeResponse {
-  bytes peerOutputPrvKeyShare = 1;
+  optional bytes peerOutputPrvKeyShare = 1;
+  optional bytes swapTx = 2;
 }
 
 message CustomPayoutPsbtRequest {
