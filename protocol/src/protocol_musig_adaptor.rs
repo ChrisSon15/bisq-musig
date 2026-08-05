@@ -14,7 +14,8 @@ use crate::multisig::{KeyCtx, PointExt as _, SigCtx};
 use crate::receiver::{Receiver, ReceiverList};
 use crate::script_paths;
 use crate::transaction::{
-    DepositTxBuilder, ForwardingTxBuilder, RedirectTxBuilder, TransactionExt as _, WarningTxBuilder,
+    ClaimTxBuilder, DepositTxBuilder, RedirectTxBuilder, SwapTxBuilder, TransactionExt as _,
+    WarningTxBuilder,
 };
 
 /// Type-erased wallet handle used by the trade protocol. The concrete wallet may be a
@@ -424,7 +425,7 @@ impl RedirectTx {
 #[derive(Default)]
 pub struct ClaimTx {
     pub sig: SigCtx,
-    pub builder: ForwardingTxBuilder,
+    pub builder: ClaimTxBuilder,
     pub claim_spend: Option<ScriptBuf>,
 }
 
@@ -566,7 +567,7 @@ impl WarningTx {
 pub struct SwapTx {
     // this transaction is only for Alice, however even Bob will construct it for signing:
     pub role: ProtocolRole,
-    pub builder: ForwardingTxBuilder,
+    pub builder: SwapTxBuilder,
     pub swap_spend: Option<ScriptBuf>,
     // SwapTx get funded by a adaptor MuSig2 signature
     pub fund_sig: SigCtx,
@@ -589,7 +590,7 @@ impl SwapTx {
     fn new(role: ProtocolRole) -> Self {
         Self {
             role,
-            builder: ForwardingTxBuilder::default(),
+            builder: SwapTxBuilder::default(),
             swap_spend: None,
             fund_sig: SigCtx::default(),
         }

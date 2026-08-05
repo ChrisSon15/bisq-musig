@@ -12,8 +12,8 @@ use protocol::multisig::{KeyCtx, KeyPair, PointExt as _, SigCtx};
 use protocol::receiver::{Receiver, ReceiverList};
 use protocol::state::{ClosureType, TradeState};
 use protocol::transaction::{
-    CustomPayoutTxBuilder, DepositTxBuilder, ForwardingTxBuilder, NetworkParams as _,
-    RedirectTxBuilder, TransactionExt as _, WarningTxBuilder,
+    ClaimTxBuilder, CustomPayoutTxBuilder, DepositTxBuilder, NetworkParams as _, RedirectTxBuilder,
+    SwapTxBuilder, TransactionExt as _, WarningTxBuilder,
 };
 use protocol::{mocks, script_paths};
 use thiserror::Error;
@@ -87,7 +87,7 @@ struct DepositTx {
 
 #[derive(Default)]
 struct SwapTx {
-    builder: ForwardingTxBuilder,
+    builder: SwapTxBuilder,
     input_sighash: Option<TapSighash>,
     input_sig_ctx: SigCtx,
 }
@@ -107,7 +107,7 @@ struct RedirectTx {
 
 #[derive(Default)]
 struct ClaimTx {
-    builder: ForwardingTxBuilder,
+    builder: ClaimTxBuilder,
     input_sig_ctx: SigCtx,
 }
 

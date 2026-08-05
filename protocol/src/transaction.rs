@@ -515,6 +515,10 @@ pub struct ForwardingTxBuilder {
     signed_tx: Option<Transaction>,
 }
 
+pub type SwapTxBuilder = ForwardingTxBuilder;
+pub type ClaimTxBuilder = ForwardingTxBuilder;
+pub type PenaltyTxBuilder = ForwardingTxBuilder;
+
 impl ForwardingTxBuilder {
     make_getter_setter!(input: TxOutput);
     make_getter_setter!(payout_address: Address);
@@ -921,11 +925,11 @@ mod tests {
     }
 
     //noinspection SpellCheckingInspection
-    fn filled_swap_tx_builder(deposit_tx_builder: &DepositTxBuilder) -> Result<ForwardingTxBuilder> {
+    fn filled_swap_tx_builder(deposit_tx_builder: &DepositTxBuilder) -> Result<SwapTxBuilder> {
         let payout_address = "bcrt1pf5vmdnfx03tlwx0j70cpct8zxpg9upf6p5sgsn624yg4a0lnxwxsegnwnx"
             .parse::<Address<_>>()?.require_network(Network::Regtest)?;
 
-        let mut builder = ForwardingTxBuilder::default();
+        let mut builder = SwapTxBuilder::default();
         builder
             .set_input(deposit_tx_builder.seller_payout()?.clone())
             .set_payout_address(payout_address)
@@ -985,11 +989,11 @@ mod tests {
     }
 
     //noinspection SpellCheckingInspection
-    fn filled_claim_tx_builder(warning_tx_builder: &WarningTxBuilder) -> Result<ForwardingTxBuilder> {
+    fn filled_claim_tx_builder(warning_tx_builder: &WarningTxBuilder) -> Result<ClaimTxBuilder> {
         let payout_address = "bcrt1pf5vmdnfx03tlwx0j70cpct8zxpg9upf6p5sgsn624yg4a0lnxwxsegnwnx"
             .parse::<Address<_>>()?.require_network(Network::Regtest)?;
 
-        let mut builder = ForwardingTxBuilder::default();
+        let mut builder = ClaimTxBuilder::default();
         builder
             .set_input(warning_tx_builder.escrow()?)
             .set_payout_address(payout_address)
