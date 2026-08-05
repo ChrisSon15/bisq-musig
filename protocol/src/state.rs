@@ -51,6 +51,8 @@ pub enum ClosureType {
 }
 
 impl TradeState {
+    /// All possible trade states, in (non-unique) topological order with respect to the
+    /// [`PartialOrd`] impl of [`TradeState`].
     pub const VALUES: [Self; 16] = [
         Self::Init,
         Self::Deposit,
@@ -127,18 +129,18 @@ impl TradeState {
             Self::Deposit /*                                   -*/ => 0x001, // .. .... ...1
             Self::BuyerReadyToRelease /*                       -*/ => 0x003, // .. .... ..11
             Self::SellerReadyToRelease /*                      -*/ => 0x007, // .. .... .111
-            Self::CustomPayoutSigned /*                        -*/ => 0x013, // .. ...1 ..11
-            Self::BuyersWarning /*                             -*/ => 0x033, // .. ..11 ..11
-            Self::SellersWarning /*                            -*/ => 0x053, // .. .1.1 ..11
-            Self::TradeClosed(ClosureType::Cooperative) /*     -*/ => 0x00f, // .. .... 1111
-            Self::TradeClosed(ClosureType::Forced) /*          -*/ => 0x117, // .1 ...1 .111
-            Self::TradeClosed(ClosureType::Custom) /*          -*/ => 0x093, // .. 1..1 ..11
-            Self::TradeClosed(ClosureType::BuyersRedirect) /*  -*/ => 0x253, // 1. .1.1 ..11
-            Self::TradeClosed(ClosureType::SellersRedirect) /* -*/ => 0x233, // 1. ..11 ..11
-            Self::TradeClosed(ClosureType::BuyersClaim) /*     -*/ => 0x03f, // .. ..11 1111
-            Self::TradeClosed(ClosureType::SellersClaim) /*    -*/ => 0x05f, // .. .1.1 1111
-            Self::TradeClosed(ClosureType::BuyersPenaltyTx) /* -*/ => 0x08f, // .. 1... 1111
-            Self::TradeClosed(ClosureType::SellersPenaltyTx) /*-*/ => 0x10f, // .1 .... 1111
+            Self::CustomPayoutSigned /*                        -*/ => 0x00b, // .. .... 1.11
+            Self::BuyersWarning /*                             -*/ => 0x01b, // .. ...1 1.11
+            Self::SellersWarning /*                            -*/ => 0x02b, // .. ..1. 1.11
+            Self::TradeClosed(ClosureType::Cooperative) /*     -*/ => 0x047, // .. .1.. .111
+            Self::TradeClosed(ClosureType::Forced) /*          -*/ => 0x08f, // .. 1... 1111
+            Self::TradeClosed(ClosureType::Custom) /*          -*/ => 0x10b, // .1 .... 1.11
+            Self::TradeClosed(ClosureType::BuyersRedirect) /*  -*/ => 0x22b, // 1. ..1. 1.11
+            Self::TradeClosed(ClosureType::SellersRedirect) /* -*/ => 0x21b, // 1. ...1 1.11
+            Self::TradeClosed(ClosureType::BuyersClaim) /*     -*/ => 0x05f, // .. .1.1 1111
+            Self::TradeClosed(ClosureType::SellersClaim) /*    -*/ => 0x06f, // .. .11. 1111
+            Self::TradeClosed(ClosureType::BuyersPenaltyTx) /* -*/ => 0x147, // .1 .1.. .111
+            Self::TradeClosed(ClosureType::SellersPenaltyTx) /*-*/ => 0x247, // 1. .1.. .111
         }
     }
 }
