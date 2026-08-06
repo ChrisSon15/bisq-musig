@@ -147,6 +147,7 @@ message CloseTradeRequest {
 message CloseTradeResponse {
   optional bytes peerOutputPrvKeyShare = 1;
   optional bytes swapTx = 2;
+  optional bytes penaltyTx = 3;
 }
 
 message CustomPayoutPsbtRequest {

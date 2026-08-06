@@ -12,8 +12,8 @@ use protocol::multisig::{KeyCtx, KeyPair, PointExt as _, SigCtx};
 use protocol::receiver::{Receiver, ReceiverList};
 use protocol::state::{ClosureType, TradeState};
 use protocol::transaction::{
-    ClaimTxBuilder, CustomPayoutTxBuilder, DepositTxBuilder, NetworkParams as _, RedirectTxBuilder,
-    SwapTxBuilder, TransactionExt as _, WarningTxBuilder,
+    ClaimTxBuilder, CustomPayoutTxBuilder, DepositTxBuilder, NetworkParams as _, PenaltyTxBuilder,
+    RedirectTxBuilder, SwapTxBuilder, TransactionExt as _, WarningTxBuilder,
 };
 use protocol::{mocks, script_paths};
 use thiserror::Error;
@@ -51,6 +51,7 @@ pub struct TradeModel {
     keys: Keys,
     deposit_tx: DepositTx,
     swap_tx: SwapTx,
+    penalty_tx: PenaltyTx,
     custom_payout_tx: CustomPayoutTx,
     buyer_txs: ArbitrationTxs,
     seller_txs: ArbitrationTxs,
@@ -108,6 +109,12 @@ struct RedirectTx {
 #[derive(Default)]
 struct ClaimTx {
     builder: ClaimTxBuilder,
+    input_sig_ctx: SigCtx,
+}
+
+#[derive(Default)]
+struct PenaltyTx {
+    builder: PenaltyTxBuilder,
     input_sig_ctx: SigCtx,
 }
 
@@ -199,6 +206,7 @@ impl TradeModel {
             txs.claim.builder.set_lock_time(network.claim_lock_time());
         }
         trade_model.swap_tx.builder.disable_lock_time();
+        trade_model.penalty_tx.builder.disable_lock_time();
         trade_model.keys.am_buyer = trade_model.am_buyer();
         trade_model
     }
@@ -253,6 +261,7 @@ impl TradeModel {
             txs.claim.builder.set_fee_rate(fee_rate);
         }
         self.swap_tx.builder.set_fee_rate(fee_rate);
+        self.penalty_tx.builder.set_fee_rate(fee_rate);
     }
 
     pub fn set_trade_fee_receiver(&mut self, receiver: Option<Receiver<NetworkUnchecked>>) -> Result<()> {
@@ -278,7 +287,9 @@ impl TradeModel {
     pub fn init_my_key_shares(&mut self) -> Result<()> {
         self.keys.buyer_payout_ctx.init_my_key_share();
         self.keys.seller_payout_ctx.init_my_key_share();
-        self.keys.my_multisig_script_key.get_or_insert(self.trade_wallet()?.new_internal_key()?);
+        if self.keys.my_multisig_script_key.is_none() {
+            self.keys.my_multisig_script_key = Some(self.trade_wallet()?.new_internal_key()?);
+        }
         Ok(())
     }
 
@@ -340,6 +351,12 @@ impl TradeModel {
         self.buyer_txs.warning.builder.set_escrow_address(buyers_warning_escrow_address);
         self.seller_txs.warning.builder.set_escrow_address(sellers_warning_escrow_address);
 
+        self.penalty_tx.input_sig_ctx.set_tweaked_key_ctx(if self.am_buyer() {
+            &sellers_warning_escrow_tweaked_key_ctx
+        } else {
+            &buyers_warning_escrow_tweaked_key_ctx
+        }.clone());
+
         self.buyer_txs.claim.input_sig_ctx.set_tweaked_key_ctx(buyers_warning_escrow_tweaked_key_ctx.clone());
         self.seller_txs.redirect.input_sig_ctx.set_tweaked_key_ctx(buyers_warning_escrow_tweaked_key_ctx);
         self.seller_txs.claim.input_sig_ctx.set_tweaked_key_ctx(sellers_warning_escrow_tweaked_key_ctx.clone());
@@ -348,15 +365,18 @@ impl TradeModel {
     }
 
     pub fn init_my_addresses(&mut self) -> Result<()> {
-        let mut wallet = self.trade_wallet()?;
-        let my_txs = if self.am_buyer() { &mut self.buyer_txs } else { &mut self.seller_txs };
-        my_txs.warning.builder.set_anchor_address(wallet.new_address()?);
-        my_txs.redirect.builder.set_anchor_address(wallet.new_address()?);
-        my_txs.claim.builder.set_payout_address(wallet.new_address()?);
-        if !self.am_buyer() {
-            self.swap_tx.builder.set_payout_address(wallet.new_address()?);
+        if self.penalty_tx.builder.payout_address().is_err() {
+            let mut wallet = self.trade_wallet()?;
+            if !self.am_buyer() {
+                self.swap_tx.builder.set_payout_address(wallet.new_address()?);
+            }
+            let my_txs = if self.am_buyer() { &mut self.buyer_txs } else { &mut self.seller_txs };
+            my_txs.warning.builder.set_anchor_address(wallet.new_address()?);
+            my_txs.redirect.builder.set_anchor_address(wallet.new_address()?);
+            my_txs.claim.builder.set_payout_address(wallet.new_address()?);
+            self.penalty_tx.builder.set_payout_address(my_txs.claim.builder.payout_address()?.clone());
+            drop(wallet);
         }
-        drop(wallet);
         Ok(())
     }
 
@@ -379,10 +399,12 @@ impl TradeModel {
     }
 
     pub fn init_my_half_deposit_psbt(&mut self) -> Result<()> {
-        if self.am_buyer() {
-            self.deposit_tx.builder.init_buyers_half_psbt(&mut *self.trade_wallet()?, &mut rand::rng())?;
-        } else {
-            self.deposit_tx.builder.init_sellers_half_psbt(&mut *self.trade_wallet()?, &mut rand::rng())?;
+        if self.my_half_deposit_psbt().is_err() {
+            if self.am_buyer() {
+                self.deposit_tx.builder.init_buyers_half_psbt(&mut *self.trade_wallet()?, &mut rand::rng())?;
+            } else {
+                self.deposit_tx.builder.init_sellers_half_psbt(&mut *self.trade_wallet()?, &mut rand::rng())?;
+            }
         }
         Ok(())
     }
@@ -435,6 +457,8 @@ impl TradeModel {
             txs.claim.builder.compute_unsigned_tx()?;
             std::mem::swap(&mut txs, &mut peer_txs);
         }
+        self.penalty_tx.builder.set_input(peer_txs.warning.builder.escrow()?.clone());
+        self.penalty_tx.builder.compute_unsigned_tx()?;
         Ok(())
     }
 
@@ -650,7 +674,12 @@ impl TradeModel {
         my_txs.claim.builder.signed_tx()?;
         if self.am_buyer() {
             self.swap_tx.input_sig_ctx.aggregated_sig()?;
+        } else {
+            self.swap_tx.builder.unsigned_tx()?;
+            self.swap_tx.input_sig_ctx.my_partial_sig()?;
         }
+        self.penalty_tx.builder.unsigned_tx()?;
+        self.penalty_tx.input_sig_ctx.tweaked_key_ctx()?;
         // Now sign the Deposit Tx. It is CRITICAL that we don't share the PSBT or signed tx until
         // the trade state has successfully advanced past `Init` to `Deposit`.
         if self.am_buyer() {
@@ -722,6 +751,19 @@ impl TradeModel {
         Ok(())
     }
 
+    pub fn compute_signed_penalty_tx(&mut self) -> Result<()> {
+        self.penalty_tx.input_sig_ctx.sign_solo(self.penalty_tx.builder.input_sighash()?,
+            *self.keys.my_payout_ctx_mut().peers_key_share()?.prv_key()?)?;
+        self.penalty_tx.builder
+            .set_input_signature(self.penalty_tx.input_sig_ctx.compute_taproot_signature(MaybeScalar::Zero)?)
+            .compute_signed_tx()?;
+        Ok(())
+    }
+
+    pub fn signed_penalty_tx(&self) -> Result<&Transaction> {
+        Ok(self.penalty_tx.builder.signed_tx()?)
+    }
+
     pub fn set_buyer_ready_to_release(&mut self) -> Result<bool> {
         // Regardless of role, make sure we have the Swap Tx adaptor signature before proceeding:
         self.swap_tx.input_sig_ctx.aggregated_sig()?;
@@ -749,6 +791,7 @@ impl TradeModel {
             ClosureType::Cooperative | ClosureType::Forced => {
                 // TODO: Should export the private key to the wallet, not just check we've got it:
                 self.keys.my_payout_ctx_mut().aggregated_key()?.prv_key()?;
+                self.penalty_tx.builder.signed_tx()?;
                 // TODO: If forced closure, make sure we've seen the Swap Tx on the network.
             }
             ClosureType::Custom => {
