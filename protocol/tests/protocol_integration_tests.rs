@@ -180,6 +180,22 @@ fn test_warning() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_penalty() -> anyhow::Result<()> {
+    let mut env = TestEnv::new()?;
+    let (mut alice, bob) = initial_tx_creation(&mut env)?;
+    // Trade is cooperatively closed. Alice learns Bob's key on her payout and uses it to
+    // preemptively sign her PenaltyTx.
+    alice.penalty_tx.sign(&bob.q_tik)?;
+    // Now suppose that Bob broadcasts his WarningTx, hoping to fraudulently claim after some delay.
+    bob.warning_tx_me.broadcast(&bob.ctx)?;
+    env.mine_block()?;
+    // Alice notices and broadcasts her PenaltyTx, sending all funds to her.
+    alice.penalty_tx.broadcast(&alice.ctx)?;
+    env.mine_block()?;
+    Ok(())
+}
+
+#[test]
 fn test_claim() -> anyhow::Result<()> {
     let mut env = TestEnv::new()?;
     // env.start_explorer_in_container()?;

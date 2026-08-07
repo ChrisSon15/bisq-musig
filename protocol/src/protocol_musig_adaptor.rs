@@ -14,8 +14,8 @@ use crate::multisig::{KeyCtx, PointExt as _, SigCtx};
 use crate::receiver::{Receiver, ReceiverList};
 use crate::script_paths;
 use crate::transaction::{
-    ClaimTxBuilder, DepositTxBuilder, RedirectTxBuilder, SwapTxBuilder, TransactionExt as _,
-    WarningTxBuilder,
+    ClaimTxBuilder, DepositTxBuilder, PenaltyTxBuilder, RedirectTxBuilder, SwapTxBuilder,
+    TransactionExt as _, WarningTxBuilder,
 };
 
 /// Type-erased wallet handle used by the trade protocol. The concrete wallet may be a
@@ -115,6 +115,7 @@ pub struct BMPProtocol {
     // which round are we in:
     round: u8,
     pub swap_tx: SwapTx,
+    pub penalty_tx: PenaltyTx,
     pub warning_tx_me: WarningTx,
     warning_tx_peer: WarningTx,
     pub claim_tx_me: ClaimTx,
@@ -158,6 +159,7 @@ impl BMPProtocol {
             deposit_tx: DepositTx::new(),
             round: 0,
             swap_tx: SwapTx::new(role),
+            penalty_tx: PenaltyTx::new(),
             warning_tx_me: WarningTx::new(role),
             warning_tx_peer: WarningTx::new(role.other()),
             claim_tx_me: ClaimTx::new(),
@@ -178,6 +180,7 @@ impl BMPProtocol {
         // ClaimTx
         let claim_spend = self.ctx.funds.new_address()?.script_pubkey();
         self.claim_tx_me.claim_spend = Some(claim_spend.clone());
+        self.penalty_tx.penalty_spend = Some(claim_spend.clone());
 
         // RedirectTx
         let redirect_anchor_spend = self.ctx.funds.new_address()?.script_pubkey();
@@ -253,6 +256,9 @@ impl BMPProtocol {
         self.redirect_tx_peer.anchor_spend = Some(bob.redirect_anchor_spend);
         self.redirect_tx_peer.build(other_tik, &self.warning_tx_me)?;
         let redirect_bob_nonce = self.redirect_tx_peer.sig.my_nonce_share()?.clone();
+
+        // PenaltyTx
+        self.penalty_tx.build(tik, &self.warning_tx_peer)?;
 
         Ok(Round2Parameter {
             p_agg: *self.p_tik.aggregated_key()?.pub_key(),
@@ -460,6 +466,47 @@ impl ClaimTx {
         self.sig.aggregate_partial_signatures()?;
 
         // now stuff those signatures into the transaction
+        self.builder
+            .set_input_signature(self.sig.compute_taproot_signature(MaybeScalar::Zero)?)
+            .compute_signed_tx()?;
+        Ok(())
+    }
+
+    pub fn broadcast(&self, me: &BMPContext) -> anyhow::Result<Txid> {
+        me.chain.transaction_broadcast(self.signed_tx()?)
+    }
+}
+
+/// `PenaltyTx` -- One version for Alice and one for Bob.
+/// Signed unilaterally, so each party only generates and holds their own version.
+#[derive(Default)]
+pub struct PenaltyTx {
+    builder: PenaltyTxBuilder,
+    sig: SigCtx,
+    penalty_spend: Option<ScriptBuf>,
+}
+
+impl PenaltyTx {
+    pub fn new() -> Self { Self::default() }
+
+    pub fn signed_tx(&self) -> anyhow::Result<&Transaction> { Ok(self.builder.signed_tx()?) }
+
+    fn build(&mut self, tik: &KeyCtx, warn_tx: &WarningTx) -> anyhow::Result<()> {
+        self.sig.set_tweaked_key_ctx(tik.with_taproot_tweak(None)?);
+        self.sig.init_my_nonce_share()?;
+
+        self.builder
+            .set_input(warn_tx.builder.escrow()?)
+            .set_payout_address(Address::from_script(self.penalty_spend.as_ref().unwrap(), Network::Regtest)?) // TODO: Improve.
+            .disable_lock_time()
+            .set_fee_rate(FeeRate::from_sat_per_vb_u32(10)) // TODO: feerates shall come from pricenodes
+            .compute_unsigned_tx()?;
+        Ok(())
+    }
+
+    pub fn sign(&mut self, tik: &KeyCtx) -> anyhow::Result<()> {
+        let msg = self.builder.input_sighash()?;
+        self.sig.sign_solo(msg, *tik.my_key_share()?.prv_key()?)?;
         self.builder
             .set_input_signature(self.sig.compute_taproot_signature(MaybeScalar::Zero)?)
             .compute_signed_tx()?;
