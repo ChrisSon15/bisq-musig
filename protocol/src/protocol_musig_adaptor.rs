@@ -94,7 +94,7 @@ pub struct Round4Parameter {
 /// this context is for the whole process and need to be persisted by the caller
 pub struct BMPContext {
     // first of all, everything which is general to the protocol itself.
-    // `funds` is type-erased so the protocol works against any [`TradeWallet`]
+    // `funds` is type-erased so the protocol works against any [`ProtocolWalletApi`]
     // implementation (e.g. `MemWallet`, `BMPWallet`, mocks).
     pub funds: BoxedTradeWallet,
     pub chain: Box<dyn ChainApi>,
@@ -241,17 +241,17 @@ impl BMPProtocol {
             ProtocolRole::Seller => (&self.q_tik, &self.p_tik),
             ProtocolRole::Buyer => (&self.p_tik, &self.q_tik)
         };
-        self.claim_tx_me.build(tik, &self.warning_tx_me)?;
+        self.claim_tx_me.build(other_tik, &self.warning_tx_me)?;
         let claim_alice_nonce = self.claim_tx_me.sig.my_nonce_share()?.clone();
         self.claim_tx_peer.claim_spend = Some(bob.claim_spend);
-        self.claim_tx_peer.build(other_tik, &self.warning_tx_peer)?;
+        self.claim_tx_peer.build(tik, &self.warning_tx_peer)?;
         let claim_bob_nonce = self.claim_tx_peer.sig.my_nonce_share()?.clone();
 
         // RedirectTx
-        self.redirect_tx_me.build(other_tik, &self.warning_tx_peer)?; // RedirectTx overcrosses; Alice references Bob's WarningTx
+        self.redirect_tx_me.build(tik, &self.warning_tx_peer)?; // RedirectTx overcrosses; Alice references Bob's WarningTx
         let redirect_alice_nonce = self.redirect_tx_me.sig.my_nonce_share()?.clone();
         self.redirect_tx_peer.anchor_spend = Some(bob.redirect_anchor_spend);
-        self.redirect_tx_peer.build(tik, &self.warning_tx_me)?;
+        self.redirect_tx_peer.build(other_tik, &self.warning_tx_me)?;
         let redirect_bob_nonce = self.redirect_tx_peer.sig.my_nonce_share()?.clone();
 
         Ok(Round2Parameter {
@@ -510,8 +510,8 @@ impl WarningTx {
 
         //--------------------
         let key_spend = match self.role {
-            ProtocolRole::Seller => q_tik,
-            ProtocolRole::Buyer => p_tik
+            ProtocolRole::Seller => p_tik,
+            ProtocolRole::Buyer => q_tik
         }.with_taproot_tweak(None)?;
 
         let txid = self.builder
