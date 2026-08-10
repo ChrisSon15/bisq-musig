@@ -261,7 +261,11 @@ impl TradeModel {
             txs.claim.builder.set_fee_rate(fee_rate);
         }
         self.swap_tx.builder.set_fee_rate(fee_rate);
-        self.penalty_tx.builder.set_fee_rate(fee_rate);
+    }
+
+    pub fn set_penalty_tx_fee_rate(&mut self, fee_rate: Option<FeeRate>) -> Result<()> {
+        self.penalty_tx.builder.set_fee_rate(fee_rate.unwrap_or(self.prepared_tx_fee_rate()?));
+        Ok(())
     }
 
     pub fn set_trade_fee_receiver(&mut self, receiver: Option<Receiver<NetworkUnchecked>>) -> Result<()> {
@@ -427,38 +431,27 @@ impl TradeModel {
 
     pub fn compute_unsigned_deposit_tx(&mut self) -> Result<()> {
         self.deposit_tx.builder.compute_unsigned_tx()?;
-        let buyer_payout = self.deposit_tx.builder.buyer_payout()?;
-        let seller_payout = self.deposit_tx.builder.seller_payout()?;
-
-        for txs in [&mut self.buyer_txs, &mut self.seller_txs] {
-            txs.warning.builder
-                .set_buyer_input(buyer_payout.clone())
-                .set_seller_input(seller_payout.clone());
-        }
-        self.swap_tx.builder.set_input(seller_payout.clone());
-        self.custom_payout_tx.builder
-            .set_buyer_input(buyer_payout.clone())
-            .set_seller_input(seller_payout.clone());
         Ok(())
     }
 
     pub fn compute_unsigned_prepared_txs(&mut self) -> Result<()> {
         if !self.am_buyer() {
             // Only the seller has all the params necessary to compute the unsigned swap tx.
+            self.swap_tx.builder.set_input(self.deposit_tx.builder.seller_payout()?.clone());
             self.swap_tx.builder.compute_unsigned_tx()?;
         }
-        let [mut txs, mut peer_txs] = [&mut self.buyer_txs, &mut self.seller_txs];
-        txs.warning.builder.compute_unsigned_tx()?;
-        peer_txs.warning.builder.compute_unsigned_tx()?;
-        for _ in 0..2 {
-            txs.redirect.builder.set_input(peer_txs.warning.builder.escrow()?.clone());
-            txs.redirect.builder.compute_unsigned_tx()?;
-            txs.claim.builder.set_input(txs.warning.builder.escrow()?.clone());
-            txs.claim.builder.compute_unsigned_tx()?;
-            std::mem::swap(&mut txs, &mut peer_txs);
-        }
-        self.penalty_tx.builder.set_input(peer_txs.warning.builder.escrow()?.clone());
-        self.penalty_tx.builder.compute_unsigned_tx()?;
+        self.buyer_txs.compute_unsigned_warning_tx(&self.deposit_tx)?;
+        self.seller_txs.compute_unsigned_warning_tx(&self.deposit_tx)?;
+        self.buyer_txs.compute_unsigned_redirect_and_claim_txs(&self.seller_txs)?;
+        self.seller_txs.compute_unsigned_redirect_and_claim_txs(&self.buyer_txs)?;
+        Ok(())
+    }
+
+    pub fn compute_unsigned_penalty_tx(&mut self) -> Result<()> {
+        let peer_txs = if self.am_buyer() { &self.seller_txs } else { &self.buyer_txs };
+        self.penalty_tx.builder
+            .set_input(peer_txs.warning.builder.escrow()?.clone())
+            .compute_unsigned_tx()?;
         Ok(())
     }
 
@@ -678,7 +671,7 @@ impl TradeModel {
             self.swap_tx.builder.unsigned_tx()?;
             self.swap_tx.input_sig_ctx.my_partial_sig()?;
         }
-        self.penalty_tx.builder.unsigned_tx()?;
+        self.penalty_tx.builder.payout_address()?;
         self.penalty_tx.input_sig_ctx.tweaked_key_ctx()?;
         // Now sign the Deposit Tx. It is CRITICAL that we don't share the PSBT or signed tx until
         // the trade state has successfully advanced past `Init` to `Deposit`.
@@ -814,6 +807,8 @@ impl TradeModel {
 
     pub fn compute_custom_payout_tx(&mut self) -> Result<()> {
         self.custom_payout_tx.builder
+            .set_buyer_input(self.deposit_tx.builder.buyer_payout()?.clone())
+            .set_seller_input(self.deposit_tx.builder.seller_payout()?.clone())
             .set_buyer_payout_address(self.buyer_txs.claim.builder.payout_address()?.clone())
             .set_seller_payout_address(self.seller_txs.claim.builder.payout_address()?.clone())
             .compute_unsigned_tx()?;
@@ -838,6 +833,26 @@ impl TradeModel {
     pub fn signed_custom_payout_tx(&self) -> Result<Transaction> {
         access!(self, CustomPayoutSigned | TradeClosed(Custom))?;
         Ok(self.custom_payout_tx.builder.signed_tx()?)
+    }
+}
+
+impl ArbitrationTxs {
+    fn compute_unsigned_warning_tx(&mut self, deposit_tx: &DepositTx) -> Result<()> {
+        self.warning.builder
+            .set_buyer_input(deposit_tx.builder.buyer_payout()?.clone())
+            .set_seller_input(deposit_tx.builder.seller_payout()?.clone())
+            .compute_unsigned_tx()?;
+        Ok(())
+    }
+
+    fn compute_unsigned_redirect_and_claim_txs(&mut self, peer: &Self) -> Result<()> {
+        self.redirect.builder
+            .set_input(peer.warning.builder.escrow()?.clone())
+            .compute_unsigned_tx()?;
+        self.claim.builder
+            .set_input(self.warning.builder.escrow()?.clone())
+            .compute_unsigned_tx()?;
+        Ok(())
     }
 }
 

@@ -142,6 +142,7 @@ message CloseTradeRequest {
   string tradeId = 1;
   optional bytes myOutputPeersPrvKeyShare = 2;
   optional bytes swapTx = 3;
+  optional uint64 penaltyTxFeeRate = 4;
 }
 
 message CloseTradeResponse {

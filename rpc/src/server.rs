@@ -192,6 +192,9 @@ impl musig_server::Musig for MusigImpl {
     #[instrument(skip_all)]
     async fn close_trade(&self, request: Request<CloseTradeRequest>) -> Result<Response<CloseTradeResponse>> {
         handle_musig_request(request, move |request, trade_model| {
+            let penalty_tx_fee_rate = request.penalty_tx_fee_rate.map(u64::check_in_signed_range).transpose()?;
+            trade_model.set_penalty_tx_fee_rate(penalty_tx_fee_rate.map(FeeRate::from_sat_per_kwu))?;
+            trade_model.compute_unsigned_penalty_tx()?;
             if let Some(peer_prv_key_share) = request.my_output_peers_prv_key_share.try_proto_into()? {
                 // Trader receives the private key share from a cooperative peer, closing our trade.
                 trade_model.set_peer_private_key_share_for_my_output(peer_prv_key_share)?;
