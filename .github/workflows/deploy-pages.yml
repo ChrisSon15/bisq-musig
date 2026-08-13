@@ -30,7 +30,7 @@ jobs:
           npm install katex
 
       - name: Setup Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: Build HTML from MD
         run: |
@@ -59,7 +59,7 @@ jobs:
           cp public/README.md.html public/index.html
 
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@v5
         with:
           path: './public'
 
