@@ -20,8 +20,8 @@ bdk_wallet = { workspace = true, features = ["test-utils"] }
 bdk_electrum = { workspace = true }
 bmp_tracing = { workspace = true }
 const_format = { workspace = true }
-tokio = { workspace = true }
 testenv = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

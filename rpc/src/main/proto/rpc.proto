@@ -134,18 +134,21 @@ message SwapTxSignatureRequest {
 }
 
 message SwapTxSignatureResponse {
-  bytes swapTx = 1;
-  bytes peerOutputPrvKeyShare = 2;
+  //bytes swapTx = 1; // removed
+  optional bytes peerOutputPrvKeyShare = 2;
 }
 
 message CloseTradeRequest {
   string tradeId = 1;
   optional bytes myOutputPeersPrvKeyShare = 2;
   optional bytes swapTx = 3;
+  optional uint64 penaltyTxFeeRate = 4;
 }
 
 message CloseTradeResponse {
-  bytes peerOutputPrvKeyShare = 1;
+  optional bytes peerOutputPrvKeyShare = 1;
+  optional bytes swapTx = 2;
+  optional bytes penaltyTx = 3;
 }
 
 message CustomPayoutPsbtRequest {

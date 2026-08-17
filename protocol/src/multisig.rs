@@ -170,7 +170,7 @@ pub struct SigCtx {
 }
 
 impl SigCtx {
-    fn tweaked_key_ctx(&self) -> Result<&TweakedKeyCtx> {
+    pub fn tweaked_key_ctx(&self) -> Result<&TweakedKeyCtx> {
         self.tweaked_key_ctx.as_ref().ok_or(MultisigErrorKind::MissingAggPubKey)
     }
 
@@ -206,7 +206,7 @@ impl SigCtx {
         // In order to have a better chance of provable security, don't allow the adaptor point to
         // be set after our local nonce share has already been initialized, as otherwise an attacker
         // may gain too much control over the challenge hash or final adapted signature nonce:
-        if self.my_nonce_pair_share.is_none() {
+        if self.my_nonce_pair_share.is_none() && self.aggregated_sig.is_none() {
             self.adaptor_point = adaptor_point.into();
         }
         match self.adaptor_point {
@@ -234,6 +234,9 @@ impl SigCtx {
     }
 
     pub fn sign_partial(&mut self, message: TapSighash) -> Result<&PartialSignature> {
+        if self.aggregated_sig.is_some() && self.my_partial_sig.is_none() {
+            return Err(MultisigErrorKind::MismatchedSigs);
+        }
         if self.message == Some(message) {
             return self.my_partial_sig();
         }
@@ -283,6 +286,20 @@ impl SigCtx {
         let adaptor_secret: MaybeScalar = adaptor_sig.reveal_secret(&final_sig)
             .ok_or(MultisigErrorKind::MismatchedSigs)?;
         Ok(adaptor_secret.try_into()?)
+    }
+
+    pub fn sign_solo(&mut self, message: TapSighash, peers_prv_key: Scalar) -> Result<&AdaptorSignature> {
+        let tweaked_key_ctx = self.tweaked_key_ctx()?;
+        let mut prv_key_shares = [tweaked_key_ctx.my_prv_key, peers_prv_key];
+        prv_key_shares.sort_by_key(Scalar::base_point_mul);
+        let seckey: Scalar = tweaked_key_ctx.key_agg_ctx.aggregated_seckey(prv_key_shares)?;
+
+        let sig = musig2::deterministic::adaptor::sign_solo(seckey, message, self.adaptor_point);
+        if self.aggregated_sig.is_some_and(|s| s != sig) {
+            return Err(MultisigErrorKind::MismatchedSigs);
+        }
+        self.message = Some(message);
+        Ok(self.aggregated_sig.insert(sig))
     }
 }
 

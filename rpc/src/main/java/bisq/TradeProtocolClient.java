@@ -301,6 +301,7 @@ public class TradeProtocolClient {
             var buyersCloseTradeResponse = stub.closeTrade(CloseTradeRequest.newBuilder()
                     .setTradeId(buyerTradeId)
                     .setMyOutputPeersPrvKeyShare(swapTxSignatureResponse.getPeerOutputPrvKeyShare())
+                    .setPenaltyTxFeeRate(3750) // 15.0 sats per vbyte -- optionally set by either trader at closure time
                     .build());
             System.out.println("Got reply: " + buyersCloseTradeResponse);
             // **************************
@@ -345,7 +346,7 @@ public class TradeProtocolClient {
             // *** BUYER CLOSES TRADE ***
             var buyersCloseTradeResponse = stub.closeTrade(CloseTradeRequest.newBuilder()
                     .setTradeId(buyerTradeId)
-                    .setSwapTx(swapTxSignatureResponse.getSwapTx())
+                    .setSwapTx(sellersCloseTradeResponse.getSwapTx())
                     .build());
             System.out.println("Got reply: " + buyersCloseTradeResponse);
             // **************************

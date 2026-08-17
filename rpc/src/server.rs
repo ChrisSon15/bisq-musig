@@ -173,20 +173,16 @@ impl musig_server::Musig for MusigImpl {
                 return Err(Status::failed_precondition("operation only available for seller"));
             }
             if request.seller_ready_to_release {
+                trade_model.compute_signed_swap_tx()?;
                 trade_model.set_seller_ready_to_release()?;
-                let swap_tx = trade_model.signed_swap_tx()?;
                 let prv_key_share = trade_model.my_private_key_share_for_peer_output()?;
 
-                Ok(SwapTxSignatureResponse {
-                    swap_tx: consensus::serialize(swap_tx),
-                    peer_output_prv_key_share: prv_key_share.serialize().into(),
-                })
+                Ok(SwapTxSignatureResponse { peer_output_prv_key_share: Some(prv_key_share.serialize().into()) })
             } else {
                 trade_model.set_swap_tx_input_peers_partial_signature(
                     request.swap_tx_input_peers_partial_signature.try_proto_into()?);
                 trade_model.aggregate_swap_tx_partial_signatures()?;
                 trade_model.set_buyer_ready_to_release()?;
-                trade_model.compute_signed_swap_tx()?;
 
                 Ok(SwapTxSignatureResponse::default())
             }
@@ -196,16 +192,21 @@ impl musig_server::Musig for MusigImpl {
     #[instrument(skip_all)]
     async fn close_trade(&self, request: Request<CloseTradeRequest>) -> Result<Response<CloseTradeResponse>> {
         handle_musig_request(request, move |request, trade_model| {
+            let penalty_tx_fee_rate = request.penalty_tx_fee_rate.map(u64::check_in_signed_range).transpose()?;
+            trade_model.set_penalty_tx_fee_rate(penalty_tx_fee_rate.map(FeeRate::from_sat_per_kwu))?;
+            trade_model.compute_unsigned_penalty_tx()?;
             if let Some(peer_prv_key_share) = request.my_output_peers_prv_key_share.try_proto_into()? {
                 // Trader receives the private key share from a cooperative peer, closing our trade.
                 trade_model.set_peer_private_key_share_for_my_output(peer_prv_key_share)?;
                 trade_model.aggregate_private_keys_for_my_output()?;
+                trade_model.compute_signed_penalty_tx()?;
                 trade_model.close_trade(ClosureType::Cooperative)?;
             } else if let Some(swap_tx) = request.swap_tx.try_proto_into()? {
                 // Buyer supplies a signed swap tx to the Rust server, to close our trade. (Mainly for
                 // testing -- normally the tx would be picked up from the bitcoin network by the server.)
                 trade_model.recover_seller_private_key_share_for_buyer_output(&swap_tx)?;
                 trade_model.aggregate_private_keys_for_my_output()?;
+                trade_model.compute_signed_penalty_tx()?;
                 trade_model.close_trade(ClosureType::Forced)?;
             } else {
                 // Peer unresponsive -- force-close our trade by publishing the swap tx. For seller only.
@@ -214,9 +215,17 @@ impl musig_server::Musig for MusigImpl {
 
                 info!("*** BROADCAST SWAP TX ***"); // TODO: Implement broadcast.
             }
-            let my_prv_key_share = trade_model.my_private_key_share_for_peer_output()?;
+            let my_prv_key_share = trade_model.my_private_key_share_for_peer_output().ok();
+            // We could use `oneof` in the proto for these fields, instead of a (wire-compatible)
+            // pair of optionals, but that makes the Prost bindings awkward to use:
+            let swap_tx = trade_model.signed_swap_tx().ok();
+            let penalty_tx = trade_model.signed_penalty_tx().ok().filter(|_| swap_tx.is_none());
 
-            Ok(CloseTradeResponse { peer_output_prv_key_share: my_prv_key_share.serialize().into() })
+            Ok(CloseTradeResponse {
+                peer_output_prv_key_share: my_prv_key_share.map(|s| s.serialize().into()),
+                swap_tx: swap_tx.map(consensus::serialize),
+                penalty_tx: penalty_tx.map(consensus::serialize),
+            })
         })
     }
 

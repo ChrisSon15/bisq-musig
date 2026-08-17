@@ -10,10 +10,12 @@ use bdk_wallet::bitcoin::{Transaction, Txid};
 use bdk_wallet::chain::DescriptorId;
 use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse};
 use tokio::select;
+
 /// Minimal abstraction over blockchain interaction for broadcasting transactions.
 pub trait ChainApi: Send + Sync {
     fn transaction_broadcast(&self, tx: &Transaction) -> anyhow::Result<Txid>;
 }
+
 /// Abstraction over the read-side of a chain backend: pre-populating a transaction cache and
 /// performing a full keychain scan. Wallet-level sync routines compose these primitives instead
 /// of taking a hard dependency on a specific chain client (e.g. `BdkElectrumClient`).

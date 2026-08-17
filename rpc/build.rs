@@ -71,10 +71,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             hex("tx")
         ])
         .serde_serialized_type("SwapTxSignatureResponse", &[
-            hex("swapTx"), base64("peerOutputPrvKeyShare")
+            opt_base64("peerOutputPrvKeyShare")
         ])
         .serde_serialized_type("CloseTradeResponse", &[
-            base64("peerOutputPrvKeyShare")
+            opt_base64("peerOutputPrvKeyShare"), opt_hex("swapTx"), opt_hex("penaltyTx")
         ])
         .serde_serialized_type("CustomPayoutPsbt", &[
             base64("psbt")
