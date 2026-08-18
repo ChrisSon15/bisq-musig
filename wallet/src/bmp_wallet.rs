@@ -726,9 +726,13 @@ mod tests {
     use std::str::FromStr as _;
 
     use bdk_kyoto::FeeRate;
-    use bdk_kyoto::bip157::tokio;
+    use bdk_kyoto::bip157::{ScriptBuf, tokio};
     use bdk_wallet::bitcoin::hashes::Hash as _;
-    use bdk_wallet::bitcoin::{Address, AddressType, Amount, BlockHash, Network, Weight, psbt};
+    use bdk_wallet::bitcoin::key::Secp256k1;
+    use bdk_wallet::bitcoin::{
+        Address, AddressType, Amount, BlockHash, Network, OutPoint, TapNodeHash, TxOut, Weight,
+        psbt,
+    };
     use bdk_wallet::chain::{self, BlockId};
     use bdk_wallet::test_utils::{ReceiveTo, receive_output_to_address};
     use bdk_wallet::{AddressInfo, KeychainKind, SignOptions};
@@ -842,6 +846,36 @@ mod tests {
         bmp_wallet.persist()?;
         let loaded_wallet = BMPWallet::load_wallet(dir.path(), Network::Regtest, "")?;
         assert_eq!(loaded_wallet.imported_keys, bmp_wallet.imported_keys);
+        Ok(())
+    }
+
+    #[test]
+    fn test_imported_keys_with_merkle_root() -> anyhow::Result<()> {
+        let dir = get_dir();
+        let mut bmp_wallet = BMPWallet::new(dir.path(), "", Network::Regtest)?;
+        let pk = new_private_key();
+
+        // Create a sample merkle root (32 bytes hex)
+        let merkle_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let merkle = TapNodeHash::from_str(merkle_hex)?;
+
+        bmp_wallet.import_private_key(pk, Some(merkle));
+
+        assert_eq!(bmp_wallet.imported_keys.len(), 1);
+
+        // Persist
+        bmp_wallet.persist()?;
+        let loaded_wallet = BMPWallet::load_wallet(dir.path(), Network::Regtest, "")?;
+
+        assert_eq!(loaded_wallet.imported_keys.len(), 1);
+
+        let (loaded_pk, loaded_merkle_opt) = &loaded_wallet.imported_keys[0];
+        assert_eq!(loaded_pk, &pk);
+        let loaded_merkle = loaded_merkle_opt
+            .as_ref()
+            .expect("merkle root should be present");
+        assert_eq!(loaded_merkle.to_string(), merkle_hex);
+
         Ok(())
     }
 
@@ -978,6 +1012,64 @@ mod tests {
                 .add_foreign_utxo(i.outpoint, psbt_input, Weight::from_wu(66))
                 .unwrap();
         }
+
+        let mut res_psbt = tx_builder.finish()?;
+
+        bmp_wallet.sign(&mut res_psbt, SignOptions::default())?;
+
+        assert!(
+            res_psbt
+                .inputs
+                .iter()
+                .all(|i| i.final_script_witness.is_some())
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sign_with_imported_key_merkle_root() -> anyhow::Result<()> {
+        let dir = get_dir();
+        let mut bmp_wallet = BMPWallet::new(dir.path(), "", Network::Regtest)?;
+
+        let pk = new_private_key();
+
+        // Example merkle root hex (32 bytes)
+        let merkle_hex = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let merkle = TapNodeHash::from_str(merkle_hex)?;
+
+        // Import private key with merkle root
+        bmp_wallet.import_private_key(pk, Some(merkle));
+
+        // Build a tx consuming a foreign utxo that pays to tr(pubkey, merkle_root)
+        let secp = Secp256k1::new();
+        let xonly = derive_public_key(&pk);
+
+        let outpoint = OutPoint::from_str(
+            "0000000000000000000000000000000000000000000000000000000000000001:0",
+        )?;
+
+        let txout = TxOut {
+            value: Amount::ONE_BTC,
+            script_pubkey: ScriptBuf::new_p2tr(&secp, xonly, Some(merkle)),
+        };
+
+        let mut psbt_input = psbt::Input {
+            witness_utxo: Some(txout.clone()),
+            tap_internal_key: Some(xonly),
+            ..Default::default()
+        };
+        psbt_input.tap_merkle_root = Some(merkle);
+
+        let mut tx_builder = bmp_wallet.build_tx();
+        tx_builder
+            .add_foreign_utxo(outpoint, psbt_input, Weight::from_wu(66))
+            .unwrap();
+
+        // Add a recipient so transaction can be built
+        let to_address = "tb1pyfv094rr0vk28lf8v9yx3veaacdzg26ztqk4ga84zucqqhafnn5q9my9rz";
+        let to_address = to_address.parse::<Address<_>>()?.assume_checked();
+        tx_builder.add_recipient(to_address, Amount::from_sat(100_000));
 
         let mut res_psbt = tx_builder.finish()?;
 
