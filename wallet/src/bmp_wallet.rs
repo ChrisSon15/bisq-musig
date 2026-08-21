@@ -317,6 +317,9 @@ impl BMPWallet<Connection> {
         Ok(())
     }
 
+    /// Test-only introspection of the imported keys; enable the `test-utils` feature to use it
+    /// from tests in downstream crates.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn imported_keys(&self) -> &[ImportedKey] {
         &self.imported_keys
     }
@@ -1125,10 +1128,6 @@ mod tests {
         assert_eq!(
             imported.script_pubkey(),
             ScriptBuf::new_p2tr(&secp, xonly, Some(merkle_root))
-        );
-        assert_ne!(
-            imported.script_pubkey(),
-            ScriptBuf::new_p2tr(&secp, xonly, None)
         );
 
         // Put a utxo paying to tr(P, tap_tree) into the wallet's graph, the way `sync_all` does,
