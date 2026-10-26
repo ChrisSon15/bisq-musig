@@ -1271,6 +1271,7 @@ mod tests {
             address: Some(address_info(REGTEST_ADDRESS)),
             num_confirmations: 6,
             imported: true,
+            is_locked: false,
         };
         let proto: bmp_wallet::Utxo = utxo.into();
 
@@ -1290,6 +1291,7 @@ mod tests {
                 address: None,
                 num_confirmations: 0,
                 imported: false,
+                is_locked: false,
             }
         };
         assert_eq!(bmp_wallet::Utxo::from(nameless).address, None);
