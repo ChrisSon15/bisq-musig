@@ -229,6 +229,7 @@ impl BMPWallet {
     fn imported_utxos(&self) -> Vec<WeightedUtxo> {
         self.tx_graph()
             .floating_txouts()
+            .filter(|utxo| !self.is_utxo_locked(utxo.0))
             .map(|utxo| {
                 let output_script_pubkey = &utxo.1.script_pubkey;
 
@@ -346,6 +347,7 @@ impl BMPWallet {
                 address: self.address_for_script(&utxo.txout.script_pubkey),
                 num_confirmations: self.num_confirmations(block_height),
                 imported: false,
+                is_locked: self.is_outpoint_locked(utxo.outpoint),
             }
         });
 
@@ -361,6 +363,7 @@ impl BMPWallet {
                 address: self.address_for_script(&txout.script_pubkey),
                 num_confirmations: 0,
                 imported: true,
+                is_locked: self.is_outpoint_locked(outpoint)
             });
 
         own.chain(imported).collect()
@@ -661,6 +664,26 @@ impl ProtocolWalletApi for BMPWallet {
         tap_tree: Option<TapTree<XOnlyPublicKey>>,
     ) -> Result<()> {
         self.import_private_key(pk, tap_tree)
+    }
+
+    fn list_locked_utxos(&self) -> Result<Vec<OutPoint>> {
+        Ok(self.wallet.list_locked_outpoints().collect())
+    }
+
+    fn lock_utxo(&mut self, utxo: OutPoint) -> Result<()> {
+        self.lock_outpoint(utxo);
+        self.persist()?;
+        Ok(())
+    }
+
+    fn unlock_utxo(&mut self, utxo: OutPoint) -> Result<()> {
+        self.unlock_outpoint(utxo);
+        self.persist()?;
+        Ok(())
+    }
+
+    fn is_utxo_locked(&self, utxo: OutPoint) -> bool {
+        self.is_outpoint_locked(utxo)
     }
 }
 

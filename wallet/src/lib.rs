@@ -43,6 +43,7 @@ mod tests {
     use crate::error::WalletErrorKind;
     use crate::password::Password;
     use crate::persisted::{BMPWalletPersister as _, DBStorage};
+    use crate::protocol_wallet_api::ProtocolWalletApi as _;
     use crate::test_utils::{MemDbHandle, MockedBDKElectrum, derive_public_key, test_password};
     use crate::utils::derive_key_from_password;
 
@@ -688,6 +689,115 @@ mod tests {
                 .inputs
                 .iter()
                 .all(|i| i.final_script_witness.is_some())
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn locked_imported_utxo_is_not_selected() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        wallet.import_private_key(new_private_key(), None)?;
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let locked_imported = wallet
+            .list_utxos()
+            .into_iter()
+            .find(|utxo| utxo.imported)
+            .expect("sync should provide an imported UTXO");
+        let locked_outpoint = OutPoint::new(locked_imported.tx_id, locked_imported.vout);
+        wallet.lock_utxo(locked_outpoint)?;
+
+        assert!(wallet.is_utxo_locked(locked_outpoint));
+
+        let mut builder = wallet.build_tx();
+        builder
+            .fee_rate(FeeRate::from_sat_per_kwu(250))
+            .add_recipient(ScriptBuf::default(), Amount::from_sat(50_000_000));
+        let psbt = builder.finish()?;
+
+        assert_eq!(psbt.unsigned_tx.input.len(), 1);
+        assert_ne!(
+            psbt.unsigned_tx.input[0].previous_output, locked_outpoint,
+            "locked imported UTXO must not be selected"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn locked_wallet_utxo_is_not_selected_without_imported_utxos() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let own_utxo = wallet
+            .list_utxos()
+            .into_iter()
+            .find(|utxo| !utxo.imported)
+            .expect("sync should provide a wallet-owned UTXO");
+        let locked_outpoint = OutPoint::new(own_utxo.tx_id, own_utxo.vout);
+        wallet.lock_utxo(locked_outpoint)?;
+
+        let mut builder = wallet.build_tx();
+        builder
+            .fee_rate(FeeRate::from_sat_per_kwu(250))
+            .add_recipient(ScriptBuf::default(), Amount::from_sat(50_000_000));
+        let err = builder
+            .finish()
+            .expect_err("the only wallet UTXO is locked");
+
+        assert!(err.to_string().contains("Insufficient funds"), "got: {err}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn locked_utxos_remain_locked_after_wallet_reload() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(
+            mem_storage.store.clone(),
+            &test_password(),
+            Network::Regtest,
+        )?;
+        wallet.import_private_key(new_private_key(), None)?;
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let utxos = wallet.list_utxos();
+        let imported = utxos
+            .iter()
+            .find(|utxo| utxo.imported)
+            .expect("sync should provide an imported UTXO");
+        let owned = utxos
+            .iter()
+            .find(|utxo| !utxo.imported)
+            .expect("sync should provide a wallet-owned UTXO");
+        let imported_outpoint = OutPoint::new(imported.tx_id, imported.vout);
+        let owned_outpoint = OutPoint::new(owned.tx_id, owned.vout);
+
+        wallet.lock_utxo(imported_outpoint)?;
+        wallet.lock_utxo(owned_outpoint)?;
+        drop(wallet);
+
+        let reloaded =
+            BMPWallet::load_wallet(mem_storage.store, Network::Regtest, &test_password())?;
+
+        assert!(reloaded.is_utxo_locked(imported_outpoint));
+        assert!(reloaded.is_utxo_locked(owned_outpoint));
+
+        let reloaded_utxos = reloaded.list_utxos();
+        assert!(
+            reloaded_utxos
+                .iter()
+                .find(|utxo| OutPoint::new(utxo.tx_id, utxo.vout) == imported_outpoint)
+                .is_some_and(|utxo| utxo.is_locked)
+        );
+        assert!(
+            reloaded_utxos
+                .iter()
+                .find(|utxo| OutPoint::new(utxo.tx_id, utxo.vout) == owned_outpoint)
+                .is_some_and(|utxo| utxo.is_locked)
         );
 
         Ok(())

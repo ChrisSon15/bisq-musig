@@ -66,4 +66,5 @@ pub struct UtxoInfo {
     /// `true` when the output is controlled by an imported private key rather than by the
     /// wallet's own HD keychains.
     pub imported: bool,
+    pub is_locked: bool,
 }
