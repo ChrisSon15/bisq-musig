@@ -1,5 +1,4 @@
 use std::error::Error;
-use std::net::{AddrParseError, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,10 +60,6 @@ struct Cli {
     wallet_poll_secs: Option<u64>,
 }
 
-fn parse_peers(peers: &[String]) -> Result<Vec<SocketAddr>, AddrParseError> {
-    peers.iter().map(|peer| peer.parse()).collect()
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let cli: Cli = Cli::parse();
@@ -104,7 +99,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             service = service.with_poll_period(Duration::from_secs(secs));
         }
 
-        let peers = parse_peers(&cli.wallet_peers)?;
+        let peers = &cli.wallet_peers;
         if peers.is_empty() {
             warn!("No --wallet-peer given: the BMP wallet will not sync with the chain.");
         } else {
@@ -112,7 +107,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 peer_count = peers.len(),
                 "Syncing the BMP wallet over compact block filters once it has been opened."
             );
-            service = service.with_chain_data_source(CBFScanner::from_socket_addrs(peers));
+            service = service.with_chain_data_source(CBFScanner::from_hostnames(peers.clone()));
         }
 
         let service = Arc::new(service);
