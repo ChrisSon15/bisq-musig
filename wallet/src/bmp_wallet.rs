@@ -814,7 +814,16 @@ impl ProtocolWalletApi for BMPWallet {
     }
 
     fn list_locked_utxos(&self) -> Vec<OutPoint> {
-        self.wallet.list_locked_outpoints().collect()
+        let mut locked = self.wallet.list_locked_unspent().collect::<Vec<_>>();
+        locked.extend(
+            self.imported_utxos
+                .iter()
+                .filter(|(outpoint, imported)| {
+                    self.is_outpoint_locked(**outpoint) && self.imported_utxo_is_unspent(imported)
+                })
+                .map(|(outpoint, _)| *outpoint),
+        );
+        locked
     }
 
     fn lock_utxo(&mut self, utxo: OutPoint) -> Result<()> {
