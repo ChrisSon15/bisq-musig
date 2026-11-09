@@ -8,8 +8,8 @@ use bdk_electrum::bdk_core::bitcoin::{Address, FeeRate, OutPoint};
 use bdk_wallet::bitcoin::bip32::Xpriv;
 use bdk_wallet::bitcoin::hex::DisplayHex as _;
 use bdk_wallet::bitcoin::{
-    Amount, Network, PrivateKey, Psbt, ScriptBuf, Sequence, TapNodeHash, Transaction, TxOut,
-    Weight, XOnlyPublicKey, consensus, psbt,
+    Amount, Network, PrivateKey, Psbt, ScriptBuf, Sequence, TapNodeHash, Transaction, Weight,
+    XOnlyPublicKey, consensus, psbt,
 };
 use bdk_wallet::chain::{ChainPosition, FullTxOut, Merge as _};
 use bdk_wallet::descriptor::ExtendedDescriptor;
@@ -102,6 +102,7 @@ pub(crate) const STOP_GAP: usize = 50;
 #[derive(Clone, Copy)]
 enum ImportedBalance {
     Immature,
+    TrustedPending,
     UntrustedPending,
     Confirmed,
 }
@@ -110,6 +111,7 @@ impl ImportedBalance {
     fn add_to(self, balance: &mut Balance, amount: Amount) {
         let bucket = match self {
             Self::Immature => &mut balance.immature,
+            Self::TrustedPending => &mut balance.trusted_pending,
             Self::UntrustedPending => &mut balance.untrusted_pending,
             Self::Confirmed => &mut balance.confirmed,
         };
@@ -253,9 +255,78 @@ impl BMPWallet {
     }
 
     pub fn imported_balance(&self) -> Balance {
+        self.imported_balance_for_lock_state(None)
+    }
+
+    /// The balance reserved by locked, currently unspent outputs.
+    pub fn locked_balance(&self) -> Balance {
+        self.balance_for_lock_state(true) + self.imported_balance_for_lock_state(Some(true))
+    }
+
+    /// The balance available to a newly-built transaction.
+    ///
+    /// `full_balance` remains the complete balance breakdown, including reserved funds.
+    pub fn available_balance(&self) -> Balance {
+        self.balance_for_lock_state(false) + self.imported_balance_for_lock_state(Some(false))
+    }
+
+    fn balance_category(
+        wallet: &PersistedWallet<Connection>,
+        local: &LocalOutput,
+        trusted_pending: bool,
+    ) -> ImportedBalance {
+        let full_txo = FullTxOut {
+            chain_position: local.chain_position,
+            outpoint: local.outpoint,
+            txout: local.txout.clone(),
+            spent_by: None,
+            is_on_coinbase: wallet
+                .tx_graph()
+                .get_tx(local.outpoint.txid)
+                .is_some_and(|tx| tx.is_coinbase()),
+        };
+        let tip_height = wallet.latest_checkpoint().height();
+
+        if full_txo.chain_position.is_unconfirmed() {
+            if trusted_pending {
+                ImportedBalance::TrustedPending
+            } else {
+                ImportedBalance::UntrustedPending
+            }
+        } else if full_txo.is_confirmed_and_spendable(tip_height) {
+            ImportedBalance::Confirmed
+        } else if !full_txo.is_mature(tip_height) {
+            ImportedBalance::Immature
+        } else {
+            ImportedBalance::Confirmed
+        }
+    }
+
+    fn balance_for_lock_state(&self, locked: bool) -> Balance {
+        let mut balance = Balance::default();
+        for local in self.wallet.list_unspent() {
+            if self.is_outpoint_locked(local.outpoint) != locked {
+                continue;
+            }
+
+            Self::balance_category(
+                &self.wallet,
+                &local,
+                local.keychain == KeychainKind::Internal,
+            )
+            .add_to(&mut balance, local.txout.value);
+        }
+        balance
+    }
+
+    fn imported_balance_for_lock_state(&self, locked: Option<bool>) -> Balance {
         let mut balance = Balance::default();
         for imported in self.imported_utxos.values() {
-            if !self.imported_utxo_is_unspent(imported) {
+            if !self.imported_utxo_is_unspent(imported)
+                || locked.is_some_and(|locked| {
+                    self.is_outpoint_locked(imported.local.outpoint) != locked
+                })
+            {
                 continue;
             }
             imported
@@ -265,68 +336,6 @@ impl BMPWallet {
         balance
     }
 
-    /// Insert a foreign previous output into the main graph for fee calculation. When the output
-    /// belongs to an imported key, also make it available to the in-memory imported-UTXO cache.
-    /// More data are filled during wallet syncing
-    pub fn insert_txout(&mut self, outpoint: OutPoint, txout: TxOut) {
-        self.wallet.insert_txout(outpoint, txout.clone());
-
-        if self.imported_key_for_script(&txout.script_pubkey).is_none()
-            || self.imported_utxos.contains_key(&outpoint)
-        {
-            return;
-        }
-
-        self.imported_utxos.insert(
-            outpoint,
-            ImportedUtxo {
-                local: LocalOutput {
-                    outpoint,
-                    txout,
-                    keychain: KeychainKind::External,
-                    is_spent: false,
-                    derivation_index: 0,
-                    chain_position: ChainPosition::Unconfirmed {
-                        first_seen: None,
-                        last_seen: None,
-                    },
-                },
-                balance: ImportedBalance::UntrustedPending,
-            },
-        );
-    }
-
-    fn imported_utxo_from_wallet(
-        wallet: &PersistedWallet<Connection>,
-        local: LocalOutput,
-    ) -> ImportedUtxo {
-        let is_on_coinbase = wallet
-            .tx_graph()
-            .get_tx(local.outpoint.txid)
-            .is_some_and(|tx| tx.is_coinbase());
-        let full_txo = FullTxOut {
-            chain_position: local.chain_position,
-            outpoint: local.outpoint,
-            txout: local.txout.clone(),
-            spent_by: None,
-            is_on_coinbase,
-        };
-        let tip_height = wallet.latest_checkpoint().height();
-        let balance = if full_txo.chain_position.is_unconfirmed() {
-            // Imported wallets use their external keychain, so their unconfirmed outputs are
-            // untrusted pending rather than trusted pending.
-            ImportedBalance::UntrustedPending
-        } else if full_txo.is_confirmed_and_spendable(tip_height) {
-            ImportedBalance::Confirmed
-        } else if !full_txo.is_mature(tip_height) {
-            ImportedBalance::Immature
-        } else {
-            ImportedBalance::Confirmed
-        };
-
-        ImportedUtxo { local, balance }
-    }
-
     fn cache_imported_utxos<'a>(
         imported_wallets: impl IntoIterator<Item = &'a PersistedWallet<Connection>>,
     ) -> HashMap<OutPoint, ImportedUtxo> {
@@ -334,9 +343,10 @@ impl BMPWallet {
             .into_iter()
             .flat_map(|wallet| {
                 wallet.list_unspent().map(|local| {
+                    let balance = Self::balance_category(wallet, &local, false);
                     (
                         local.outpoint,
-                        Self::imported_utxo_from_wallet(wallet, local),
+                        ImportedUtxo { local, balance },
                     )
                 })
             })
@@ -1077,7 +1087,7 @@ impl WalletApi for BMPWallet {
     }
 
     fn balance(&self) -> Amount {
-        (self.imported_balance() + self.wallet.balance()).trusted_spendable()
+        self.available_balance().trusted_spendable()
     }
 
     fn get_seed_phrase(&self) -> Result<Mnemonic> {
