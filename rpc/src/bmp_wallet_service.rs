@@ -129,6 +129,11 @@ pub trait BmpWalletService {
 
     async fn full_balance(&self) -> anyhow::Result<Balance>;
 
+    /// Returns the complete balance, the transaction-eligible balance, and the reserved balance
+    /// from one wallet snapshot. The complete breakdown includes reserved funds; the available
+    /// breakdown excludes locked outputs.
+    async fn balance_snapshot(&self) -> anyhow::Result<(Balance, Balance, Balance)>;
+
     /// The wallet's seed phrase, one word per element.
     ///
     /// `password` must be the wallet password; a wrong one fails with [`InvalidPassword`] rather
@@ -453,6 +458,16 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
         Ok(require_open(&mut guard)?.full_balance())
     }
 
+    async fn balance_snapshot(&self) -> anyhow::Result<(Balance, Balance, Balance)> {
+        let mut guard = self.wallet.lock().await;
+        let wallet = require_open(&mut guard)?;
+        Ok((
+            wallet.full_balance(),
+            wallet.available_balance(),
+            wallet.locked_balance(),
+        ))
+    }
+
     async fn seed_words(&self, password: &str) -> anyhow::Result<Vec<String>> {
         let mut guard = self.wallet.lock().await;
         let wallet = require_open(&mut guard)?;
@@ -640,13 +655,17 @@ impl wallet_server::Wallet for BmpWalletImpl {
         request: Request<GetBalanceRequest>,
     ) -> Result<Response<GetBalanceResponse>> {
         handle_request_async(request, |_request| async {
-            let balance = self
+            let (balance, available, reserved) = self
                 .wallet_service
-                .full_balance()
+                .balance_snapshot()
                 .await
                 .map_err(|e| status_from(&e))?;
 
-            Ok(balance.into())
+            Ok(GetBalanceResponse::from_balances(
+                &balance,
+                &available,
+                &reserved,
+            ))
         })
         .await
     }
@@ -732,13 +751,24 @@ fn is_invalid_password(error: &anyhow::Error) -> bool {
 
 impl From<Balance> for GetBalanceResponse {
     fn from(value: Balance) -> Self {
+        let reserved = Balance::default();
+        Self::from_balances(&value, &value, &reserved)
+    }
+}
+
+impl GetBalanceResponse {
+    fn from_balances(total: &Balance, available: &Balance, reserved: &Balance) -> Self {
         Self {
-            // bisq2 reads only `balance`; keep it the trusted-spendable total it expects.
-            balance: value.trusted_spendable().to_sat(),
-            confirmed: value.confirmed.to_sat(),
-            trusted_pending: value.trusted_pending.to_sat(),
-            untrusted_pending: value.untrusted_pending.to_sat(),
-            immature: value.immature.to_sat(),
+            // bisq2 reads only `balance`; keep it the trusted-spendable amount that is actually
+            // available for a new transaction, excluding reserved outputs.
+            balance: available.trusted_spendable().to_sat(),
+            // The remaining fields retain the complete BDK breakdown for clients that need to
+            // distinguish total holdings from currently available funds.
+            confirmed: total.confirmed.to_sat(),
+            trusted_pending: total.trusted_pending.to_sat(),
+            untrusted_pending: total.untrusted_pending.to_sat(),
+            immature: total.immature.to_sat(),
+            reserved: reserved.total().to_sat(),
         }
     }
 }
@@ -1202,8 +1232,31 @@ mod tests {
         assert_eq!(proto.trusted_pending, 20);
         assert_eq!(proto.untrusted_pending, 300);
         assert_eq!(proto.immature, 1);
+        assert_eq!(proto.reserved, 0);
         // Untrusted/immature funds must never be presented as spendable.
         assert!(proto.balance < balance.total().to_sat());
+    }
+
+    #[test]
+    fn balance_maps_available_and_reserved_amounts_for_get_balance() {
+        let total = Balance {
+            confirmed: Amount::from_sat(2_000),
+            ..Balance::default()
+        };
+        let available = Balance {
+            confirmed: Amount::from_sat(750),
+            ..Balance::default()
+        };
+        let reserved = Balance {
+            confirmed: Amount::from_sat(1_250),
+            ..Balance::default()
+        };
+
+        let proto = GetBalanceResponse::from_balances(&total, &available, &reserved);
+
+        assert_eq!(proto.balance, 750);
+        assert_eq!(proto.confirmed, 2_000);
+        assert_eq!(proto.reserved, 1_250);
     }
 
     #[test]

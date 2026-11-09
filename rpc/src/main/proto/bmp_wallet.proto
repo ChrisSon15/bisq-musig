@@ -125,6 +125,8 @@ message GetBalanceResponse {
     uint64 trustedPending = 3;
     uint64 untrustedPending = 4;
     uint64 immature = 5;
+    // Total value currently reserved by locked, unspent outputs.
+    uint64 reserved = 6;
 }
 
 message GetSeedWordsRequest {
