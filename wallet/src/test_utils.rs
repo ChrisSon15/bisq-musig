@@ -11,15 +11,17 @@ use bdk_wallet::bitcoin::{
 };
 use bdk_wallet::chain::{BlockId, ChainPosition, ConfirmationBlockTime};
 use bdk_wallet::rusqlite::Connection;
-use bdk_wallet::test_utils::{insert_checkpoint, receive_output_in_latest_block};
+use bdk_wallet::test_utils::{
+    ReceiveTo, insert_checkpoint, receive_output, receive_output_in_latest_block,
+};
 use bdk_wallet::{KeychainKind, LocalOutput, PersistedWallet, Utxo, WeightedUtxo};
 use rand::RngCore as _;
 use secp::Scalar;
 
 use crate::bmp_wallet::ImportedKey;
 use crate::chain_data_source::ChainDataSource;
-use crate::password::Password;
 use crate::error::ChainDataSourceError;
+use crate::password::Password;
 use crate::persisted::{BMPWalletPersister, DBStorage};
 
 /// A password that follows the wallet's password rules, for tests that need some password.
@@ -70,6 +72,66 @@ impl ChainDataSource for MockedBDKElectrum {
                 },
             );
             receive_output_in_latest_block(w, Amount::ONE_BTC);
+        }
+        Ok(())
+    }
+}
+
+pub struct MockedBDKElectrumWithPending;
+
+impl ChainDataSource for MockedBDKElectrumWithPending {
+    const RECOVERY_HEIGHT: usize = 10;
+    const BATCH_SIZE: usize = 10;
+    const STOP_GAP: usize = 10;
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the ChainDataSource trait requires an async method"
+    )]
+    async fn sync(
+        &self,
+        persister: Vec<&mut PersistedWallet<impl BMPWalletPersister>>,
+    ) -> Result<(), ChainDataSourceError> {
+        for (wallet_index, wallet) in persister.into_iter().enumerate() {
+            insert_checkpoint(
+                wallet,
+                BlockId {
+                    height: 42,
+                    hash: BlockHash::all_zeros(),
+                },
+            );
+            insert_checkpoint(
+                wallet,
+                BlockId {
+                    height: 1_000,
+                    hash: BlockHash::all_zeros(),
+                },
+            );
+            insert_checkpoint(
+                wallet,
+                BlockId {
+                    height: 2_000,
+                    hash: BlockHash::all_zeros(),
+                },
+            );
+
+            match wallet_index {
+                1 => {
+                    let block_id = wallet.latest_checkpoint().block_id();
+                    receive_output(
+                        wallet,
+                        Amount::from_sat(10_000),
+                        ReceiveTo::Block(ConfirmationBlockTime {
+                            block_id,
+                            confirmation_time: 2_000,
+                        }),
+                    );
+                }
+                2 => {
+                    receive_output(wallet, Amount::from_sat(20_000), ReceiveTo::Mempool(2_000));
+                }
+                _ => {}
+            }
         }
         Ok(())
     }

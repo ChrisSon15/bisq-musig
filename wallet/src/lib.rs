@@ -46,7 +46,10 @@ mod tests {
     use crate::password::Password;
     use crate::persisted::{BMPWalletPersister as _, DBStorage};
     use crate::protocol_wallet_api::ProtocolWalletApi as _;
-    use crate::test_utils::{MemDbHandle, MockedBDKElectrum, derive_public_key, test_password};
+    use crate::test_utils::{
+        MemDbHandle, MockedBDKElectrum, MockedBDKElectrumWithPending, derive_public_key,
+        test_password,
+    };
     use crate::utils::derive_key_from_password;
 
     fn new_private_key() -> Scalar {
@@ -901,13 +904,14 @@ mod tests {
 
     #[tokio::test]
     async fn locked_utxos_remain_locked_after_wallet_reload() -> anyhow::Result<()> {
-        let mem_storage = MemDbHandle::new()?;
+        let mut mem_storage = MemDbHandle::new()?;
         let mut wallet = BMPWallet::new(
             mem_storage.store.clone(),
             &test_password(),
             Network::Regtest,
         )?;
         wallet.import_private_key(new_private_key(), None)?;
+        mem_storage.anchor_imported_key(&wallet.imported_keys()[0])?;
         wallet.sync_all(&MockedBDKElectrum {}).await?;
 
         let utxos = wallet.list_utxos();
@@ -924,6 +928,9 @@ mod tests {
 
         wallet.lock_utxo(imported_outpoint)?;
         wallet.lock_utxo(owned_outpoint)?;
+        let locked_outpoints = wallet.list_locked_utxos();
+        assert!(locked_outpoints.contains(&imported_outpoint));
+        assert!(locked_outpoints.contains(&owned_outpoint));
         drop(wallet);
 
         let mut reloaded = BMPWallet::load_wallet(
@@ -934,6 +941,9 @@ mod tests {
 
         assert!(reloaded.is_utxo_locked(imported_outpoint));
         assert!(reloaded.is_utxo_locked(owned_outpoint));
+        let locked_outpoints = reloaded.list_locked_utxos();
+        assert!(locked_outpoints.contains(&imported_outpoint));
+        assert!(locked_outpoints.contains(&owned_outpoint));
 
         let reloaded_utxos = reloaded.list_utxos();
         assert!(
@@ -952,6 +962,9 @@ mod tests {
         // Unlocking immediately makes the imported outpoint eligible for coin selection again.
         reloaded.unlock_utxo(imported_outpoint)?;
         assert!(!reloaded.is_utxo_locked(imported_outpoint));
+        let locked_outpoints = reloaded.list_locked_utxos();
+        assert!(!locked_outpoints.contains(&imported_outpoint));
+        assert!(locked_outpoints.contains(&owned_outpoint));
 
         let mut builder = reloaded.build_tx();
         builder
@@ -973,6 +986,7 @@ mod tests {
             BMPWallet::load_wallet(mem_storage.store, Network::Regtest, &test_password())?;
         assert!(!reloaded.is_utxo_locked(imported_outpoint));
         assert!(!reloaded.is_utxo_locked(owned_outpoint));
+        assert_eq!(reloaded.list_locked_utxos(), [] as [OutPoint; 0]);
 
         let mut builder = reloaded.build_tx();
         builder
@@ -988,6 +1002,9 @@ mod tests {
 
         // The owned outpoint is selectable too when the imported one is locked.
         reloaded.lock_utxo(imported_outpoint)?;
+        let locked_outpoints = reloaded.list_locked_utxos();
+        assert!(locked_outpoints.contains(&imported_outpoint));
+        assert!(!locked_outpoints.contains(&owned_outpoint));
         let mut builder = reloaded.build_tx();
         builder
             .fee_rate(FeeRate::from_sat_per_kwu(250))
@@ -1082,7 +1099,60 @@ mod tests {
                 .iter()
                 .all(|input| input.previous_output != locked_outpoint)
         );
+        // Building a PSBT does not mark its inputs spent. Once the wallet sees the spending
+        // transaction, the locked coin is the only imported balance left.
+        bdk_wallet::test_utils::insert_tx(&mut wallet, psbt.extract_tx()?);
         assert_eq!(wallet.imported_balance().trusted_spendable(), locked.amount);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drain_imported_balance_updates_the_spent_balance() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        wallet.import_private_key(new_private_key(), None)?;
+        wallet.import_private_key(new_private_key(), None)?;
+        wallet.sync_all(&MockedBDKElectrumWithPending {}).await?;
+
+        let imported = wallet
+            .list_utxos()
+            .into_iter()
+            .filter(|utxo| utxo.imported)
+            .collect::<Vec<_>>();
+        let confirmed = imported
+            .iter()
+            .find(|utxo| utxo.num_confirmations > 0)
+            .expect("the test chain should provide one confirmed imported UTXO");
+        let pending = imported
+            .iter()
+            .find(|utxo| utxo.num_confirmations == 0)
+            .expect("the test chain should provide one pending imported UTXO");
+        let confirmed_outpoint = OutPoint::new(confirmed.tx_id, confirmed.vout);
+        let pending_outpoint = OutPoint::new(pending.tx_id, pending.vout);
+
+        wallet.lock_utxo(confirmed_outpoint)?;
+        assert_eq!(
+            wallet.imported_balance().confirmed,
+            Amount::from_sat(10_000)
+        );
+        assert_eq!(
+            wallet.imported_balance().untrusted_pending,
+            Amount::from_sat(20_000)
+        );
+
+        let psbt = wallet.drain_imported_balance(FeeRate::from_sat_per_kwu(25_000))?;
+
+        assert_eq!(psbt.unsigned_tx.input.len(), 1);
+        assert_eq!(psbt.unsigned_tx.input[0].previous_output, pending_outpoint);
+        // The balance is recomputed from the graph, so the PSBT must be recorded before its input
+        // is considered spent.
+        bdk_wallet::test_utils::insert_tx(&mut wallet, psbt.extract_tx()?);
+        assert_eq!(
+            wallet.imported_balance().confirmed,
+            Amount::from_sat(10_000)
+        );
+        assert_eq!(wallet.imported_balance().untrusted_pending, Amount::ZERO);
 
         Ok(())
     }

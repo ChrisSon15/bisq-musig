@@ -8,10 +8,10 @@ use bdk_electrum::bdk_core::bitcoin::{Address, FeeRate, OutPoint};
 use bdk_wallet::bitcoin::bip32::Xpriv;
 use bdk_wallet::bitcoin::hex::DisplayHex as _;
 use bdk_wallet::bitcoin::{
-    Amount, Network, PrivateKey, Psbt, ScriptBuf, Sequence, TapNodeHash, Transaction, Weight,
-    XOnlyPublicKey, consensus, psbt,
+    Amount, Network, PrivateKey, Psbt, ScriptBuf, Sequence, TapNodeHash, Transaction, TxOut,
+    Weight, XOnlyPublicKey, consensus, psbt,
 };
-use bdk_wallet::chain::{ChainPosition, Merge as _};
+use bdk_wallet::chain::{ChainPosition, FullTxOut, Merge as _};
 use bdk_wallet::descriptor::ExtendedDescriptor;
 use bdk_wallet::keys::bip39::Mnemonic;
 use bdk_wallet::miniscript::descriptor::{KeyMap, TapTree, Tr};
@@ -20,8 +20,8 @@ use bdk_wallet::rusqlite::Connection;
 use bdk_wallet::signer::{InputSigner as _, SignerContext, SignerError, SignerWrapper};
 use bdk_wallet::template::{Bip86, DescriptorTemplate as _};
 use bdk_wallet::{
-    AddressInfo, Balance, KeychainKind, PersistedWallet, SignOptions, TxBuilder, Utxo, Wallet,
-    WeightedUtxo,
+    AddressInfo, Balance, KeychainKind, LocalOutput, PersistedWallet, SignOptions, TxBuilder, Utxo,
+    Wallet, WeightedUtxo,
 };
 use rand::RngCore as _;
 use secp::Scalar;
@@ -99,10 +99,34 @@ impl ImportedKey {
 
 pub(crate) const STOP_GAP: usize = 50;
 
+#[derive(Clone, Copy)]
+enum ImportedBalance {
+    Immature,
+    UntrustedPending,
+    Confirmed,
+}
+
+impl ImportedBalance {
+    fn add_to(self, balance: &mut Balance, amount: Amount) {
+        let bucket = match self {
+            Self::Immature => &mut balance.immature,
+            Self::UntrustedPending => &mut balance.untrusted_pending,
+            Self::Confirmed => &mut balance.confirmed,
+        };
+        *bucket = Amount::from_sat(bucket.to_sat().saturating_add(amount.to_sat()));
+    }
+}
+
+#[derive(Clone)]
+struct ImportedUtxo {
+    local: LocalOutput,
+    balance: ImportedBalance,
+}
+
 pub struct BMPWallet {
     wallet: PersistedWallet<Connection>,
     imported_keys: HashMap<ScriptBuf, ImportedKey>,
-    imported_balance: Balance,
+    imported_utxos: HashMap<OutPoint, ImportedUtxo>,
     signers_loaded: bool,
     db: BMPDatabase<Connection>,
     last_unused_address: Option<String>,
@@ -228,16 +252,114 @@ impl BMPWallet {
         keys
     }
 
-    pub const fn imported_balance(&self) -> &Balance {
-        &self.imported_balance
+    pub fn imported_balance(&self) -> Balance {
+        let mut balance = Balance::default();
+        for imported in self.imported_utxos.values() {
+            if !self.imported_utxo_is_unspent(imported) {
+                continue;
+            }
+            imported
+                .balance
+                .add_to(&mut balance, imported.local.txout.value);
+        }
+        balance
+    }
+
+    /// Insert a foreign previous output into the main graph for fee calculation. When the output
+    /// belongs to an imported key, also make it available to the in-memory imported-UTXO cache.
+    /// More data are filled during wallet syncing
+    pub fn insert_txout(&mut self, outpoint: OutPoint, txout: TxOut) {
+        self.wallet.insert_txout(outpoint, txout.clone());
+
+        if self.imported_key_for_script(&txout.script_pubkey).is_none()
+            || self.imported_utxos.contains_key(&outpoint)
+        {
+            return;
+        }
+
+        self.imported_utxos.insert(
+            outpoint,
+            ImportedUtxo {
+                local: LocalOutput {
+                    outpoint,
+                    txout,
+                    keychain: KeychainKind::External,
+                    is_spent: false,
+                    derivation_index: 0,
+                    chain_position: ChainPosition::Unconfirmed {
+                        first_seen: None,
+                        last_seen: None,
+                    },
+                },
+                balance: ImportedBalance::UntrustedPending,
+            },
+        );
+    }
+
+    fn imported_utxo_from_wallet(
+        wallet: &PersistedWallet<Connection>,
+        local: LocalOutput,
+    ) -> ImportedUtxo {
+        let is_on_coinbase = wallet
+            .tx_graph()
+            .get_tx(local.outpoint.txid)
+            .is_some_and(|tx| tx.is_coinbase());
+        let full_txo = FullTxOut {
+            chain_position: local.chain_position,
+            outpoint: local.outpoint,
+            txout: local.txout.clone(),
+            spent_by: None,
+            is_on_coinbase,
+        };
+        let tip_height = wallet.latest_checkpoint().height();
+        let balance = if full_txo.chain_position.is_unconfirmed() {
+            // Imported wallets use their external keychain, so their unconfirmed outputs are
+            // untrusted pending rather than trusted pending.
+            ImportedBalance::UntrustedPending
+        } else if full_txo.is_confirmed_and_spendable(tip_height) {
+            ImportedBalance::Confirmed
+        } else if !full_txo.is_mature(tip_height) {
+            ImportedBalance::Immature
+        } else {
+            ImportedBalance::Confirmed
+        };
+
+        ImportedUtxo { local, balance }
+    }
+
+    fn cache_imported_utxos<'a>(
+        imported_wallets: impl IntoIterator<Item = &'a PersistedWallet<Connection>>,
+    ) -> HashMap<OutPoint, ImportedUtxo> {
+        imported_wallets
+            .into_iter()
+            .flat_map(|wallet| {
+                wallet.list_unspent().map(|local| {
+                    (
+                        local.outpoint,
+                        Self::imported_utxo_from_wallet(wallet, local),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn imported_utxo_is_unspent(&self, imported: &ImportedUtxo) -> bool {
+        !imported.local.is_spent
+            && self
+                .tx_graph()
+                .outspends(imported.local.outpoint)
+                .is_empty()
     }
 
     fn imported_utxos(&self) -> Vec<WeightedUtxo> {
-        self.tx_graph()
-            .floating_txouts()
-            .filter(|utxo| !self.is_utxo_locked(utxo.0))
-            .map(|utxo| {
-                let output_script_pubkey = &utxo.1.script_pubkey;
+        self.imported_utxos
+            .iter()
+            .filter(|(outpoint, imported)| {
+                !self.is_utxo_locked(**outpoint) && self.imported_utxo_is_unspent(imported)
+            })
+            .map(|(_, imported)| {
+                let local = &imported.local;
+                let output_script_pubkey = &local.txout.script_pubkey;
 
                 let (tap_internal_key, tap_merkle_root) = self
                     .imported_keys
@@ -248,10 +370,10 @@ impl BMPWallet {
 
                 WeightedUtxo {
                     utxo: Utxo::Foreign {
-                        outpoint: utxo.0,
+                        outpoint: local.outpoint,
                         sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                         psbt_input: Box::new(psbt::Input {
-                            witness_utxo: Some(utxo.1.clone()),
+                            witness_utxo: Some(local.txout.clone()),
                             tap_internal_key,
                             tap_merkle_root,
                             ..Default::default()
@@ -274,7 +396,7 @@ impl BMPWallet {
     /// [`WalletApi::balance`] flattens this to a single spendable [`Amount`]; callers that need
     /// to distinguish confirmed from pending funds should use this instead.
     pub fn full_balance(&self) -> Balance {
-        self.imported_balance.clone() + self.wallet.balance()
+        self.imported_balance() + self.wallet.balance()
     }
 
     /// Every address revealed so far on either keychain, external first.
@@ -336,10 +458,9 @@ impl BMPWallet {
 
     /// All unspent outputs, both the HD wallet's own and those held by imported keys.
     ///
-    /// Imported outputs live in the tx graph as *floating* txouts (inserted by
-    /// [`WalletApi::sync_all`] so that fee calculation works), which carry no chain position —
-    /// they are therefore always reported with `num_confirmations == 0`. Ones the graph already
-    /// knows to be spent are dropped, so this stays consistent with [`Self::full_balance`].
+    /// Imported outputs are cached with their chain position, while their `TxOut`s are also kept
+    /// in the main graph so fee calculation can inspect transactions spending them. Outputs that
+    /// are spent by a locally recorded transaction are excluded from the displayed UTXO set.
     pub fn list_utxos(&self) -> Vec<UtxoInfo> {
         let own = self.list_unspent().map(|utxo| {
             let block_height = match utxo.chain_position {
@@ -358,18 +479,25 @@ impl BMPWallet {
         });
 
         let imported = self
-            .tx_graph()
-            .floating_txouts()
-            .filter(|(outpoint, _)| self.tx_graph().outspends(*outpoint).is_empty())
-            .filter(|(_, txout)| self.imported_key_for_script(&txout.script_pubkey).is_some())
-            .map(|(outpoint, txout)| UtxoInfo {
-                tx_id: outpoint.txid,
-                vout: outpoint.vout,
-                amount: txout.value,
-                address: self.address_for_script(&txout.script_pubkey),
-                num_confirmations: 0,
-                imported: true,
-                is_locked: self.is_outpoint_locked(outpoint)
+            .imported_utxos
+            .iter()
+            .filter(|(_, imported)| self.imported_utxo_is_unspent(imported))
+            .filter_map(|(outpoint, imported)| {
+                let local = &imported.local;
+                let block_height = match local.chain_position {
+                    ChainPosition::Confirmed { anchor, .. } => Some(anchor.block_id.height),
+                    ChainPosition::Unconfirmed { .. } => None,
+                };
+                self.imported_key_for_script(&local.txout.script_pubkey)
+                    .map(|_| UtxoInfo {
+                        tx_id: outpoint.txid,
+                        vout: outpoint.vout,
+                        amount: local.txout.value,
+                        address: self.address_for_script(&local.txout.script_pubkey),
+                        num_confirmations: self.num_confirmations(block_height),
+                        imported: true,
+                        is_locked: self.is_outpoint_locked(*outpoint),
+                    })
             });
 
         own.chain(imported).collect()
@@ -505,6 +633,8 @@ impl BMPWallet {
     /// in the mempool. Treating a signed-and-handed-out transaction as spent is the safe
     /// direction: a payment that never made it to the network leaves coins looking locked
     /// (recoverable) rather than double-spent (not).
+    ///
+    /// @TODO: reserve the utxo created from this method call and avoid reselecting them
     pub fn send_to_address(
         &mut self,
         address: &Address,
@@ -610,10 +740,15 @@ impl BMPWallet {
             Self::insert_imported_key(&mut imported_keys, key)?;
         }
 
+        let imported_wallets =
+            Self::load_imported_wallets(imported_keys.values(), &storage, network)?;
+        let imported_utxos =
+            Self::cache_imported_utxos(imported_wallets.iter().map(|(wallet, _)| wallet));
+
         Ok(Self {
             wallet,
             imported_keys,
-            imported_balance: Balance::default(),
+            imported_utxos,
             signers_loaded: false,
             db: BMPDatabase::new(storage, db),
             last_unused_address: None,
@@ -673,7 +808,7 @@ impl ProtocolWalletApi for BMPWallet {
     }
 
     fn list_locked_utxos(&self) -> Vec<OutPoint> {
-        self.wallet.list_locked_unspent().collect()
+        self.wallet.list_locked_outpoints().collect()
     }
 
     fn lock_utxo(&mut self, utxo: OutPoint) -> Result<()> {
@@ -750,25 +885,20 @@ impl WalletApi for BMPWallet {
         );
 
         s.sync(vec).await?;
-
-        let mut final_imported_balance = Balance::default();
-
-        // For having accurate Wallet::calculate_fee and Wallet::calculate_fee_rate
-        // This is also at same time a way to have to UTXOs of the imported merged
-        // into the main wallet, allowing easy manipulation during coinselection
+        // Keep the imported TxOuts in the main graph so fee calculation can inspect transactions
+        // spending them. Their ownership, chain position, and balance category remain in the
+        // imported-UTXO cache below.
         for (w, _) in &imported {
             for utxo in w.list_unspent() {
-                self.insert_txout(utxo.outpoint, utxo.txout);
+                self.wallet.insert_txout(utxo.outpoint, utxo.txout);
             }
-            final_imported_balance = final_imported_balance + w.balance();
         }
-
-        self.imported_balance = final_imported_balance;
 
         // Persist changes from imported keys
         for (w, db) in &mut imported {
             w.persist(db)?;
         }
+        self.imported_utxos = Self::cache_imported_utxos(imported.iter().map(|(wallet, _)| wallet));
 
         self.persist()?;
         Ok(())
@@ -819,7 +949,7 @@ impl WalletApi for BMPWallet {
         Ok(Self {
             wallet,
             imported_keys: HashMap::new(),
-            imported_balance: Balance::default(),
+            imported_utxos: HashMap::new(),
             signers_loaded: true,
             db: BMPDatabase::new(storage, db),
             last_unused_address: None,
@@ -947,7 +1077,7 @@ impl WalletApi for BMPWallet {
     }
 
     fn balance(&self) -> Amount {
-        (self.imported_balance.clone() + self.wallet.balance()).trusted_spendable()
+        (self.imported_balance() + self.wallet.balance()).trusted_spendable()
     }
 
     fn get_seed_phrase(&self) -> Result<Mnemonic> {
@@ -972,7 +1102,15 @@ impl WalletApi for BMPWallet {
         let psbt = match tx_builder.finish() {
             Err(bdk_wallet::error::CreateTxError::CoinSelection(insufficient_funds)) => {
                 let cs = SpendImportedOnly(imported_utxos);
-                let fees = insufficient_funds.needed - insufficient_funds.available;
+                let Some(fees) = insufficient_funds
+                    .needed
+                    .checked_sub(insufficient_funds.available)
+                else {
+                    return Err(
+                        bdk_wallet::error::CreateTxError::CoinSelection(insufficient_funds)
+                            .into(),
+                    );
+                };
                 let Some(amount_to_send) = imported_amount.checked_sub(fees) else {
                     return Err(
                         bdk_wallet::error::CreateTxError::CoinSelection(insufficient_funds)
@@ -988,30 +1126,6 @@ impl WalletApi for BMPWallet {
             Err(e) => return Err(e.into()),
             Ok(psbt) => psbt,
         };
-
-        let spent_amount: Amount = psbt
-            .inputs
-            .iter()
-            .map(|input| {
-                input
-                    .witness_utxo
-                    .as_ref()
-                    .expect("drain PSBT inputs must include witness UTXOs")
-                    .value
-            })
-            .sum();
-        self.imported_balance.confirmed = self
-            .imported_balance
-            .confirmed
-            .checked_sub(spent_amount)
-            .unwrap_or_default();
-
-        tracing::debug!(
-            "spent imported amount {}, remaining imported balance {}",
-            spent_amount,
-            self.imported_balance
-        );
-
         Ok(psbt)
     }
 }
