@@ -48,7 +48,7 @@ mod tests {
     use crate::protocol_wallet_api::ProtocolWalletApi as _;
     use crate::test_utils::{
         MemDbHandle, MockedBDKElectrum, MockedBDKElectrumWithCoinbase,
-        MockedBDKElectrumWithPending, derive_public_key, test_password,
+        MockedBDKElectrumWithPending, MockedBDKElectrumWithSpend, derive_public_key, test_password,
     };
     use crate::utils::derive_key_from_password;
 
@@ -891,6 +891,50 @@ mod tests {
             .expect_err("the only wallet UTXO is locked");
 
         assert!(err.to_string().contains("Insufficient funds"), "got: {err}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_locked_utxos_omits_unknown_outpoints() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let unknown = OutPoint::null();
+        wallet.lock_utxo(unknown)?;
+
+        assert!(wallet.is_utxo_locked(unknown));
+        assert!(!wallet.list_locked_utxos().contains(&unknown));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn locked_outpoint_is_removed_from_active_locks_when_spent() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let owned = wallet
+            .list_utxos()
+            .into_iter()
+            .find(|utxo| !utxo.imported)
+            .expect("sync should provide a wallet-owned UTXO");
+        let outpoint = OutPoint::new(owned.tx_id, owned.vout);
+        wallet.lock_utxo(outpoint)?;
+        assert!(wallet.list_locked_utxos().contains(&outpoint));
+
+        wallet.sync_all(&MockedBDKElectrumWithSpend {}).await?;
+
+        assert!(wallet.is_utxo_locked(outpoint));
+        assert!(!wallet.list_locked_utxos().contains(&outpoint));
+        assert!(
+            !wallet
+                .list_utxos()
+                .iter()
+                .any(|utxo| OutPoint::new(utxo.tx_id, utxo.vout) == outpoint)
+        );
 
         Ok(())
     }

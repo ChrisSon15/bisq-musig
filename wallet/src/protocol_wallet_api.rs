@@ -222,7 +222,7 @@ impl ProtocolWalletApi for MemWallet {
     }
 
     fn list_locked_utxos(&self) -> Vec<OutPoint> {
-        self.wallet.list_locked_outpoints().collect()
+        self.wallet.list_locked_unspent().collect()
     }
 
     fn unlock_utxo(&mut self, utxo: OutPoint) -> Result<()> {
@@ -288,7 +288,7 @@ impl ProtocolWalletApi for Wallet {
     }
 
     fn list_locked_utxos(&self) -> Vec<OutPoint> {
-        self.list_locked_outpoints().collect()
+        self.list_locked_unspent().collect()
     }
 
     fn unlock_utxo(&mut self, utxo: OutPoint) -> Result<()> {

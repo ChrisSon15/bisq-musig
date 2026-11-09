@@ -12,7 +12,7 @@ use bdk_wallet::bitcoin::{
 use bdk_wallet::chain::{BlockId, ChainPosition, ConfirmationBlockTime};
 use bdk_wallet::rusqlite::Connection;
 use bdk_wallet::test_utils::{
-    ReceiveTo, insert_checkpoint, receive_output, receive_output_in_latest_block,
+    ReceiveTo, insert_checkpoint, insert_tx, receive_output, receive_output_in_latest_block,
 };
 use bdk_wallet::{KeychainKind, LocalOutput, PersistedWallet, Utxo, WeightedUtxo};
 use rand::RngCore as _;
@@ -132,6 +132,47 @@ impl ChainDataSource for MockedBDKElectrumWithPending {
                 }
                 _ => {}
             }
+        }
+        Ok(())
+    }
+}
+
+pub struct MockedBDKElectrumWithSpend;
+
+impl ChainDataSource for MockedBDKElectrumWithSpend {
+    const RECOVERY_HEIGHT: usize = 10;
+    const BATCH_SIZE: usize = 1;
+    const STOP_GAP: usize = 1;
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the ChainDataSource trait requires an async method"
+    )]
+    async fn sync(
+        &self,
+        persister: Vec<&mut PersistedWallet<impl BMPWalletPersister>>,
+    ) -> Result<(), ChainDataSourceError> {
+        for wallet in persister {
+            let previous_output = wallet
+                .list_unspent()
+                .next()
+                .expect("wallet should have an output to spend")
+                .outpoint;
+            insert_tx(
+                wallet,
+                Transaction {
+                    version: bdk_wallet::bitcoin::transaction::Version::ONE,
+                    lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+                    input: vec![bdk_wallet::bitcoin::TxIn {
+                        previous_output,
+                        ..Default::default()
+                    }],
+                    output: vec![TxOut {
+                        value: Amount::from_sat(1),
+                        script_pubkey: ScriptBuf::new(),
+                    }],
+                },
+            );
         }
         Ok(())
     }
