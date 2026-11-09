@@ -137,6 +137,74 @@ impl ChainDataSource for MockedBDKElectrumWithPending {
     }
 }
 
+pub struct MockedBDKElectrumWithCoinbase {
+    pub tip_height: u32,
+}
+
+impl ChainDataSource for MockedBDKElectrumWithCoinbase {
+    const RECOVERY_HEIGHT: usize = 1;
+    const BATCH_SIZE: usize = 1;
+    const STOP_GAP: usize = 1;
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the ChainDataSource trait requires an async method"
+    )]
+    async fn sync(
+        &self,
+        persister: Vec<&mut PersistedWallet<impl BMPWalletPersister>>,
+    ) -> Result<(), ChainDataSourceError> {
+        let confirmation = BlockId {
+            height: 1,
+            hash: BlockHash::all_zeros(),
+        };
+        for wallet in persister {
+            insert_checkpoint(wallet, confirmation);
+            insert_checkpoint(
+                wallet,
+                BlockId {
+                    height: self.tip_height,
+                    hash: BlockHash::all_zeros(),
+                },
+            );
+
+            let tx = Transaction {
+                version: bdk_wallet::bitcoin::transaction::Version::ONE,
+                lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+                input: vec![bdk_wallet::bitcoin::TxIn {
+                    previous_output: OutPoint::null(),
+                    ..Default::default()
+                }],
+                output: vec![TxOut {
+                    script_pubkey: wallet
+                        .peek_address(KeychainKind::External, 0)
+                        .address
+                        .script_pubkey(),
+                    value: Amount::ONE_BTC,
+                }],
+            };
+            let txid = tx.compute_txid();
+            let mut tx_update = bdk_wallet::chain::TxUpdate::default();
+            tx_update.txs = vec![std::sync::Arc::new(tx)];
+            tx_update.anchors = [(
+                ConfirmationBlockTime {
+                    block_id: confirmation,
+                    confirmation_time: 1,
+                },
+                txid,
+            )]
+            .into();
+            wallet
+                .apply_update(bdk_wallet::Update {
+                    tx_update,
+                    ..Default::default()
+                })
+                .expect("failed to apply coinbase update");
+        }
+        Ok(())
+    }
+}
+
 pub fn verify_signature(
     signing_key: &PrivateKey,
     witness: &Witness,
