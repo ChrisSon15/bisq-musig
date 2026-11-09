@@ -37,7 +37,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::{self, JoinHandle};
 use tokio::time::{self, Duration, MissedTickBehavior};
 use tonic::{Request, Response, Result, Status};
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 use zeroize::Zeroizing;
 
 use crate::observable::ObservableHashMap;
@@ -85,6 +85,18 @@ pub trait BmpWalletService {
     /// Whether the wallet is open and, if a chain data source is configured, has completed at
     /// least one sync.
     fn is_ready(&self) -> bool;
+
+    /// Whether a wallet database exists in the wallet directory, open or not, so a client can
+    /// tell, without a password, whether [`Self::open_or_create_wallet`] would open a wallet or
+    /// create one. Checks the directory afresh on every call.
+    ///
+    /// # Errors
+    /// Will return `Err` if the directory can't be checked (e.g. for lack of permission).
+    fn wallet_exists(&self) -> std::io::Result<bool>;
+
+    /// Whether [`Self::open_or_create_wallet`] has opened the wallet. Unlike [`Self::is_ready`],
+    /// this doesn't wait for the first sync.
+    fn is_open(&self) -> bool;
 
     /// Opens the wallet database, creating a fresh wallet only if none exists yet.
     ///
@@ -159,6 +171,9 @@ pub struct BMPWalletServiceImpl<S> {
     tx_confidence_map: Mutex<ObservableHashMap<Txid, TxConfidence>>,
     chain_data_source: Option<S>,
     broadcaster: Option<Arc<dyn ChainApi>>,
+    /// Set once `wallet` holds an open wallet (it is never closed again), so that the status
+    /// can be read without waiting on the wallet lock, which a sync may hold for a long time.
+    open: AtomicBool,
     ready: AtomicBool,
     poll_period: Duration,
 }
@@ -184,6 +199,7 @@ impl<S> BMPWalletServiceImpl<S> {
             tx_confidence_map: Mutex::new(ObservableHashMap::new()),
             chain_data_source: None,
             broadcaster: None,
+            open: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             poll_period: DEFAULT_POLL_PERIOD,
         }
@@ -214,6 +230,11 @@ impl<S> BMPWalletServiceImpl<S> {
             poll_period,
             ..self
         }
+    }
+
+    /// Where the wallet database lives (or will live, once created).
+    fn db_path(&self) -> PathBuf {
+        self.wallet_dir.join(BMPWallet::DB_NAME)
     }
 
     pub fn get_tx_confidence_stream(&self, txid: Txid) -> BoxStream<'static, Option<TxConfidence>> {
@@ -313,6 +334,14 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
         self.ready.load(Ordering::Acquire)
     }
 
+    fn wallet_exists(&self) -> std::io::Result<bool> {
+        self.db_path().try_exists()
+    }
+
+    fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
+
     async fn open_or_create_wallet(&self, password: &str) -> anyhow::Result<()> {
         let mut guard = self.wallet.lock().await;
 
@@ -330,7 +359,7 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
         // rewrites the Argon2 salt the existing database's key was derived from — which would
         // render that wallet, and any funds in it, permanently unrecoverable.
         fs::create_dir_all(&self.wallet_dir)?;
-        let db_path = self.wallet_dir.join(BMPWallet::DB_NAME);
+        let db_path = self.db_path();
         let wallet = if db_path.exists() {
             let wallet = match BMPWallet::load_wallet(
                 self.wallet_dir.as_path().into(),
@@ -369,6 +398,7 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
             .unwrap()
             .sync(tx_confidence_entries(&wallet));
         *guard = Some(wallet);
+        self.open.store(true, Ordering::Release);
 
         // With no chain data source there is nothing to sync, so the wallet is ready as soon as
         // it is open; otherwise the sync loop flips the flag after the first successful sync.
@@ -517,8 +547,16 @@ impl wallet_server::Wallet for BmpWalletImpl {
         request: Request<IsWalletReadyRequest>,
     ) -> Result<Response<IsWalletReadyResponse>> {
         handle_request_async(request, |_request| async {
+            let exists = self
+                .wallet_service
+                .wallet_exists()
+                .inspect_err(|e| warn!("Could not check whether the wallet exists: {e}"))
+                .ok();
+
             Ok(IsWalletReadyResponse {
                 ready: self.wallet_service.is_ready(),
+                exists,
+                open: Some(self.wallet_service.is_open()),
             })
         })
         .await
@@ -906,6 +944,55 @@ mod tests {
                 .await
                 .is_err()
         );    
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reports_whether_the_wallet_exists_and_is_open() {
+        // A wallet directory that hasn't been created yet: no wallet, nothing open.
+        let dir = tempdir().unwrap();
+        let wallet_dir = dir.path().join("wallet");
+        let service =
+            BMPWalletServiceImpl::<NoopChainDataSource>::new(&wallet_dir, Network::Regtest);
+        assert!(
+            !service.wallet_exists().unwrap(),
+            "no wallet directory, so no wallet"
+        );
+        assert!(!service.is_open());
+        assert!(!service.is_ready());
+
+        // Creating the wallet makes it exist and leaves it open.
+        service.open_or_create_wallet(PASSWORD).await.unwrap();
+        assert!(service.wallet_exists().unwrap());
+        assert!(service.is_open());
+        assert!(service.is_ready());
+
+        // A fresh service on the same directory sees the wallet, closed, before any password
+        // has been sent.
+        let reloaded =
+            BMPWalletServiceImpl::<NoopChainDataSource>::new(&wallet_dir, Network::Regtest);
+        assert!(
+            reloaded.wallet_exists().unwrap(),
+            "the closed wallet must still be seen"
+        );
+        assert!(!reloaded.is_open());
+        assert!(!reloaded.is_ready());
+
+        // A refused open leaves the wallet closed.
+        assert!(reloaded.open_or_create_wallet(NEW_PASSWORD).await.is_err());
+        assert!(!reloaded.is_open());
+
+        reloaded.open_or_create_wallet(PASSWORD).await.unwrap();
+        assert!(reloaded.wallet_exists().unwrap());
+        assert!(reloaded.is_open());
+        assert!(reloaded.is_ready());
+
+        // With a chain data source, an open wallet isn't ready until its first sync, which is
+        // what `is_open` tells apart from a wallet that hasn't been opened.
+        let syncing = BMPWalletServiceImpl::new(&wallet_dir, Network::Regtest)
+            .with_chain_data_source(NoopChainDataSource);
+        syncing.open_or_create_wallet(PASSWORD).await.unwrap();
+        assert!(syncing.is_open());
+        assert!(!syncing.is_ready(), "no sync has run yet");
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -115,8 +115,12 @@ public class BmpWalletServiceTest {
     private void isWalletReady() {
         // Either answer is legitimate — an unsynced wallet reports false — but the call itself
         // must succeed, which is what proves the method is wired to BMPWalletServiceImpl.
-        boolean ready = stub.isWalletReady(IsWalletReadyRequest.newBuilder().build()).getReady();
-        System.out.println("    ready=" + ready);
+        var response = stub.isWalletReady(IsWalletReadyRequest.newBuilder().build());
+        // OpenOrCreateWallet has run by now, so the wallet must exist and be open.
+        assertTrue(response.getExists(), "the opened wallet must exist");
+        assertTrue(response.getOpen(), "the opened wallet must be open");
+        System.out.println("    ready=" + response.getReady() + " exists=" + response.getExists()
+                + " open=" + response.getOpen());
     }
 
     private void getBalance() {

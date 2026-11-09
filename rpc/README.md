@@ -57,9 +57,11 @@ below to sync from this node.
 
 When `musigd` is started with `--wallet-dir <dir>`, it serves the `wallet.Wallet` service from a `BMPWallet` stored in
 that directory. The wallet is not opened at startup: the client opens (or creates) it with the `OpenOrCreateWallet`
-RPC, which carries the wallet password. It syncs over Compact Block Filters from the peers given with `--wallet-peer
-<host:port>` (repeatable), re-syncing every `--wallet-poll-secs` seconds; with no peer it does not sync, but all
-non-chain operations still work. `--wallet-network` selects the network (default `regtest`). Transactions are
+RPC, which carries the wallet password. Before that, `IsWalletReady` tells a client, without a password, whether a
+wallet database exists in the directory (`exists`) and whether it has been opened (`open`), so it can tell whether
+`OpenOrCreateWallet` would open its wallet or create a new, empty one. The wallet syncs over Compact Block Filters
+from the peers given with `--wallet-peer <host:port>` (repeatable), re-syncing every `--wallet-poll-secs` seconds;
+with no peer it does not sync, but all non-chain operations still work. `--wallet-network` selects the network (default `regtest`). Transactions are
 broadcast via the Bitcoin Core RPC connection above.
 
 [bmp_wallet.proto](src/main/proto/bmp_wallet.proto) is derived from bisq2's own `wallet/src/main/proto/wallet.proto`

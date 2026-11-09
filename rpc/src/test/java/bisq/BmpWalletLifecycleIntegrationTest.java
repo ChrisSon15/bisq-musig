@@ -5,6 +5,7 @@ import bisq.wallet.protobuf.GetBalanceRequest;
 import bisq.wallet.protobuf.GetSeedWordsRequest;
 import bisq.wallet.protobuf.GetUnusedAddressRequest;
 import bisq.wallet.protobuf.IsWalletReadyRequest;
+import bisq.wallet.protobuf.IsWalletReadyResponse;
 import bisq.wallet.protobuf.OpenOrCreateWalletRequest;
 import bisq.wallet.protobuf.WalletGrpc;
 import io.grpc.ManagedChannel;
@@ -80,8 +81,12 @@ public class BmpWalletLifecycleIntegrationTest {
     @Test
     @Order(1)
     void walletOperationsBeforeOpenAreRefused() {
-        assertFalse(stub.isWalletReady(IsWalletReadyRequest.newBuilder().build()).getReady(),
-                "an unopened wallet must not report itself ready");
+        IsWalletReadyResponse status = walletStatus();
+        assertFalse(status.getReady(), "an unopened wallet must not report itself ready");
+        assertTrue(status.hasExists() && status.hasOpen(),
+                "musigd must report whether the wallet exists and is open");
+        assertFalse(status.getExists(), "no wallet has been created yet");
+        assertFalse(status.getOpen());
 
         StatusRuntimeException e = assertThrows(StatusRuntimeException.class,
                 () -> stub.getBalance(GetBalanceRequest.newBuilder().build()));
@@ -109,16 +114,18 @@ public class BmpWalletLifecycleIntegrationTest {
             assertTrue(description.contains("at least 8 characters"),
                     "the rules must be spelled out, got: " + description);
         }
-        assertFalse(stub.isWalletReady(IsWalletReadyRequest.newBuilder().build()).getReady(),
-                "no wallet must have been created");
+        assertFalse(walletStatus().getExists(), "no wallet must have been created");
 
         assertTrue(stub.openOrCreateWallet(OpenOrCreateWalletRequest.newBuilder()
                         .setPassword(PASSWORD)
                         .build())
                 .getSuccess());
 
-        assertTrue(stub.isWalletReady(IsWalletReadyRequest.newBuilder().build()).getReady(),
+        IsWalletReadyResponse status = walletStatus();
+        assertTrue(status.getReady(),
                 "with no chain source configured, an open wallet is a ready wallet");
+        assertTrue(status.getExists(), "the created wallet must exist");
+        assertTrue(status.getOpen(), "the created wallet must be open");
         assertEquals(0, stub.getBalance(GetBalanceRequest.newBuilder().build()).getBalance(),
                 "a fresh wallet starts empty");
 
@@ -197,6 +204,13 @@ public class BmpWalletLifecycleIntegrationTest {
         stopMusigd();
         startMusigd();
 
+        // Before any password is sent, the client can tell the wallet is there but closed, so
+        // OpenOrCreateWallet would open it rather than create a new one.
+        IsWalletReadyResponse status = walletStatus();
+        assertTrue(status.getExists(), "the persisted wallet must be seen without a password");
+        assertFalse(status.getOpen(), "the restarted daemon has not opened the wallet yet");
+        assertFalse(status.getReady());
+
         // The daemon restarted, so the wallet must be re-opened — and the password in force is
         // the one the previous test changed to, not the one the wallet was created with.
         StatusRuntimeException e = assertThrows(StatusRuntimeException.class,
@@ -212,6 +226,7 @@ public class BmpWalletLifecycleIntegrationTest {
                 .getSuccess());
         assertEquals(seedWords, seedWords(NEW_PASSWORD),
                 "reloading must yield the same wallet, not a fresh one");
+        assertTrue(walletStatus().getOpen());
     }
 
     // --- plumbing ----------------------------------------------------------------------------
@@ -234,6 +249,10 @@ public class BmpWalletLifecycleIntegrationTest {
             musigd.close();
             musigd = null;
         }
+    }
+
+    private IsWalletReadyResponse walletStatus() {
+        return stub.isWalletReady(IsWalletReadyRequest.newBuilder().build());
     }
 
     private List<String> seedWords(String password) {
