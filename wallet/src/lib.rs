@@ -47,8 +47,8 @@ mod tests {
     use crate::persisted::{BMPWalletPersister as _, DBStorage};
     use crate::protocol_wallet_api::ProtocolWalletApi as _;
     use crate::test_utils::{
-        MemDbHandle, MockedBDKElectrum, MockedBDKElectrumWithPending, derive_public_key,
-        test_password,
+        MemDbHandle, MockedBDKElectrum, MockedBDKElectrumWithCoinbase,
+        MockedBDKElectrumWithPending, derive_public_key, test_password,
     };
     use crate::utils::derive_key_from_password;
 
@@ -1047,6 +1047,58 @@ mod tests {
         assert_eq!(
             wallet.locked_balance().trusted_spendable(),
             Amount::from_int_btc(1)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn immature_imported_coinbase_is_not_selected_until_mature() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        wallet.import_private_key(new_private_key(), None)?;
+
+        wallet
+            .sync_all(&MockedBDKElectrumWithCoinbase { tip_height: 1 })
+            .await?;
+        let _immature = wallet
+            .list_utxos()
+            .into_iter()
+            .find(|utxo| utxo.imported)
+            .expect("sync should provide an imported coinbase UTXO");
+        assert_eq!(wallet.imported_balance().immature, Amount::ONE_BTC);
+
+        let mut builder = wallet.build_tx();
+        builder
+            .fee_rate(FeeRate::from_sat_per_kwu(250))
+            .add_recipient(ScriptBuf::default(), Amount::from_sat(50_000_000));
+        let error = builder
+            .finish()
+            .expect_err("immature imported coinbase must not be selected");
+        assert!(error.to_string().contains("Insufficient funds"));
+
+        let mem_storage = MemDbHandle::new()?;
+        let mut mature_wallet =
+            BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        mature_wallet.import_private_key(new_private_key(), None)?;
+        mature_wallet
+            .sync_all(&MockedBDKElectrumWithCoinbase { tip_height: 100 })
+            .await?;
+        let mature = mature_wallet
+            .list_utxos()
+            .into_iter()
+            .find(|utxo| utxo.imported)
+            .expect("mature sync should provide an imported coinbase UTXO");
+        let mut builder = mature_wallet.build_tx();
+        builder
+            .fee_rate(FeeRate::from_sat_per_kwu(250))
+            .add_recipient(ScriptBuf::default(), Amount::from_sat(50_000_000));
+        let psbt = builder.finish()?;
+        assert!(
+            psbt.unsigned_tx
+                .input
+                .iter()
+                .any(|input| input.previous_output == OutPoint::new(mature.tx_id, mature.vout))
         );
 
         Ok(())

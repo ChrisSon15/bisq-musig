@@ -365,7 +365,9 @@ impl BMPWallet {
         self.imported_utxos
             .iter()
             .filter(|(outpoint, imported)| {
-                !self.is_utxo_locked(**outpoint) && self.imported_utxo_is_unspent(imported)
+                !self.is_utxo_locked(**outpoint)
+                    && self.imported_utxo_is_unspent(imported)
+                    && !matches!(imported.balance, ImportedBalance::Immature)
             })
             .map(|(_, imported)| {
                 let local = &imported.local;
