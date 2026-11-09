@@ -204,4 +204,6 @@ message Utxo {
     // Absent when the script doesn't decode to a standard address.
     PubAddressInfo address = 4;
     uint32 numConfirmations = 5;
+    // Whether this unspent output is reserved and excluded from coin selection.
+    bool isLocked = 6;
 }

@@ -800,6 +800,7 @@ impl From<UtxoInfo> for bmp_wallet::Utxo {
             amount: value.amount.to_sat(),
             address: value.address.map(Into::into),
             num_confirmations: value.num_confirmations,
+            is_locked: value.is_locked,
         }
     }
 }
@@ -1324,7 +1325,7 @@ mod tests {
             address: Some(address_info(REGTEST_ADDRESS)),
             num_confirmations: 6,
             imported: true,
-            is_locked: false,
+            is_locked: true,
         };
         let proto: bmp_wallet::Utxo = utxo.into();
 
@@ -1333,6 +1334,7 @@ mod tests {
         assert_eq!(proto.amount, 50_000);
         assert_eq!(proto.address.unwrap().address, REGTEST_ADDRESS);
         assert_eq!(proto.num_confirmations, 6);
+        assert!(proto.is_locked);
 
         // A non-standard script must come through as an absent address, not panic.
         let nameless = UtxoInfo {
