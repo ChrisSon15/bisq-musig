@@ -465,12 +465,8 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
     async fn seed_words(&self, password: &str) -> anyhow::Result<Vec<String>> {
         let mut guard = self.wallet.lock().await;
         let wallet = require_open(&mut guard)?;
-
-        if !wallet.check_password(&Password::check(password)?)? {
-            return Err(InvalidPassword.into());
-        }
-
-        let mnemonic = wallet.get_seed_phrase()?;
+        let password = Password::check(password)?;
+        let mnemonic = wallet.get_seed_phrase(&password)?;
         Ok(mnemonic.words().map(ToOwned::to_owned).collect())
     }
 }

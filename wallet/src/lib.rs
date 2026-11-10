@@ -78,7 +78,7 @@ mod tests {
         assert_eq!(bmp_wallet.imported_keys().len(), 0);
         assert_eq!(bmp_wallet.balance(), Amount::from_sat(0));
 
-        let seed = bmp_wallet.get_seed_phrase()?;
+        let seed = bmp_wallet.get_seed_phrase(&test_password())?;
 
         tracing::info!("Generated mnemonic {} ", seed);
         assert_eq!(seed.word_count(), 24);
@@ -107,7 +107,7 @@ mod tests {
     fn new_wallet_matches_standard_bip39_restore() -> anyhow::Result<()> {
         let mem_storage = MemDbHandle::new()?;
         let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
-        let mnemonic = wallet.get_seed_phrase()?;
+        let mnemonic = wallet.get_seed_phrase(&test_password())?;
         let wallet_address = wallet.get_new_address()?.address;
 
         let bip39_seed = mnemonic.to_seed("");
@@ -208,7 +208,7 @@ mod tests {
         ] {
             let (_mem_storage, wallet) = reload_with_stored_seed(corrupt)?;
 
-            let error = wallet.get_seed_phrase().unwrap_err();
+            let error = wallet.get_seed_phrase(&test_password()).unwrap_err();
 
             assert!(
                 matches!(error, WalletErrorKind::Mnemonic(e) if e == expected),
@@ -217,6 +217,22 @@ mod tests {
             let message = error.to_string();
             assert!(!message.contains("abandon") && !message.contains("notaword"));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn get_seed_phrase_requires_the_wallet_password() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        let wrong_password: Password = "Attacker#9".parse()?;
+
+        let error = wallet.get_seed_phrase(&wrong_password).unwrap_err();
+        assert!(
+            matches!(error, WalletErrorKind::InvalidPassword),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(wallet.get_seed_phrase(&test_password())?.word_count(), 24);
+
         Ok(())
     }
 
@@ -281,7 +297,7 @@ mod tests {
             )?;
             assert_eq!(wallet.imported_keys().len(), 0);
             stored_balance = wallet.balance();
-            stored_seed = wallet.get_seed_phrase().unwrap();
+            stored_seed = wallet.get_seed_phrase(&test_password()).unwrap();
             last_generated_addr = wallet.get_new_address()?;
 
             receive_output_to_address(
@@ -302,7 +318,7 @@ mod tests {
 
         let mut wallet =
             BMPWallet::load_wallet(mem_storage.store, Network::Regtest, &test_password())?;
-        let loaded_seed = wallet.get_seed_phrase()?;
+        let loaded_seed = wallet.get_seed_phrase(&test_password())?;
 
         let new_receiving_addr = wallet.get_new_address()?;
 
@@ -335,7 +351,10 @@ mod tests {
 
         let mut wallet = BMPWallet::load_wallet(storage, Network::Regtest, &test_password())?;
         assert_eq!(wallet.imported_keys().len(), 0);
-        assert_eq!(wallet.get_seed_phrase()?.to_string(), seed_phrase);
+        assert_eq!(
+            wallet.get_seed_phrase(&test_password())?.to_string(),
+            seed_phrase
+        );
         assert_eq!(
             wallet.get_new_address()?.address.address_type(),
             Some(AddressType::P2tr)
@@ -1234,13 +1253,13 @@ mod tests {
             &test_password(),
             Network::Regtest,
         )?;
-        let seed = bmp_wallet.get_seed_phrase().unwrap();
+        let seed = bmp_wallet.get_seed_phrase(&test_password()).unwrap();
 
         assert_eq!(seed.word_count(), 24);
 
         let lw =
             BMPWallet::load_wallet(mem_storage.store, Network::Regtest, &test_password()).unwrap();
-        assert_eq!(lw.get_seed_phrase().unwrap(), seed);
+        assert_eq!(lw.get_seed_phrase(&test_password()).unwrap(), seed);
         Ok(())
     }
 
@@ -2013,7 +2032,7 @@ mod tests {
             &test_password(),
             Network::Regtest,
         )?;
-        let seed = wallet.get_seed_phrase()?;
+        let seed = wallet.get_seed_phrase(&test_password())?;
 
         let attacker: Password = "Attacker#9".parse()?;
         let Err(err) = wallet.change_password(&attacker, &attacker) else {
@@ -2036,7 +2055,7 @@ mod tests {
         // ...and that survives a reload, i.e. nothing reached disk.
         let reloaded =
             BMPWallet::load_wallet(mem_storage.store, Network::Regtest, &test_password())?;
-        assert_eq!(reloaded.get_seed_phrase()?, seed);
+        assert_eq!(reloaded.get_seed_phrase(&test_password())?, seed);
 
         Ok(())
     }
@@ -2051,7 +2070,7 @@ mod tests {
             &test_password(),
             Network::Regtest,
         )?;
-        let seed = wallet.get_seed_phrase()?;
+        let seed = wallet.get_seed_phrase(&test_password())?;
 
         let fresh: Password = "Fresh#2024".parse()?;
         wallet.change_password(&test_password(), &fresh)?;
@@ -2064,7 +2083,7 @@ mod tests {
         drop(wallet);
 
         let reloaded = BMPWallet::load_wallet(mem_storage.store, Network::Regtest, &fresh)?;
-        assert_eq!(reloaded.get_seed_phrase()?, seed);
+        assert_eq!(reloaded.get_seed_phrase(&fresh)?, seed);
 
         Ok(())
     }
