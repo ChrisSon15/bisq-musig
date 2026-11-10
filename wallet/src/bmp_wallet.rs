@@ -11,7 +11,7 @@ use bdk_wallet::bitcoin::{
     Amount, Network, PrivateKey, Psbt, ScriptBuf, Sequence, TapNodeHash, Transaction, Weight,
     XOnlyPublicKey, consensus, psbt,
 };
-use bdk_wallet::chain::{ChainPosition, FullTxOut, Merge as _};
+use bdk_wallet::chain::{CanonicalizationParams, ChainPosition, FullTxOut, Merge as _};
 use bdk_wallet::descriptor::ExtendedDescriptor;
 use bdk_wallet::keys::bip39::Mnemonic;
 use bdk_wallet::miniscript::descriptor::{KeyMap, TapTree, Tr};
@@ -349,10 +349,21 @@ impl BMPWallet {
 
     fn imported_utxo_is_unspent(&self, imported: &ImportedUtxo) -> bool {
         !imported.local.is_spent
-            && self
+            && !self
                 .tx_graph()
-                .outspends(imported.local.outpoint)
-                .is_empty()
+                .list_canonical_txs(
+                    self.wallet.local_chain(),
+                    self.wallet.latest_checkpoint().block_id(),
+                    CanonicalizationParams::default(),
+                )
+                .any(|canonical_tx| {
+                    canonical_tx
+                        .tx_node
+                        .tx
+                        .input
+                        .iter()
+                        .any(|input| input.previous_output == imported.local.outpoint)
+                })
     }
 
     fn imported_utxos(&self) -> Vec<WeightedUtxo> {

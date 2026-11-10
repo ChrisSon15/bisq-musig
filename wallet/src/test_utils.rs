@@ -178,6 +178,48 @@ impl ChainDataSource for MockedBDKElectrumWithSpend {
     }
 }
 
+pub struct MockedBDKElectrumWithEvictedSpend {
+    pub outpoint: OutPoint,
+}
+
+impl ChainDataSource for MockedBDKElectrumWithEvictedSpend {
+    const RECOVERY_HEIGHT: usize = 10;
+    const BATCH_SIZE: usize = 1;
+    const STOP_GAP: usize = 1;
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the ChainDataSource trait requires an async method"
+    )]
+    async fn sync(
+        &self,
+        persister: Vec<&mut PersistedWallet<impl BMPWalletPersister>>,
+    ) -> Result<(), ChainDataSourceError> {
+        for (wallet_index, wallet) in persister.into_iter().enumerate() {
+            if wallet_index != 0 {
+                continue;
+            }
+
+            let tx = Transaction {
+                version: bdk_wallet::bitcoin::transaction::Version::ONE,
+                lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+                input: vec![bdk_wallet::bitcoin::TxIn {
+                    previous_output: self.outpoint,
+                    ..Default::default()
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: ScriptBuf::new(),
+                }],
+            };
+            let txid = tx.compute_txid();
+            wallet.apply_unconfirmed_txs([(tx, 100)]);
+            wallet.apply_evicted_txs([(txid, 200)]);
+        }
+        Ok(())
+    }
+}
+
 pub struct MockedBDKElectrumWithCoinbase {
     pub tip_height: u32,
 }

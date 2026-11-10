@@ -46,7 +46,8 @@ mod tests {
     use crate::protocol_wallet_api::ProtocolWalletApi as _;
     use crate::test_utils::{
         MemDbHandle, MockedBDKElectrum, MockedBDKElectrumWithCoinbase,
-        MockedBDKElectrumWithPending, MockedBDKElectrumWithSpend, derive_public_key, test_password,
+        MockedBDKElectrumWithEvictedSpend, MockedBDKElectrumWithPending,
+        MockedBDKElectrumWithSpend, derive_public_key, test_password,
     };
     use crate::utils::derive_key_from_password;
 
@@ -788,6 +789,56 @@ mod tests {
                 .list_utxos()
                 .iter()
                 .any(|utxo| OutPoint::new(utxo.tx_id, utxo.vout) == outpoint)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn evicted_imported_spend_does_not_hide_the_imported_utxo() -> anyhow::Result<()> {
+        let mut mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(
+            mem_storage.store.clone(),
+            &test_password(),
+            Network::Regtest,
+        )?;
+        wallet.import_private_key(new_private_key(), None)?;
+        mem_storage.anchor_imported_key(&wallet.imported_keys()[0])?;
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let imported = wallet
+            .list_utxos()
+            .into_iter()
+            .find(|utxo| utxo.imported)
+            .expect("sync should provide an imported UTXO");
+        let outpoint = OutPoint::new(imported.tx_id, imported.vout);
+        wallet.lock_utxo(outpoint)?;
+
+        wallet
+            .sync_all(&MockedBDKElectrumWithEvictedSpend { outpoint })
+            .await?;
+
+        assert!(wallet.is_utxo_locked(outpoint));
+        assert!(wallet.list_locked_utxos().contains(&outpoint));
+        assert!(
+            wallet
+                .list_utxos()
+                .iter()
+                .any(|utxo| OutPoint::new(utxo.tx_id, utxo.vout) == outpoint)
+        );
+        assert_eq!(wallet.imported_balance().confirmed, Amount::ONE_BTC);
+
+        wallet.unlock_utxo(outpoint)?;
+        let mut builder = wallet.build_tx();
+        builder
+            .fee_rate(FeeRate::from_sat_per_kwu(250))
+            .add_recipient(ScriptBuf::default(), Amount::from_sat(50_000_000));
+        let psbt = builder.finish()?;
+        assert!(
+            psbt.unsigned_tx
+                .input
+                .iter()
+                .any(|input| input.previous_output == outpoint)
         );
 
         Ok(())
