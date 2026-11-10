@@ -132,7 +132,7 @@ pub trait BmpWalletService {
     /// The wallet's seed phrase, one word per element.
     ///
     /// `password` must be the wallet password; a wrong one fails with [`InvalidPassword`] rather
-    /// than revealing anything.
+    /// than revealing anything. A stored seed that is not a valid BIP39 mnemonic also fails.
     async fn seed_words(&self, password: &str) -> anyhow::Result<Vec<String>>;
 }
 
@@ -461,8 +461,8 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
             return Err(InvalidPassword.into());
         }
 
-        let phrase = wallet.get_seed_phrase()?;
-        Ok(phrase.split_whitespace().map(ToOwned::to_owned).collect())
+        let mnemonic = wallet.get_seed_phrase()?;
+        Ok(mnemonic.words().map(ToOwned::to_owned).collect())
     }
 }
 
@@ -1008,6 +1008,44 @@ mod tests {
             seed_phrase
         );
         assert!(reopened.unused_address().await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seed_words_fails_for_a_corrupt_persisted_seed() {
+        let dir = tempdir().unwrap();
+        let created =
+            BMPWalletServiceImpl::<NoopChainDataSource>::new(dir.path(), Network::Regtest);
+        created.open_or_create_wallet(PASSWORD).await.unwrap();
+        drop(created);
+
+        let storage = DBStorage::File(dir.path().to_path_buf());
+        let salt = storage.load_salt(BMPWallet::DB_NAME).unwrap();
+        let mut db = storage.open(BMPWallet::DB_NAME).unwrap();
+        let key = derive_key_from_password(&PASSWORD.parse().unwrap(), &salt).unwrap();
+        db.pragma_update(None, "key", key.as_str()).unwrap();
+        db.execute(&format!("DELETE FROM {}", BMPWallet::SEEDS_TABLE_NAME), [])
+            .unwrap();
+        Connection::persist_seed_phrase(
+            &mut db,
+            BMPWallet::SEEDS_TABLE_NAME,
+            "abandon abandon abandon",
+        )
+        .unwrap();
+        drop(db);
+
+        let reopened =
+            BMPWalletServiceImpl::<NoopChainDataSource>::new(dir.path(), Network::Regtest);
+        reopened.open_or_create_wallet(PASSWORD).await.unwrap();
+
+        let error = reopened.seed_words(PASSWORD).await.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<WalletErrorKind>(),
+                Some(WalletErrorKind::Mnemonic(_))
+            ),
+            "unexpected error: {error:#}"
+        );
+        assert!(!format!("{error:#}").contains("abandon"));
     }
     
     #[tokio::test(flavor = "multi_thread")]

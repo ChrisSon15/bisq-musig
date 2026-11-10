@@ -25,6 +25,7 @@ use bdk_wallet::{
 };
 use rand::RngCore as _;
 use secp::Scalar;
+use zeroize::Zeroizing;
 
 use crate::chain_data_source::ChainDataSource;
 use crate::coin_selection::{AlwaysSpendImportedFirst, SpendImportedOnly};
@@ -120,10 +121,9 @@ struct Bip86Keys {
 }
 
 impl BMPWallet {
-    fn bip86_keys_from_seed_phrase(network: Network, seed_phrase: &str) -> Result<Bip86Keys> {
-        let mnemonic = Mnemonic::parse_normalized(seed_phrase)?;
-        let seed = mnemonic.to_seed("");
-        let xprv = Xpriv::new_master(network, &seed)?;
+    fn bip86_keys_from_seed_phrase(network: Network, mnemonic: &Mnemonic) -> Result<Bip86Keys> {
+        let seed = Zeroizing::new(mnemonic.to_seed(""));
+        let xprv = Xpriv::new_master(network, &seed[..])?;
 
         let (external, external_map, _) =
             Bip86(xprv, KeychainKind::External).build(network.into())?;
@@ -139,18 +139,24 @@ impl BMPWallet {
     fn create_wallet_from_seed(
         db: &mut Connection,
         network: Network,
-        seed_phrase: &str,
+        mnemonic: &Mnemonic,
     ) -> Result<PersistedWallet<Connection>> {
         let Bip86Keys {
             external: (descriptor, external_map),
             internal: (change_descriptor, internal_map),
-        } = Self::bip86_keys_from_seed_phrase(network, seed_phrase)?;
+        } = Self::bip86_keys_from_seed_phrase(network, mnemonic)?;
 
         Ok(Wallet::create(descriptor, change_descriptor)
             .network(network)
             .keymap(KeychainKind::External, external_map)
             .keymap(KeychainKind::Internal, internal_map)
             .create_wallet(db)?)
+    }
+
+    /// Reads the persisted seed phrase and parses it as BIP39.
+    fn load_mnemonic(db: &Connection) -> Result<Mnemonic> {
+        let text = Zeroizing::new(Connection::get_seed_phrase(db, Self::SEEDS_TABLE_NAME)?);
+        Ok(Mnemonic::parse_normalized(&text)?)
     }
 
     pub fn list_unused_addresses_since_last_used(
@@ -586,8 +592,8 @@ impl BMPWallet {
             wallet
         } else if Connection::has_seed_phrase(&db, Self::SEEDS_TABLE_NAME)? {
             tracing::warn!("No wallet found, but seed phrase exists; creating wallet from seed");
-            let seed_phrase = Connection::get_seed_phrase(&db, Self::SEEDS_TABLE_NAME)?;
-            Self::create_wallet_from_seed(&mut db, network, &seed_phrase)?
+            let mnemonic = Self::load_mnemonic(&db)?;
+            Self::create_wallet_from_seed(&mut db, network, &mnemonic)?
         } else {
             return Err(WalletErrorKind::NoWallet);
         };
@@ -684,7 +690,11 @@ pub trait WalletApi {
     fn get_new_address(&mut self) -> Result<AddressInfo>;
     fn get_change_address(&mut self) -> Result<AddressInfo>;
 
-    fn get_seed_phrase(&self) -> Result<String>;
+    /// The persisted seed phrase, validated as BIP39; a corrupt stored value is an error.
+    ///
+    /// The returned [`Mnemonic`] is wiped when dropped. Copies the caller makes from it, such as a
+    /// `String` of its words, are not.
+    fn get_seed_phrase(&self) -> Result<Mnemonic>;
 
     fn balance(&self) -> Amount;
 
@@ -746,8 +756,8 @@ impl WalletApi for BMPWallet {
         Self: Sized,
     {
         // TODO: Make the word size configurable?
-        let mut seed = [0u8; 32];
-        rand::rng().fill_bytes(&mut seed);
+        let mut entropy = Zeroizing::new([0u8; 32]);
+        rand::rng().fill_bytes(&mut entropy[..]);
 
         // Never create over an existing wallet.
         if storage.db_exists(Self::DB_NAME) {
@@ -766,11 +776,22 @@ impl WalletApi for BMPWallet {
             Some(Self::SEEDS_TABLE_NAME),
         )?;
 
-        let mnemonic = Mnemonic::from_entropy(&seed)?;
-        let words = mnemonic.to_string();
-        Connection::persist_seed_phrase(&mut db, Self::SEEDS_TABLE_NAME, &words)?;
+        let mnemonic = Mnemonic::from_entropy(&entropy[..])?;
+        let capacity =
+            mnemonic.words().map(str::len).sum::<usize>() + mnemonic.word_count().saturating_sub(1);
 
-        let wallet = Self::create_wallet_from_seed(&mut db, network, &words)?;
+        let mut phrase = Zeroizing::new(String::with_capacity(capacity));
+
+        for (i, word) in mnemonic.words().enumerate() {
+            if i > 0 {
+                phrase.push(' ');
+            }
+            phrase.push_str(word);
+        }
+
+        Connection::persist_seed_phrase(&mut db, Self::SEEDS_TABLE_NAME, &phrase)?;
+
+        let wallet = Self::create_wallet_from_seed(&mut db, network, &mnemonic)?;
 
         Ok(Self {
             wallet,
@@ -906,11 +927,8 @@ impl WalletApi for BMPWallet {
         (self.imported_balance.clone() + self.wallet.balance()).trusted_spendable()
     }
 
-    fn get_seed_phrase(&self) -> Result<String> {
-        Ok(Connection::get_seed_phrase(
-            &self.db,
-            Self::SEEDS_TABLE_NAME,
-        )?)
+    fn get_seed_phrase(&self) -> Result<Mnemonic> {
+        Self::load_mnemonic(&self.db)
     }
 
     fn drain_imported_balance(&mut self, fee_rate: FeeRate) -> Result<Psbt> {

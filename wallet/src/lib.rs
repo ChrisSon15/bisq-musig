@@ -28,16 +28,18 @@ mod tests {
         XOnlyPublicKey, absolute, psbt, taproot, transaction,
     };
     use bdk_wallet::chain::{self, BlockId};
-    use bdk_wallet::keys::bip39::Mnemonic;
+    use bdk_wallet::keys::bip39::{Error as Bip39Error, Mnemonic};
     use bdk_wallet::miniscript::Descriptor;
     use bdk_wallet::miniscript::descriptor::TapTree;
     use bdk_wallet::rusqlite::Connection;
+    use bdk_wallet::signer::SignerError;
     use bdk_wallet::template::{Bip86, DescriptorTemplate as _};
     use bdk_wallet::test_utils::{ReceiveTo, receive_output_to_address};
     use bdk_wallet::{AddressInfo, KeychainKind, SignOptions};
     use bmp_tracing::tracing;
     use rand::RngCore as _;
     use secp::Scalar;
+    use zeroize::{Zeroize as _, ZeroizeOnDrop};
 
     use crate::bmp_wallet::{BMPWallet, ImportedKey, STOP_GAP, WalletApi as _};
     use crate::error::WalletErrorKind;
@@ -74,7 +76,7 @@ mod tests {
         let seed = bmp_wallet.get_seed_phrase()?;
 
         tracing::info!("Generated mnemonic {} ", seed);
-        assert_ne!(seed, "");
+        assert_eq!(seed.word_count(), 24);
 
         let receiving_addr = bmp_wallet.get_new_address()?;
 
@@ -100,10 +102,9 @@ mod tests {
     fn new_wallet_matches_standard_bip39_restore() -> anyhow::Result<()> {
         let mem_storage = MemDbHandle::new()?;
         let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
-        let seed_phrase = wallet.get_seed_phrase()?;
+        let mnemonic = wallet.get_seed_phrase()?;
         let wallet_address = wallet.get_new_address()?.address;
 
-        let mnemonic = Mnemonic::parse_normalized(&seed_phrase)?;
         let bip39_seed = mnemonic.to_seed("");
         let xprv = Xpriv::new_master(Network::Regtest, &bip39_seed)?;
         let (descriptor, _, _) =
@@ -113,6 +114,47 @@ mod tests {
             .address(Network::Regtest)?;
 
         assert_eq!(wallet_address, expected_address);
+        Ok(())
+    }
+
+    #[test]
+    fn stored_seed_text_is_canonical_bip39() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let storage = mem_storage.store.clone();
+        let wallet = BMPWallet::new(storage.clone(), &test_password(), Network::Regtest)?;
+        drop(wallet);
+
+        let salt = storage.load_salt(BMPWallet::DB_NAME)?;
+        let db = storage.open(BMPWallet::DB_NAME)?;
+        let key = derive_key_from_password(&test_password(), &salt)?;
+        db.pragma_update(None, "key", key.as_str())?;
+        let text = Connection::get_seed_phrase(&db, BMPWallet::SEEDS_TABLE_NAME)?;
+
+        // Re-rendering the parsed phrase must reproduce the stored text exactly.
+        let parsed = Mnemonic::parse_normalized(&text)?;
+        assert_eq!(parsed.word_count(), 24);
+        assert_eq!(parsed.to_string(), text);
+        Ok(())
+    }
+
+    /// `Mnemonic` is imported through `bdk_wallet`, as in production code, so this fails to compile
+    /// if `bip39`'s `zeroize` feature is not active on that exact type.
+    #[test]
+    fn mnemonic_zeroizes_on_drop() {
+        const fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<Mnemonic>();
+    }
+
+    #[test]
+    fn explicit_zeroize_clears_a_mnemonic() -> anyhow::Result<()> {
+        let mut mnemonic = Mnemonic::parse_normalized(ABANDON)?;
+        assert_eq!(mnemonic.word_count(), 12);
+
+        mnemonic.zeroize();
+
+        // Zeroization replaces all word indices with zero, so word_count() returns 24.
+        assert_eq!(mnemonic.word_count(), 24);
+        assert!(mnemonic.word_indices().all(|index| index == 0));
         Ok(())
     }
 
@@ -150,8 +192,78 @@ mod tests {
     }
 
     #[test]
+    fn get_seed_phrase_rejects_an_invalid_stored_phrase() -> anyhow::Result<()> {
+        let bad_checksum = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon";
+        let unknown_word = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon notaword";
+
+        for (corrupt, expected) in [
+            ("abandon abandon abandon", Bip39Error::BadWordCount(3)),
+            (bad_checksum, Bip39Error::InvalidChecksum),
+            (unknown_word, Bip39Error::UnknownWord(11)),
+        ] {
+            let (_mem_storage, wallet) = reload_with_stored_seed(corrupt)?;
+
+            let error = wallet.get_seed_phrase().unwrap_err();
+
+            assert!(
+                matches!(error, WalletErrorKind::Mnemonic(e) if e == expected),
+                "unexpected error: {error}"
+            );
+            let message = error.to_string();
+            assert!(!message.contains("abandon") && !message.contains("notaword"));
+        }
+        Ok(())
+    }
+
+    const ABANDON: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    /// Creates a wallet, replaces its stored seed with `seed`, and reloads it.
+    fn reload_with_stored_seed(seed: &str) -> anyhow::Result<(MemDbHandle, BMPWallet)> {
+        let mem_storage = MemDbHandle::new()?;
+        let storage = mem_storage.store.clone();
+
+        let wallet = BMPWallet::new(storage.clone(), &test_password(), Network::Regtest)?;
+        drop(wallet);
+
+        let salt = storage.load_salt(BMPWallet::DB_NAME)?;
+        let mut db = storage.open(BMPWallet::DB_NAME)?;
+        let key = derive_key_from_password(&test_password(), &salt)?;
+        db.pragma_update(None, "key", key.as_str())?;
+        db.execute(&format!("DELETE FROM {}", BMPWallet::SEEDS_TABLE_NAME), [])?;
+        Connection::persist_seed_phrase(&mut db, BMPWallet::SEEDS_TABLE_NAME, seed)?;
+        drop(db);
+
+        let wallet = BMPWallet::load_wallet(storage, Network::Regtest, &test_password())?;
+        Ok((mem_storage, wallet))
+    }
+
+    #[test]
+    fn signing_with_a_corrupt_stored_seed_reports_unable_to_load_keys() -> anyhow::Result<()> {
+        let (_mem_storage, mut wallet) = reload_with_stored_seed("abandon abandon abandon")?;
+        let mut psbt = psbt::Psbt::from_unsigned_tx(Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        })?;
+
+        let error = wallet.sign(&mut psbt, SignOptions::default()).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                WalletErrorKind::Signer(SignerError::External(ref m))
+                    if m.contains("Unable to load keys")
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(!error.to_string().contains("abandon"));
+        Ok(())
+    }
+
+    #[test]
     fn test_load_wallet() -> anyhow::Result<()> {
-        let stored_seed: String;
+        let stored_seed: Mnemonic;
         let stored_balance: Amount;
         let last_generated_addr: AddressInfo;
         let mem_storage = MemDbHandle::new()?;
@@ -218,10 +330,44 @@ mod tests {
 
         let mut wallet = BMPWallet::load_wallet(storage, Network::Regtest, &test_password())?;
         assert_eq!(wallet.imported_keys().len(), 0);
-        assert_eq!(wallet.get_seed_phrase()?, seed_phrase);
+        assert_eq!(wallet.get_seed_phrase()?.to_string(), seed_phrase);
         assert_eq!(
             wallet.get_new_address()?.address.address_type(),
             Some(AddressType::P2tr)
+        );
+        Ok(())
+    }
+
+    /// BIP-86 test vectors for the "abandon … about" mnemonic (mainnet, account 0).
+    #[test]
+    fn recovered_wallet_matches_bip86_test_vectors() -> anyhow::Result<()> {
+        const EXTERNAL_0: &str = "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr";
+        const INTERNAL_0: &str = "bc1p3qkhfews2uk44qtvauqyr2ttdsw7svhkl9nkm9s9c3x4ax5h60wqwruhk7";
+
+        let mem_storage = MemDbHandle::new()?;
+        let storage = mem_storage.store.clone();
+        let mut db = storage.open(BMPWallet::DB_NAME)?;
+        let salt = storage.persist_salt(BMPWallet::DB_NAME)?;
+        let key = derive_key_from_password(&test_password(), &salt)?;
+        db.pragma_update(None, "key", key.as_str())?;
+        Connection::init(
+            &mut db,
+            Some(BMPWallet::IMPORTED_KEYS_TABLE_NAME),
+            Some(BMPWallet::SEEDS_TABLE_NAME),
+        )?;
+        Connection::persist_seed_phrase(&mut db, BMPWallet::SEEDS_TABLE_NAME, ABANDON)?;
+        drop(db);
+
+        // Only the seed is persisted, so loading takes the recovery path.
+        let mut wallet = BMPWallet::load_wallet(storage, Network::Bitcoin, &test_password())?;
+
+        assert_eq!(
+            wallet.get_new_address()?.address,
+            Address::from_str(EXTERNAL_0)?.assume_checked()
+        );
+        assert_eq!(
+            wallet.get_change_address()?.address,
+            Address::from_str(INTERNAL_0)?.assume_checked()
         );
         Ok(())
     }
@@ -703,8 +849,7 @@ mod tests {
         )?;
         let seed = bmp_wallet.get_seed_phrase().unwrap();
 
-        assert_ne!(seed, "");
-        assert_eq!(seed.split_whitespace().count(), 24);
+        assert_eq!(seed.word_count(), 24);
 
         let lw =
             BMPWallet::load_wallet(mem_storage.store, Network::Regtest, &test_password()).unwrap();
