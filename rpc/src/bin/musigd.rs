@@ -111,7 +111,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         let service = Arc::new(service);
-        Arc::clone(&service).spawn_connection(Arc::clone(&rpc_client));
+        Arc::clone(&service).spawn_connection();
         Some(service)
     } else {
         None

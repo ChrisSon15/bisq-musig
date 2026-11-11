@@ -37,7 +37,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::{self, JoinHandle};
 use tokio::time::{self, Duration, MissedTickBehavior};
 use tonic::{Request, Response, Result, Status};
-use tracing::{debug, error, info, instrument};
+use tracing::{error, info, instrument};
 use zeroize::Zeroizing;
 
 use crate::observable::ObservableHashMap;
@@ -244,22 +244,16 @@ impl<S: ChainDataSource + Send + Sync + 'static> BMPWalletServiceImpl<S> {
     /// [`crate::wallet::WalletService::connect`] does for the bitcoind-backed wallet without
     /// this type having to implement that trait.
     ///
-    /// The `rpc` argument is used only to log which node we're pointed at — `BMPWallet` reaches
-    /// the chain over compact block filters, not Bitcoin Core RPC, so it plays no part in
-    /// syncing here.
+    /// Unlike that method it takes no Bitcoin Core client: `BMPWallet` reaches the chain only
+    /// through the chain data source (compact block filters by default), and the node used to
+    /// publish transactions is the broadcaster's business (see [`Self::with_broadcaster`]).
     ///
     /// The wallet itself is opened by the `OpenOrCreateWallet` RPC, so syncing (and with it the
     /// ready flag) waits until that has happened.
     ///
     /// # Errors
     /// Will return `Err` if the initial or any subsequent sync fails.
-    pub async fn connect(&self, rpc: Arc<Client>) -> WalletResult<Never> {
-        match task::block_in_place(|| rpc.get_blockchain_info()) {
-            Ok(info) => info!(chain = %info.chain, blocks = info.blocks,
-                "Bitcoin Core reachable (informational only; syncing uses the chain data source)."),
-            Err(e) => debug!("Bitcoin Core RPC not reachable ({e}); continuing regardless."),
-        }
-
+    pub async fn connect(&self) -> WalletResult<Never> {
         let Some(chain_data_source) = self.chain_data_source.as_ref() else {
             info!("No chain data source configured; wallet will not sync.");
             // `open_or_create_wallet` flips the ready flag as soon as the wallet is open, since
@@ -295,12 +289,9 @@ impl<S: ChainDataSource + Send + Sync + 'static> BMPWalletServiceImpl<S> {
     ///
     /// # Panics
     /// Will panic if called outside the context of a Tokio runtime.
-    pub fn spawn_connection(
-        self: Arc<Self>,
-        client: Arc<Client>,
-    ) -> JoinHandle<WalletResult<Never>> {
+    pub fn spawn_connection(self: Arc<Self>) -> JoinHandle<WalletResult<Never>> {
         task::spawn(async move {
-            self.connect(client)
+            self.connect()
                 .await
                 .inspect_err(|e| error!("Wallet connection error: {e}"))
         })
