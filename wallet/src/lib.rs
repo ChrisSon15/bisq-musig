@@ -1745,4 +1745,110 @@ mod tests {
 
         Ok(())
     }
+    /// Sets up a wallet with one confirmed 1 BTC HD coin and one confirmed 1 BTC imported coin,
+    /// then pays out the whole imported coin to an external address, so that the payment has no
+    /// change output and therefore no output that belongs to the HD wallet.
+    ///
+    /// Returns the wallet, the external address, and the imported outpoint that was spent.
+    async fn wallet_after_spending_imported_coin_without_change()
+    -> anyhow::Result<(BMPWallet, Address, OutPoint)> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        wallet.import_private_key(new_private_key(), None)?;
+        // MockedBDKElectrum confirms 1 BTC to the HD wallet and 1 BTC to the imported key.
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let imported_utxos = wallet
+            .list_utxos()
+            .into_iter()
+            .filter(|utxo| utxo.imported)
+            .collect::<Vec<_>>();
+        assert_eq!(imported_utxos.len(), 1, "precondition: one imported coin");
+        let imported_outpoint = OutPoint::new(imported_utxos[0].tx_id, imported_utxos[0].vout);
+        assert_eq!(wallet.imported_balance().total(), Amount::ONE_BTC);
+
+        // An address the wallet does not own.
+        let external_script = ImportedKey::new(new_private_key(), None)?.script_pubkey();
+        let external_address = Address::from_script(&external_script, Network::Regtest)?;
+
+        // 1 BTC minus 400 sat: what is left after the fee is below the dust limit, so no change
+        // output is created.
+        let payment = wallet.send_to_address(
+            &external_address,
+            Amount::ONE_BTC - Amount::from_sat(400),
+            FeeRate::from_sat_per_vb_u32(2),
+        )?;
+        assert_eq!(
+            payment
+                .input
+                .iter()
+                .map(|input| input.previous_output)
+                .collect::<Vec<_>>(),
+            [imported_outpoint],
+            "precondition: the payment spends exactly the imported coin"
+        );
+        assert_eq!(
+            payment.output.len(),
+            1,
+            "precondition: the payment has no change output"
+        );
+
+        Ok((wallet, external_address, imported_outpoint))
+    }
+
+    /// `send_to_address` promises that the inputs of a payment it handed out "count as spent
+    /// from here on". For an imported coin spent without a change output this does not hold: the
+    /// payment has no output of the HD wallet, so `apply_unconfirmed_txs` drops it as not
+    /// relevant, and the cached imported coin still looks unspent. A second payment then spends
+    /// the same coin again and conflicts with the first one.
+    #[tokio::test]
+    async fn imported_coin_spent_without_change_is_not_selected_again() -> anyhow::Result<()> {
+        let (mut wallet, external_address, imported_outpoint) =
+            wallet_after_spending_imported_coin_without_change().await?;
+
+        // The HD coin alone covers this amount, so there is no need to touch the imported coin.
+        let second_payment = wallet.send_to_address(
+            &external_address,
+            Amount::from_sat(10_000_000),
+            FeeRate::from_sat_per_vb_u32(2),
+        )?;
+
+        assert!(
+            second_payment
+                .input
+                .iter()
+                .all(|input| input.previous_output != imported_outpoint),
+            "the second payment spends the imported coin {imported_outpoint} again, although \
+             the first payment already spent it"
+        );
+
+        Ok(())
+    }
+
+    /// Same cause as above, seen through the read side: after the imported coin was paid out
+    /// without change, the wallet still lists it and still counts it in the balances.
+    #[tokio::test]
+    async fn imported_coin_spent_without_change_is_removed_from_utxo_list_and_balance()
+    -> anyhow::Result<()> {
+        let (wallet, _, imported_outpoint) =
+            wallet_after_spending_imported_coin_without_change().await?;
+
+        assert!(
+            wallet
+                .list_utxos()
+                .iter()
+                .all(|utxo| OutPoint::new(utxo.tx_id, utxo.vout) != imported_outpoint),
+            "the spent imported coin {imported_outpoint} is still listed as unspent"
+        );
+        assert_eq!(
+            wallet.imported_balance().total(),
+            Amount::ZERO,
+            "the spent imported coin is still counted in the imported balance"
+        );
+        // Only the untouched 1 BTC HD coin is left.
+        assert_eq!(wallet.full_balance().total(), Amount::ONE_BTC);
+        assert_eq!(wallet.balance(), Amount::ONE_BTC);
+
+        Ok(())
+    }
 }
