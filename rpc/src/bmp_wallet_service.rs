@@ -129,9 +129,12 @@ pub trait BmpWalletService {
 
     async fn full_balance(&self) -> anyhow::Result<Balance>;
 
-    /// Returns the complete balance, the transaction-eligible balance, and the reserved balance
-    /// from one wallet snapshot. The complete breakdown includes reserved funds; the available
-    /// breakdown excludes locked outputs.
+    /// Returns `(total, available, reserved)` from one wallet snapshot.
+    ///
+    /// `total` is the complete BDK balance breakdown, including reserved outputs. `available` is
+    /// the same breakdown after removing reserved outputs; the RPC's scalar `balance` is derived
+    /// from its trusted-spendable portion. `reserved` is the breakdown of outputs held out of coin
+    /// selection.
     async fn balance_snapshot(&self) -> anyhow::Result<(Balance, Balance, Balance)>;
 
     /// The wallet's seed phrase, one word per element.
@@ -464,7 +467,7 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
         Ok((
             wallet.full_balance(),
             wallet.available_balance(),
-            wallet.locked_balance(),
+            wallet.reserved_balance(),
         ))
     }
 
@@ -655,14 +658,14 @@ impl wallet_server::Wallet for BmpWalletImpl {
         request: Request<GetBalanceRequest>,
     ) -> Result<Response<GetBalanceResponse>> {
         handle_request_async(request, |_request| async {
-            let (balance, available, reserved) = self
+            let (total, available, reserved) = self
                 .wallet_service
                 .balance_snapshot()
                 .await
                 .map_err(|e| status_from(&e))?;
 
             Ok(GetBalanceResponse::from_balances(
-                &balance,
+                &total,
                 &available,
                 &reserved,
             ))
@@ -762,12 +765,14 @@ impl GetBalanceResponse {
             // bisq2 reads only `balance`; keep it the trusted-spendable amount that is actually
             // available for a new transaction, excluding reserved outputs.
             balance: available.trusted_spendable().to_sat(),
-            // The remaining fields retain the complete BDK breakdown for clients that need to
-            // distinguish total holdings from currently available funds.
+            // These four fields come from `total`, so they include reserved outputs and describe
+            // the complete holdings rather than the filtered available balance.
             confirmed: total.confirmed.to_sat(),
             trusted_pending: total.trusted_pending.to_sat(),
             untrusted_pending: total.untrusted_pending.to_sat(),
             immature: total.immature.to_sat(),
+            // `total()` intentionally includes every balance category, including immature and
+            // untrusted-pending reserved outputs.
             reserved: reserved.total().to_sat(),
         }
     }
@@ -1287,15 +1292,17 @@ mod tests {
             ..Balance::default()
         };
         let reserved = Balance {
+            immature: Amount::from_sat(10),
+            trusted_pending: Amount::from_sat(20),
+            untrusted_pending: Amount::from_sat(30),
             confirmed: Amount::from_sat(1_250),
-            ..Balance::default()
         };
 
         let proto = GetBalanceResponse::from_balances(&total, &available, &reserved);
 
         assert_eq!(proto.balance, 750);
         assert_eq!(proto.confirmed, 2_000);
-        assert_eq!(proto.reserved, 1_250);
+        assert_eq!(proto.reserved, 1_310);
     }
 
     #[test]

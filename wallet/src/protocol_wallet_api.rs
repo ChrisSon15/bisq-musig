@@ -299,7 +299,7 @@ impl ProtocolWalletApi for Wallet {
     fn is_utxo_locked(&self, utxo: OutPoint) -> bool {
         self.is_outpoint_locked(utxo)
     }
-    // @TODO Add a new method, locked_balance
+    // @TODO Add a new method, reserved_balance
 }
 
 /// Sign the wallet-owned inputs of `psbt` using the supplied `sign` closure, then transfer the

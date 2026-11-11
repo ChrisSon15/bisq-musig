@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::ops::{Deref, DerefMut};
 use std::time::UNIX_EPOCH;
 use std::vec;
@@ -108,6 +107,10 @@ pub(crate) struct ImportedWallet {
 
 impl ImportedWallet {
     fn persist(&mut self, storage: &DBStorage) -> Result<bool> {
+        if self.wallet.staged().is_none() {
+            return Ok(false);
+        }
+
         #[cfg(any(test, feature = "test-utils"))]
         if let Some(db) = self.db.as_mut() {
             return Ok(self.wallet.persist(db)?);
@@ -231,14 +234,7 @@ impl BMPWallet {
         tap_tree: Option<TapTree<XOnlyPublicKey>>,
     ) -> Result<()> {
         let key_to_import = ImportedKey::new(pk, tap_tree)?;
-        if self
-            .imported_keys
-            .contains_key(&key_to_import.script_pubkey())
-            || self
-                .imported_keys
-                .values()
-                .any(|existing| existing.internal_key() == key_to_import.internal_key())
-        {
+        if Self::is_duplicate_imported_key(&self.imported_keys, &key_to_import) {
             return Err(WalletErrorKind::DuplicateKey);
         }
 
@@ -271,8 +267,8 @@ impl BMPWallet {
             })
     }
 
-    /// The balance reserved by locked, currently unspent outputs.
-    pub fn locked_balance(&self) -> Balance {
+    /// The balance reserved by currently unspent outputs held out of coin selection.
+    pub fn reserved_balance(&self) -> Balance {
         self.balance_for_lock_state(true) + self.imported_balance_for_lock_state(true)
     }
 
@@ -420,24 +416,26 @@ impl BMPWallet {
         self.imported_keys.get(script_pubkey)
     }
 
+    fn is_duplicate_imported_key(
+        imported_keys: &HashMap<ScriptBuf, ImportedKey>,
+        key: &ImportedKey,
+    ) -> bool {
+        imported_keys.contains_key(&key.script_pubkey())
+            || imported_keys
+                .values()
+                .any(|existing| existing.internal_key() == key.internal_key())
+    }
+
     fn insert_imported_key(
         imported_keys: &mut HashMap<ScriptBuf, ImportedKey>,
         key: ImportedKey,
     ) -> Result<()> {
-        if imported_keys
-            .values()
-            .any(|existing| existing.internal_key() == key.internal_key())
-        {
+        if Self::is_duplicate_imported_key(imported_keys, &key) {
             return Err(WalletErrorKind::DuplicateKey);
         }
 
-        match imported_keys.entry(key.script_pubkey()) {
-            Entry::Occupied(_) => Err(WalletErrorKind::DuplicateKey),
-            Entry::Vacant(entry) => {
-                entry.insert(key);
-                Ok(())
-            }
-        }
+        imported_keys.insert(key.script_pubkey(), key);
+        Ok(())
     }
 
     /// Renders `script_pubkey` as an address, or `None` if it isn't a standard one.

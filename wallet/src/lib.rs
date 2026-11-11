@@ -547,6 +547,27 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn persist_does_not_open_clean_file_backed_imported_wallet() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage: DBStorage = dir.path().into();
+        let mut wallet = BMPWallet::new(storage, &test_password(), Network::Regtest)?;
+        let key = new_private_key();
+
+        wallet.import_private_key(key, None)?;
+        wallet.persist()?;
+
+        let imported_db = dir
+            .path()
+            .join(format!("bmp_{}.db3", derive_public_key(&key)));
+        assert!(imported_db.exists());
+        std::fs::remove_file(&imported_db)?;
+
+        assert!(!wallet.persist()?);
+        assert!(!imported_db.exists());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_sync() -> anyhow::Result<()> {
         let mem_storage = MemDbHandle::new()?;
@@ -1136,7 +1157,7 @@ mod tests {
         wallet.lock_utxo(owned_outpoint)?;
 
         assert_eq!(wallet.full_balance().confirmed, Amount::from_int_btc(2));
-        assert_eq!(wallet.locked_balance().confirmed, Amount::from_int_btc(2));
+        assert_eq!(wallet.reserved_balance().confirmed, Amount::from_int_btc(2));
         assert_eq!(wallet.available_balance().trusted_spendable(), Amount::ZERO);
         assert_eq!(wallet.balance(), Amount::ZERO);
 
@@ -1146,7 +1167,7 @@ mod tests {
             Amount::from_int_btc(1)
         );
         assert_eq!(
-            wallet.locked_balance().trusted_spendable(),
+            wallet.reserved_balance().trusted_spendable(),
             Amount::from_int_btc(1)
         );
 

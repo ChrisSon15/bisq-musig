@@ -116,16 +116,21 @@ message SendToAddressResponse {
 message GetBalanceRequest {}
 
 message GetBalanceResponse {
-    // Balance in satoshis
+    // Trusted-spendable balance in satoshis from outputs that are not reserved. This is the
+    // confirmed plus trusted-pending portion of the available balance; immature and untrusted
+    // pending amounts are excluded.
     uint64 balance = 1;
-    // Additions over bisq2's copy: the full BDK breakdown, so a client can distinguish settled
-    // funds from pending ones. `balance` above stays the trusted-spendable total for
-    // compatibility.
+    // Total confirmed balance in satoshis, including reserved outputs.
     uint64 confirmed = 2;
+    // Total trusted-pending balance in satoshis, including reserved outputs.
     uint64 trustedPending = 3;
+    // Total untrusted-pending balance in satoshis, including reserved outputs.
     uint64 untrustedPending = 4;
+    // Total immature balance in satoshis, including reserved outputs.
     uint64 immature = 5;
-    // Total value currently reserved by locked, unspent outputs.
+    // Total value in satoshis of outputs currently reserved and excluded from coin selection.
+    // This is the sum of all balance categories, so it can include immature and untrusted-pending
+    // amounts.
     uint64 reserved = 6;
 }
 
@@ -204,6 +209,6 @@ message Utxo {
     // Absent when the script doesn't decode to a standard address.
     PubAddressInfo address = 4;
     uint32 numConfirmations = 5;
-    // Whether this unspent output is reserved and excluded from coin selection.
+    // Whether this unspent output is locked and excluded from coin selection.
     bool isLocked = 6;
 }
