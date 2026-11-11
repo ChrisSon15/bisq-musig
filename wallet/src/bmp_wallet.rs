@@ -99,36 +99,29 @@ impl ImportedKey {
 
 pub(crate) const STOP_GAP: usize = 50;
 
-#[derive(Clone, Copy)]
-enum ImportedBalance {
-    Immature,
-    TrustedPending,
-    UntrustedPending,
-    Confirmed,
+pub(crate) struct ImportedWallet {
+    pub(crate) wallet: PersistedWallet<Connection>,
+    db_name: String,
+    #[cfg(any(test, feature = "test-utils"))]
+    db: Option<Connection>,
 }
 
-impl ImportedBalance {
-    fn add_to(self, balance: &mut Balance, amount: Amount) {
-        let bucket = match self {
-            Self::Immature => &mut balance.immature,
-            Self::TrustedPending => &mut balance.trusted_pending,
-            Self::UntrustedPending => &mut balance.untrusted_pending,
-            Self::Confirmed => &mut balance.confirmed,
-        };
-        *bucket = Amount::from_sat(bucket.to_sat().saturating_add(amount.to_sat()));
+impl ImportedWallet {
+    fn persist(&mut self, storage: &DBStorage) -> Result<bool> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(db) = self.db.as_mut() {
+            return Ok(self.wallet.persist(db)?);
+        }
+
+        let mut db = storage.sibling(&self.db_name).open(&self.db_name)?;
+        Ok(self.wallet.persist(&mut db)?)
     }
-}
-
-#[derive(Clone)]
-struct ImportedUtxo {
-    local: LocalOutput,
-    balance: ImportedBalance,
 }
 
 pub struct BMPWallet {
     wallet: PersistedWallet<Connection>,
     imported_keys: HashMap<ScriptBuf, ImportedKey>,
-    imported_utxos: HashMap<OutPoint, ImportedUtxo>,
+    imported_wallets: Vec<ImportedWallet>,
     signers_loaded: bool,
     db: BMPDatabase<Connection>,
     last_unused_address: Option<String>,
@@ -238,7 +231,23 @@ impl BMPWallet {
         tap_tree: Option<TapTree<XOnlyPublicKey>>,
     ) -> Result<()> {
         let key_to_import = ImportedKey::new(pk, tap_tree)?;
-        Self::insert_imported_key(&mut self.imported_keys, key_to_import)
+        if self
+            .imported_keys
+            .contains_key(&key_to_import.script_pubkey())
+            || self
+                .imported_keys
+                .values()
+                .any(|existing| existing.internal_key() == key_to_import.internal_key())
+        {
+            return Err(WalletErrorKind::DuplicateKey);
+        }
+
+        let imported_wallet =
+            Self::load_imported_wallet(&key_to_import, self.db.storage(), self.network())?;
+        self.imported_keys
+            .insert(key_to_import.script_pubkey(), key_to_import);
+        self.imported_wallets.push(imported_wallet);
+        Ok(())
     }
 
     /// Test-only introspection of the imported keys; enable the `test-utils` feature to use it
@@ -255,26 +264,77 @@ impl BMPWallet {
     }
 
     pub fn imported_balance(&self) -> Balance {
-        self.imported_balance_for_lock_state(None)
+        self.imported_wallets
+            .iter()
+            .fold(Balance::default(), |balance, imported| {
+                balance + imported.wallet.balance()
+            })
     }
 
     /// The balance reserved by locked, currently unspent outputs.
     pub fn locked_balance(&self) -> Balance {
-        self.balance_for_lock_state(true) + self.imported_balance_for_lock_state(Some(true))
+        self.balance_for_lock_state(true) + self.imported_balance_for_lock_state(true)
     }
 
     /// The balance available to a newly-built transaction.
     ///
     /// `full_balance` remains the complete balance breakdown, including reserved funds.
     pub fn available_balance(&self) -> Balance {
-        self.balance_for_lock_state(false) + self.imported_balance_for_lock_state(Some(false))
+        self.balance_for_lock_state(false) + self.imported_balance_for_lock_state(false)
     }
 
-    fn balance_category(
+    fn wallet_balance_for_lock_state(
+        wallet: &PersistedWallet<Connection>,
+        locked: bool,
+        is_locked: impl Fn(OutPoint) -> bool,
+    ) -> Balance {
+        let outpoints = wallet
+            .spk_index()
+            .outpoints()
+            .iter()
+            .copied()
+            .filter(|(_, outpoint)| is_locked(*outpoint) == locked);
+        wallet.tx_graph().balance(
+            wallet.local_chain(),
+            wallet.latest_checkpoint().block_id(),
+            CanonicalizationParams::default(),
+            outpoints,
+            |(keychain, _), _| *keychain == KeychainKind::Internal,
+        )
+    }
+
+    fn balance_for_lock_state(&self, locked: bool) -> Balance {
+        Self::wallet_balance_for_lock_state(&self.wallet, locked, |outpoint| {
+            self.is_outpoint_locked(outpoint)
+        })
+    }
+
+    fn imported_balance_for_lock_state(&self, locked: bool) -> Balance {
+        self.imported_wallets
+            .iter()
+            .fold(Balance::default(), |balance, imported| {
+                balance
+                    + Self::wallet_balance_for_lock_state(&imported.wallet, locked, |outpoint| {
+                        self.is_outpoint_locked(outpoint)
+                    })
+            })
+    }
+
+    fn imported_unspent(
+        &self,
+    ) -> impl Iterator<Item = (&PersistedWallet<Connection>, LocalOutput)> + '_ {
+        self.imported_wallets.iter().flat_map(|imported_wallet| {
+            imported_wallet
+                .wallet
+                .list_unspent()
+                .map(move |local| (&imported_wallet.wallet, local))
+            })
+    }
+
+    fn imported_utxo_is_immature(
         wallet: &PersistedWallet<Connection>,
         local: &LocalOutput,
-        trusted_pending: bool,
-    ) -> ImportedBalance {
+    ) -> bool {
         let full_txo = FullTxOut {
             chain_position: local.chain_position,
             outpoint: local.outpoint,
@@ -285,105 +345,19 @@ impl BMPWallet {
                 .get_tx(local.outpoint.txid)
                 .is_some_and(|tx| tx.is_coinbase()),
         };
-        let tip_height = wallet.latest_checkpoint().height();
-
-        if full_txo.chain_position.is_unconfirmed() {
-            if trusted_pending {
-                ImportedBalance::TrustedPending
-            } else {
-                ImportedBalance::UntrustedPending
-            }
-        } else if full_txo.is_confirmed_and_spendable(tip_height) {
-            ImportedBalance::Confirmed
-        } else if !full_txo.is_mature(tip_height) {
-            ImportedBalance::Immature
-        } else {
-            ImportedBalance::Confirmed
-        }
-    }
-
-    fn balance_for_lock_state(&self, locked: bool) -> Balance {
-        let mut balance = Balance::default();
-        for local in self.wallet.list_unspent() {
-            if self.is_outpoint_locked(local.outpoint) != locked {
-                continue;
-            }
-
-            Self::balance_category(
-                &self.wallet,
-                &local,
-                local.keychain == KeychainKind::Internal,
-            )
-            .add_to(&mut balance, local.txout.value);
-        }
-        balance
-    }
-
-    fn imported_balance_for_lock_state(&self, locked: Option<bool>) -> Balance {
-        let mut balance = Balance::default();
-        for imported in self.imported_utxos.values() {
-            if !self.imported_utxo_is_unspent(imported)
-                || locked.is_some_and(|locked| {
-                    self.is_outpoint_locked(imported.local.outpoint) != locked
-                })
-            {
-                continue;
-            }
-            imported
-                .balance
-                .add_to(&mut balance, imported.local.txout.value);
-        }
-        balance
-    }
-
-    fn cache_imported_utxos<'a>(
-        imported_wallets: impl IntoIterator<Item = &'a PersistedWallet<Connection>>,
-    ) -> HashMap<OutPoint, ImportedUtxo> {
-        imported_wallets
-            .into_iter()
-            .flat_map(|wallet| {
-                wallet.list_unspent().map(|local| {
-                    let balance = Self::balance_category(wallet, &local, false);
-                    (
-                        local.outpoint,
-                        ImportedUtxo { local, balance },
-                    )
-                })
-            })
-            .collect()
-    }
-
-    fn imported_utxo_is_unspent(&self, imported: &ImportedUtxo) -> bool {
-        !imported.local.is_spent
-            && !self
-                .tx_graph()
-                .list_canonical_txs(
-                    self.wallet.local_chain(),
-                    self.wallet.latest_checkpoint().block_id(),
-                    CanonicalizationParams::default(),
-                )
-                .any(|canonical_tx| {
-                    canonical_tx
-                        .tx_node
-                        .tx
-                        .input
-                        .iter()
-                        .any(|input| input.previous_output == imported.local.outpoint)
-                })
+        !full_txo.is_mature(wallet.latest_checkpoint().height())
     }
 
     fn imported_utxos(&self) -> Vec<WeightedUtxo> {
-        self.imported_utxos
-            .iter()
-            .filter(|(outpoint, imported)| {
-                !self.is_utxo_locked(**outpoint)
-                    && self.imported_utxo_is_unspent(imported)
-                    && !matches!(imported.balance, ImportedBalance::Immature)
-            })
-            .map(|(_, imported)| {
-                let local = &imported.local;
-                let output_script_pubkey = &local.txout.script_pubkey;
+        self.imported_unspent()
+            .filter_map(|(wallet, local)| {
+                if self.is_utxo_locked(local.outpoint)
+                    || Self::imported_utxo_is_immature(wallet, &local)
+                {
+                    return None;
+                }
 
+                let output_script_pubkey = &local.txout.script_pubkey;
                 let (tap_internal_key, tap_merkle_root) = self
                     .imported_keys
                     .get(output_script_pubkey)
@@ -391,21 +365,21 @@ impl BMPWallet {
                         (Some(key.internal_key()), key.merkle_root())
                     });
 
-                WeightedUtxo {
+                Some(WeightedUtxo {
                     utxo: Utxo::Foreign {
                         outpoint: local.outpoint,
                         sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                         psbt_input: Box::new(psbt::Input {
-                            witness_utxo: Some(local.txout.clone()),
+                            witness_utxo: Some(local.txout),
                             tap_internal_key,
                             tap_merkle_root,
                             ..Default::default()
                         }),
                     },
                     satisfaction_weight: Weight::from_wu_usize(65),
-                }
+                })
             })
-            .collect::<Vec<_>>()
+            .collect()
     }
 
     fn build_tx(&mut self) -> TxBuilder<'_, AlwaysSpendImportedFirst> {
@@ -474,16 +448,22 @@ impl BMPWallet {
     }
 
     /// Confirmation count for a chain position: `0` while unconfirmed.
-    fn num_confirmations(&self, block_height: Option<u32>) -> u32 {
-        let next_height = self.wallet.latest_checkpoint().height() + 1;
+    fn num_confirmations_for(
+        wallet: &PersistedWallet<Connection>,
+        block_height: Option<u32>,
+    ) -> u32 {
+        let next_height = wallet.latest_checkpoint().height() + 1;
         block_height.map_or(0, |height| next_height.saturating_sub(height))
+    }
+
+    fn num_confirmations(&self, block_height: Option<u32>) -> u32 {
+        Self::num_confirmations_for(&self.wallet, block_height)
     }
 
     /// All unspent outputs, both the HD wallet's own and those held by imported keys.
     ///
-    /// Imported outputs are cached with their chain position, while their `TxOut`s are also kept
-    /// in the main graph so fee calculation can inspect transactions spending them. Outputs that
-    /// are spent by a locally recorded transaction are excluded from the displayed UTXO set.
+    /// Imported outputs come directly from the corresponding imported wallets. Their `TxOut`s are
+    /// also kept in the main graph so fee calculation can inspect transactions spending them.
     pub fn list_utxos(&self) -> Vec<UtxoInfo> {
         let own = self.list_unspent().map(|utxo| {
             let block_height = match utxo.chain_position {
@@ -502,11 +482,9 @@ impl BMPWallet {
         });
 
         let imported = self
-            .imported_utxos
-            .iter()
-            .filter(|(_, imported)| self.imported_utxo_is_unspent(imported))
-            .filter_map(|(outpoint, imported)| {
-                let local = &imported.local;
+            .imported_unspent()
+            .filter_map(|(wallet, local)| {
+                let outpoint = local.outpoint;
                 let block_height = match local.chain_position {
                     ChainPosition::Confirmed { anchor, .. } => Some(anchor.block_id.height),
                     ChainPosition::Unconfirmed { .. } => None,
@@ -517,9 +495,9 @@ impl BMPWallet {
                         vout: outpoint.vout,
                         amount: local.txout.value,
                         address: self.address_for_script(&local.txout.script_pubkey),
-                        num_confirmations: self.num_confirmations(block_height),
+                        num_confirmations: Self::num_confirmations_for(wallet, block_height),
                         imported: true,
-                        is_locked: self.is_outpoint_locked(*outpoint),
+                        is_locked: self.is_outpoint_locked(outpoint),
                     })
             });
 
@@ -657,7 +635,6 @@ impl BMPWallet {
     /// direction: a payment that never made it to the network leaves coins looking locked
     /// (recoverable) rather than double-spent (not).
     ///
-    /// @TODO: reserve the utxo created from this method call and avoid reselecting them
     pub fn send_to_address(
         &mut self,
         address: &Address,
@@ -678,41 +655,67 @@ impl BMPWallet {
             .map_err(WalletErrorKind::generic)?
             .as_secs();
         self.wallet.apply_unconfirmed_txs([(tx.clone(), last_seen)]);
+        for imported in &mut self.imported_wallets {
+            if imported.wallet.list_unspent().any(|utxo| {
+                tx.input
+                    .iter()
+                    .any(|input| input.previous_output == utxo.outpoint)
+            }) {
+                imported
+                    .wallet
+                    .apply_unconfirmed_txs([(tx.clone(), last_seen)]);
+            }
+        }
         <Self as WalletApi>::persist(self)?;
 
         Ok(tx)
+    }
+
+    fn load_imported_wallet(
+        key: &ImportedKey,
+        storage: &DBStorage,
+        network: Network,
+    ) -> Result<ImportedWallet> {
+        let db_name = format!("bmp_{}.db3", key.internal_key());
+        let imported_storage = storage.sibling(&db_name);
+        let mut db = imported_storage.open(&db_name)?;
+        let descriptor = key.descriptor().to_string();
+
+        let imported_wallet = if let Some(wallet) = Wallet::load()
+            .descriptor(KeychainKind::External, Some(descriptor.clone()))
+            .check_network(network)
+            .extract_keys()
+            .load_wallet(&mut db)?
+        {
+            wallet
+        } else {
+            Wallet::create_single(descriptor)
+                .network(network)
+                .create_wallet(&mut db)?
+        };
+
+        // BDK's PersistedWallet owns the Wallet state, not the persister connection. Keep the
+        // connection only for shared in-memory test databases; file-backed databases reopen it
+        // for persist() and therefore do not retain one connection per imported wallet.
+        #[cfg(any(test, feature = "test-utils"))]
+        let db = storage.base_path().is_none().then_some(db);
+        Ok(ImportedWallet {
+            wallet: imported_wallet,
+            db_name,
+            #[cfg(any(test, feature = "test-utils"))]
+            db,
+        })
     }
 
     pub(crate) fn load_imported_wallets<'a>(
         imported_keys: impl IntoIterator<Item = &'a ImportedKey>,
         storage: &DBStorage,
         network: Network,
-    ) -> Result<Vec<(PersistedWallet<Connection>, Connection)>> {
-        let mut res = vec![];
-        for key in imported_keys {
-            let pubk = key.internal_key();
-            let db_file = format!("bmp_{pubk}.db3");
-
-            let imported_storage = storage.sibling(&db_file);
-            let mut db = imported_storage.open(&db_file)?;
-            let descriptor = key.descriptor().to_string();
-
-            let imported_wallet_opt = Wallet::load()
-                .descriptor(KeychainKind::External, Some(descriptor.clone()))
-                .check_network(network)
-                .extract_keys()
-                .load_wallet(&mut db)?;
-
-            let imported_wallet = if let Some(wallet) = imported_wallet_opt {
-                wallet
-            } else {
-                Wallet::create_single(descriptor)
-                    .network(network)
-                    .create_wallet(&mut db)?
-            };
-            res.push((imported_wallet, db));
-        }
-        Ok(res)
+    ) -> Result<Vec<ImportedWallet>> {
+        imported_keys
+            .into_iter()
+            .map(|key| Self::load_imported_wallet(key, storage, network))
+            .collect()
     }
 
     /// Opens the wallet database at `db_path` with the key derived from `password` and `salt`.
@@ -765,13 +768,11 @@ impl BMPWallet {
 
         let imported_wallets =
             Self::load_imported_wallets(imported_keys.values(), &storage, network)?;
-        let imported_utxos =
-            Self::cache_imported_utxos(imported_wallets.iter().map(|(wallet, _)| wallet));
 
         Ok(Self {
             wallet,
             imported_keys,
-            imported_utxos,
+            imported_wallets,
             signers_loaded: false,
             db: BMPDatabase::new(storage, db),
             last_unused_address: None,
@@ -833,12 +834,9 @@ impl ProtocolWalletApi for BMPWallet {
     fn list_locked_utxos(&self) -> Vec<OutPoint> {
         let mut locked = self.wallet.list_locked_unspent().collect::<Vec<_>>();
         locked.extend(
-            self.imported_utxos
-                .iter()
-                .filter(|(outpoint, imported)| {
-                    self.is_outpoint_locked(**outpoint) && self.imported_utxo_is_unspent(imported)
-                })
-                .map(|(outpoint, _)| *outpoint),
+            self.imported_unspent()
+                .filter(|(_, local)| self.is_outpoint_locked(local.outpoint))
+                .map(|(_, local)| local.outpoint),
         );
         locked
     }
@@ -905,32 +903,24 @@ impl WalletApi for BMPWallet {
     const DB_NAME: &str = "bmp_bdk_wallet.db3";
 
     async fn sync_all(&mut self, s: &(impl ChainDataSource + Sync)) -> Result<()> {
-        let network = self.network();
-        let mut vec = vec![&mut self.wallet];
-        let mut imported =
-            Self::load_imported_wallets(self.imported_keys.values(), self.db.storage(), network)?;
+        {
+            let mut wallets = vec![&mut self.wallet];
+            wallets.extend(
+                self.imported_wallets
+                    .iter_mut()
+                    .map(|imported| &mut imported.wallet),
+            );
+            s.sync(wallets).await?;
+        }
 
-        vec.extend(
-            imported
-                .iter_mut()
-                .map(|persister_wallet| &mut persister_wallet.0),
-        );
-
-        s.sync(vec).await?;
         // Keep the imported TxOuts in the main graph so fee calculation can inspect transactions
         // spending them. Their ownership, chain position, and balance category remain in the
-        // imported-UTXO cache below.
-        for (w, _) in &imported {
-            for utxo in w.list_unspent() {
+        // imported wallets above.
+        for imported in &self.imported_wallets {
+            for utxo in imported.wallet.list_unspent() {
                 self.wallet.insert_txout(utxo.outpoint, utxo.txout);
             }
         }
-
-        // Persist changes from imported keys
-        for (w, db) in &mut imported {
-            w.persist(db)?;
-        }
-        self.imported_utxos = Self::cache_imported_utxos(imported.iter().map(|(wallet, _)| wallet));
 
         self.persist()?;
         Ok(())
@@ -981,7 +971,7 @@ impl WalletApi for BMPWallet {
         Ok(Self {
             wallet,
             imported_keys: HashMap::new(),
-            imported_utxos: HashMap::new(),
+            imported_wallets: Vec::new(),
             signers_loaded: true,
             db: BMPDatabase::new(storage, db),
             last_unused_address: None,
@@ -999,14 +989,21 @@ impl WalletApi for BMPWallet {
             &imported_keys,
         )?;
 
-        match self.wallet.staged_mut() {
+        let mut persisted = match self.wallet.staged_mut() {
             Some(stage) => {
                 Connection::persist_staged_changes(&mut self.db, &*stage)?;
                 let _ = stage.take();
-                Ok(true)
+                true
             }
-            None => Ok(false),
+            None => false,
+        };
+
+        let storage = self.db.storage().clone();
+        for imported in &mut self.imported_wallets {
+            persisted |= imported.persist(&storage)?;
         }
+
+        Ok(persisted)
     }
 
     fn sign(&mut self, psbt: &mut Psbt, sign_options: SignOptions) -> Result<()> {
