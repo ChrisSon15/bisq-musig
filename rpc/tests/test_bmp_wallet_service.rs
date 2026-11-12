@@ -114,6 +114,16 @@ impl WalletServiceFixture {
             .seed_words)
     }
 
+    /// The `IsWalletReady` response's `(ready, exists, open)`, none of which needs a password.
+    async fn status(&mut self) -> Result<(bool, Option<bool>, Option<bool>), tonic::Status> {
+        let response = self
+            .client
+            .is_wallet_ready(IsWalletReadyRequest {})
+            .await?
+            .into_inner();
+        Ok((response.ready, response.exists, response.open))
+    }
+
     fn stop(self) {
         self.server.abort();
     }
@@ -159,6 +169,52 @@ async fn operations_before_open_are_refused_over_grpc() -> anyhow::Result<()> {
         .into_inner()
         .ready;
     assert!(!ready, "an unopened wallet must not report itself ready");
+    fixture.stop();
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wallet_existence_is_reported_without_a_password_over_grpc() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Not created yet, as on a first start (or after the wallet directory was wiped).
+    let wallet_dir = dir.path().join("wallet");
+
+    // --- No wallet directory: OpenOrCreateWallet would create a wallet ---
+    let mut fixture = WalletServiceFixture::start(&wallet_dir).await?;
+    assert_eq!(
+        fixture.status().await?,
+        (false, Some(false), Some(false)),
+        "no wallet directory, so no wallet: (ready, exists, open)"
+    );
+
+    // --- Open wallet ---
+    assert!(fixture.open(PASSWORD).await?.into_inner().success);
+    assert_eq!(
+        fixture.status().await?,
+        (true, Some(true), Some(true)),
+        "a created wallet exists and is open: (ready, exists, open)"
+    );
+    fixture.stop();
+
+    // --- Closed wallet: after a restart it exists, but OpenOrCreateWallet hasn't opened it ---
+    let mut fixture = WalletServiceFixture::start(&wallet_dir).await?;
+    assert_eq!(
+        fixture.status().await?,
+        (false, Some(true), Some(false)),
+        "a persisted wallet must be seen before any password is sent: (ready, exists, open)"
+    );
+
+    // A wrong password neither opens it nor makes it look absent.
+    let err = fixture
+        .open(NEW_PASSWORD)
+        .await
+        .expect_err("a wrong password must not open the persisted wallet");
+    assert_eq!(err.code(), Code::PermissionDenied, "got: {err}");
+    assert_eq!(fixture.status().await?, (false, Some(true), Some(false)));
+
+    assert!(fixture.open(PASSWORD).await?.into_inner().success);
+    assert_eq!(fixture.status().await?, (true, Some(true), Some(true)));
     fixture.stop();
 
     Ok(())

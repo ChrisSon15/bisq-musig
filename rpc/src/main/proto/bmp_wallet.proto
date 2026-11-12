@@ -49,6 +49,8 @@ service Wallet {
     // `OpenOrCreateWalletRequest`), failing with INVALID_ARGUMENT otherwise; a wrong password
     // for an existing wallet fails with PERMISSION_DENIED.
     rpc OpenOrCreateWallet (OpenOrCreateWalletRequest) returns (OpenOrCreateWalletResponse);
+    // Needs no password and works before `OpenOrCreateWallet`, so a client can learn whether
+    // that call would open an existing wallet or create a new one (see `IsWalletReadyResponse`).
     rpc IsWalletReady (IsWalletReadyRequest) returns (IsWalletReadyResponse);
     rpc GetUnusedAddress (GetUnusedAddressRequest) returns (GetUnusedAddressResponse);
     rpc GetWalletAddresses (GetWalletAddressesRequest) returns (GetWalletAddressesResponse);
@@ -71,7 +73,22 @@ service Wallet {
 message IsWalletReadyRequest {}
 
 message IsWalletReadyResponse {
+    // Whether the wallet is open and, if the server syncs it, has completed its first sync.
     bool ready = 1;
+    // Additions over bisq2's copy, so a client can tell "no wallet yet" from "wallet not opened
+    // yet" before it sends a password. Both are always set by this server; a client seeing one
+    // unset is talking to an older server that doesn't report it.
+    //
+    // Whether a wallet database exists in the server's wallet directory, open or not. False
+    // means `OpenOrCreateWallet` would create a new, empty wallet: a client whose own record
+    // says a wallet exists should not call it then, but tell the user (the wallet directory may
+    // have been wiped or moved). Reflects the directory as it is now, so it can be false even
+    // while `open` is true, if the database was removed from under the running server. Left
+    // unset if the directory can't be checked.
+    optional bool exists = 2;
+    // Whether `OpenOrCreateWallet` has opened the wallet. Unlike `ready`, this doesn't wait for
+    // the first sync.
+    optional bool open = 3;
 }
 
 message GetUnusedAddressRequest {}
