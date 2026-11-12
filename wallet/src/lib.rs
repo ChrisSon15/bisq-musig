@@ -24,7 +24,7 @@ mod tests {
     use bdk_wallet::bitcoin::secp256k1::Message;
     use bdk_wallet::bitcoin::sighash::{Prevouts, SighashCache};
     use bdk_wallet::bitcoin::{
-        Address, AddressType, Amount, BlockHash, Network, OutPoint, Transaction, TxOut, Weight,
+        Address, AddressType, Amount, BlockHash, Network, OutPoint, Transaction, Weight,
         XOnlyPublicKey, absolute, psbt, taproot, transaction,
     };
     use bdk_wallet::chain::{self, BlockId};
@@ -45,7 +45,12 @@ mod tests {
     use crate::error::WalletErrorKind;
     use crate::password::Password;
     use crate::persisted::{BMPWalletPersister as _, DBStorage};
-    use crate::test_utils::{MemDbHandle, MockedBDKElectrum, derive_public_key, test_password};
+    use crate::protocol_wallet_api::ProtocolWalletApi as _;
+    use crate::test_utils::{
+        MemDbHandle, MockedBDKElectrum, MockedBDKElectrumWithCoinbase,
+        MockedBDKElectrumWithEvictedSpend, MockedBDKElectrumWithPending,
+        MockedBDKElectrumWithSpend, MockedBDKElectrumWithSpendOf, derive_public_key, test_password,
+    };
     use crate::utils::derive_key_from_password;
 
     fn new_private_key() -> Scalar {
@@ -542,6 +547,27 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn persist_does_not_open_clean_file_backed_imported_wallet() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage: DBStorage = dir.path().into();
+        let mut wallet = BMPWallet::new(storage, &test_password(), Network::Regtest)?;
+        let key = new_private_key();
+
+        wallet.import_private_key(key, None)?;
+        wallet.persist()?;
+
+        let imported_db = dir
+            .path()
+            .join(format!("bmp_{}.db3", derive_public_key(&key)));
+        assert!(imported_db.exists());
+        std::fs::remove_file(&imported_db)?;
+
+        assert!(!wallet.persist()?);
+        assert!(!imported_db.exists());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_sync() -> anyhow::Result<()> {
         let mem_storage = MemDbHandle::new()?;
@@ -666,8 +692,14 @@ mod tests {
 
         let imported_wallets =
             BMPWallet::load_imported_wallets(&keys, &mem_storage.store, Network::Regtest)?;
-        let first_key_unspents = imported_wallets[0].0.list_unspent().collect::<Vec<_>>();
-        let second_key_unspents = imported_wallets[1].0.list_unspent().collect::<Vec<_>>();
+        let first_key_unspents = imported_wallets[0]
+            .wallet
+            .list_unspent()
+            .collect::<Vec<_>>();
+        let second_key_unspents = imported_wallets[1]
+            .wallet
+            .list_unspent()
+            .collect::<Vec<_>>();
 
         assert_eq!(first_key_unspents.len(), 1);
         assert_eq!(second_key_unspents.len(), 1);
@@ -736,16 +768,9 @@ mod tests {
             ScriptBuf::new_p2tr(&secp, xonly, Some(merkle_root))
         );
 
-        // Put a utxo paying to tr(P, tap_tree) into the wallet's graph, the way `sync_all` does,
-        // and let the wallet's own `build_tx` path (imported_utxos) prepare the PSBT input.
-        let outpoint = OutPoint::from_str(
-            "0000000000000000000000000000000000000000000000000000000000000001:0",
-        )?;
-        let txout = TxOut {
-            value: Amount::ONE_BTC,
-            script_pubkey: imported.script_pubkey(),
-        };
-        bmp_wallet.insert_txout(outpoint, txout);
+        // Syncing validates the imported wallet's output and makes it available to the normal
+        // build path.
+        bmp_wallet.sync_all(&MockedBDKElectrum {}).await?;
 
         let mut tx_builder = bmp_wallet.build_tx();
 
@@ -839,6 +864,368 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn locked_imported_utxo_is_not_selected() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        wallet.import_private_key(new_private_key(), None)?;
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let locked_imported = wallet
+            .list_utxos()
+            .into_iter()
+            .find(|utxo| utxo.imported)
+            .expect("sync should provide an imported UTXO");
+        let locked_outpoint = OutPoint::new(locked_imported.tx_id, locked_imported.vout);
+        wallet.lock_utxo(locked_outpoint)?;
+
+        assert!(wallet.is_utxo_locked(locked_outpoint));
+
+        let mut builder = wallet.build_tx();
+        builder
+            .fee_rate(FeeRate::from_sat_per_kwu(250))
+            .add_recipient(ScriptBuf::default(), Amount::from_sat(50_000_000));
+        let psbt = builder.finish()?;
+
+        assert_eq!(psbt.unsigned_tx.input.len(), 1);
+        assert_ne!(
+            psbt.unsigned_tx.input[0].previous_output, locked_outpoint,
+            "locked imported UTXO must not be selected"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn locked_wallet_utxo_is_not_selected_without_imported_utxos() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let own_utxo = wallet
+            .list_utxos()
+            .into_iter()
+            .find(|utxo| !utxo.imported)
+            .expect("sync should provide a wallet-owned UTXO");
+        let locked_outpoint = OutPoint::new(own_utxo.tx_id, own_utxo.vout);
+        wallet.lock_utxo(locked_outpoint)?;
+
+        let mut builder = wallet.build_tx();
+        builder
+            .fee_rate(FeeRate::from_sat_per_kwu(250))
+            .add_recipient(ScriptBuf::default(), Amount::from_sat(50_000_000));
+        let err = builder
+            .finish()
+            .expect_err("the only wallet UTXO is locked");
+
+        assert!(err.to_string().contains("Insufficient funds"), "got: {err}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_locked_utxos_omits_unknown_outpoints() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let unknown = OutPoint::null();
+        wallet.lock_utxo(unknown)?;
+
+        assert!(wallet.is_utxo_locked(unknown));
+        assert!(!wallet.list_locked_utxos().contains(&unknown));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn locked_outpoint_is_removed_from_active_locks_when_spent() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let owned = wallet
+            .list_utxos()
+            .into_iter()
+            .find(|utxo| !utxo.imported)
+            .expect("sync should provide a wallet-owned UTXO");
+        let outpoint = OutPoint::new(owned.tx_id, owned.vout);
+        wallet.lock_utxo(outpoint)?;
+        assert!(wallet.list_locked_utxos().contains(&outpoint));
+
+        wallet.sync_all(&MockedBDKElectrumWithSpend {}).await?;
+
+        assert!(wallet.is_utxo_locked(outpoint));
+        assert!(!wallet.list_locked_utxos().contains(&outpoint));
+        assert!(
+            !wallet
+                .list_utxos()
+                .iter()
+                .any(|utxo| OutPoint::new(utxo.tx_id, utxo.vout) == outpoint)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn evicted_imported_spend_does_not_hide_the_imported_utxo() -> anyhow::Result<()> {
+        let mut mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(
+            mem_storage.store.clone(),
+            &test_password(),
+            Network::Regtest,
+        )?;
+        wallet.import_private_key(new_private_key(), None)?;
+        mem_storage.anchor_imported_key(&wallet.imported_keys()[0])?;
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let imported = wallet
+            .list_utxos()
+            .into_iter()
+            .find(|utxo| utxo.imported)
+            .expect("sync should provide an imported UTXO");
+        let outpoint = OutPoint::new(imported.tx_id, imported.vout);
+        wallet.lock_utxo(outpoint)?;
+
+        wallet
+            .sync_all(&MockedBDKElectrumWithEvictedSpend { outpoint })
+            .await?;
+
+        assert!(wallet.is_utxo_locked(outpoint));
+        assert!(wallet.list_locked_utxos().contains(&outpoint));
+        assert!(
+            wallet
+                .list_utxos()
+                .iter()
+                .any(|utxo| OutPoint::new(utxo.tx_id, utxo.vout) == outpoint)
+        );
+        assert_eq!(wallet.imported_balance().confirmed, Amount::ONE_BTC);
+
+        wallet.unlock_utxo(outpoint)?;
+        let mut builder = wallet.build_tx();
+        builder
+            .fee_rate(FeeRate::from_sat_per_kwu(250))
+            .add_recipient(ScriptBuf::default(), Amount::from_sat(50_000_000));
+        let psbt = builder.finish()?;
+        assert!(
+            psbt.unsigned_tx
+                .input
+                .iter()
+                .any(|input| input.previous_output == outpoint)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn locked_utxos_remain_locked_after_wallet_reload() -> anyhow::Result<()> {
+        let mut mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(
+            mem_storage.store.clone(),
+            &test_password(),
+            Network::Regtest,
+        )?;
+        wallet.import_private_key(new_private_key(), None)?;
+        mem_storage.anchor_imported_key(&wallet.imported_keys()[0])?;
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let utxos = wallet.list_utxos();
+        let imported = utxos
+            .iter()
+            .find(|utxo| utxo.imported)
+            .expect("sync should provide an imported UTXO");
+        let owned = utxos
+            .iter()
+            .find(|utxo| !utxo.imported)
+            .expect("sync should provide a wallet-owned UTXO");
+        let imported_outpoint = OutPoint::new(imported.tx_id, imported.vout);
+        let owned_outpoint = OutPoint::new(owned.tx_id, owned.vout);
+
+        wallet.lock_utxo(imported_outpoint)?;
+        wallet.lock_utxo(owned_outpoint)?;
+        let locked_outpoints = wallet.list_locked_utxos();
+        assert!(locked_outpoints.contains(&imported_outpoint));
+        assert!(locked_outpoints.contains(&owned_outpoint));
+        drop(wallet);
+
+        let mut reloaded = BMPWallet::load_wallet(
+            mem_storage.store.clone(),
+            Network::Regtest,
+            &test_password(),
+        )?;
+
+        assert!(reloaded.is_utxo_locked(imported_outpoint));
+        assert!(reloaded.is_utxo_locked(owned_outpoint));
+        let locked_outpoints = reloaded.list_locked_utxos();
+        assert!(locked_outpoints.contains(&imported_outpoint));
+        assert!(locked_outpoints.contains(&owned_outpoint));
+
+        let reloaded_utxos = reloaded.list_utxos();
+        assert!(
+            reloaded_utxos
+                .iter()
+                .find(|utxo| OutPoint::new(utxo.tx_id, utxo.vout) == imported_outpoint)
+                .is_some_and(|utxo| utxo.is_locked)
+        );
+        assert!(
+            reloaded_utxos
+                .iter()
+                .find(|utxo| OutPoint::new(utxo.tx_id, utxo.vout) == owned_outpoint)
+                .is_some_and(|utxo| utxo.is_locked)
+        );
+
+        // Unlocking immediately makes the imported outpoint eligible for coin selection again.
+        reloaded.unlock_utxo(imported_outpoint)?;
+        assert!(!reloaded.is_utxo_locked(imported_outpoint));
+        let locked_outpoints = reloaded.list_locked_utxos();
+        assert!(!locked_outpoints.contains(&imported_outpoint));
+        assert!(locked_outpoints.contains(&owned_outpoint));
+
+        let mut builder = reloaded.build_tx();
+        builder
+            .fee_rate(FeeRate::from_sat_per_kwu(250))
+            .add_recipient(ScriptBuf::default(), Amount::from_sat(50_000_000));
+        let psbt = builder.finish()?;
+        assert!(
+            psbt.unsigned_tx
+                .input
+                .iter()
+                .any(|input| input.previous_output == imported_outpoint)
+        );
+
+        // Persist both unlocks, reload, and verify the unlocked state and selection behavior.
+        reloaded.unlock_utxo(owned_outpoint)?;
+        drop(reloaded);
+
+        let mut reloaded =
+            BMPWallet::load_wallet(mem_storage.store, Network::Regtest, &test_password())?;
+        assert!(!reloaded.is_utxo_locked(imported_outpoint));
+        assert!(!reloaded.is_utxo_locked(owned_outpoint));
+        assert_eq!(reloaded.list_locked_utxos(), [] as [OutPoint; 0]);
+
+        let mut builder = reloaded.build_tx();
+        builder
+            .fee_rate(FeeRate::from_sat_per_kwu(250))
+            .add_recipient(ScriptBuf::default(), Amount::from_sat(50_000_000));
+        let psbt = builder.finish()?;
+        assert!(
+            psbt.unsigned_tx
+                .input
+                .iter()
+                .any(|input| input.previous_output == imported_outpoint)
+        );
+
+        // The owned outpoint is selectable too when the imported one is locked.
+        reloaded.lock_utxo(imported_outpoint)?;
+        let locked_outpoints = reloaded.list_locked_utxos();
+        assert!(locked_outpoints.contains(&imported_outpoint));
+        assert!(!locked_outpoints.contains(&owned_outpoint));
+        let mut builder = reloaded.build_tx();
+        builder
+            .fee_rate(FeeRate::from_sat_per_kwu(250))
+            .add_recipient(ScriptBuf::default(), Amount::from_sat(50_000_000));
+        let psbt = builder.finish()?;
+        assert!(
+            psbt.unsigned_tx
+                .input
+                .iter()
+                .any(|input| input.previous_output == owned_outpoint)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn balance_excludes_locked_hd_and_imported_utxos() -> anyhow::Result<()> {
+        let mut mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(
+            mem_storage.store.clone(),
+            &test_password(),
+            Network::Regtest,
+        )?;
+        wallet.import_private_key(new_private_key(), None)?;
+        mem_storage.anchor_imported_key(&wallet.imported_keys()[0])?;
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let utxos = wallet.list_utxos();
+        let imported = utxos.iter().find(|utxo| utxo.imported).unwrap();
+        let owned = utxos.iter().find(|utxo| !utxo.imported).unwrap();
+        let imported_outpoint = OutPoint::new(imported.tx_id, imported.vout);
+        let owned_outpoint = OutPoint::new(owned.tx_id, owned.vout);
+
+        wallet.lock_utxo(imported_outpoint)?;
+        wallet.lock_utxo(owned_outpoint)?;
+
+        assert_eq!(wallet.full_balance().confirmed, Amount::from_int_btc(2));
+        assert_eq!(wallet.reserved_balance().confirmed, Amount::from_int_btc(2));
+        assert_eq!(wallet.available_balance().trusted_spendable(), Amount::ZERO);
+        assert_eq!(wallet.balance(), Amount::ZERO);
+
+        wallet.unlock_utxo(imported_outpoint)?;
+        assert_eq!(
+            wallet.available_balance().trusted_spendable(),
+            Amount::from_int_btc(1)
+        );
+        assert_eq!(
+            wallet.reserved_balance().trusted_spendable(),
+            Amount::from_int_btc(1)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn immature_imported_coinbase_is_not_selected_until_mature() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        wallet.import_private_key(new_private_key(), None)?;
+
+        wallet
+            .sync_all(&MockedBDKElectrumWithCoinbase { tip_height: 1 })
+            .await?;
+        let _immature = wallet
+            .list_utxos()
+            .into_iter()
+            .find(|utxo| utxo.imported)
+            .expect("sync should provide an imported coinbase UTXO");
+        assert_eq!(wallet.imported_balance().immature, Amount::ONE_BTC);
+
+        let mut builder = wallet.build_tx();
+        builder
+            .fee_rate(FeeRate::from_sat_per_kwu(250))
+            .add_recipient(ScriptBuf::default(), Amount::from_sat(50_000_000));
+        let error = builder
+            .finish()
+            .expect_err("immature imported coinbase must not be selected");
+        assert!(error.to_string().contains("Insufficient funds"));
+
+        let mem_storage = MemDbHandle::new()?;
+        let mut mature_wallet =
+            BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        mature_wallet.import_private_key(new_private_key(), None)?;
+        mature_wallet
+            .sync_all(&MockedBDKElectrumWithCoinbase { tip_height: 100 })
+            .await?;
+        let mature = mature_wallet
+            .list_utxos()
+            .into_iter()
+            .find(|utxo| utxo.imported)
+            .expect("mature sync should provide an imported coinbase UTXO");
+        let mut builder = mature_wallet.build_tx();
+        builder
+            .fee_rate(FeeRate::from_sat_per_kwu(250))
+            .add_recipient(ScriptBuf::default(), Amount::from_sat(50_000_000));
+        let psbt = builder.finish()?;
+        assert!(
+            psbt.unsigned_tx
+                .input
+                .iter()
+                .any(|input| input.previous_output == OutPoint::new(mature.tx_id, mature.vout))
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn load_wallet_with_the_right_password() -> anyhow::Result<()> {
         let mem_storage = MemDbHandle::new()?;
@@ -889,6 +1276,118 @@ mod tests {
         assert_eq!(tx.input.len(), 2);
         assert_eq!(tx.output.len(), 1);
         assert_eq!(tx.output[0].value, Amount::from_str("1.99983150 BTC")?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drain_imported_balance_preserves_locked_imported_coins() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        wallet.import_private_key(new_private_key(), None)?;
+        wallet.import_private_key(new_private_key(), None)?;
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let locked = wallet
+            .list_utxos()
+            .into_iter()
+            .find(|utxo| utxo.imported)
+            .expect("sync should provide an imported UTXO");
+        let locked_outpoint = OutPoint::new(locked.tx_id, locked.vout);
+        wallet.lock_utxo(locked_outpoint)?;
+
+        let psbt = wallet.drain_imported_balance(FeeRate::from_sat_per_kwu(25_000))?;
+
+        assert_eq!(psbt.unsigned_tx.input.len(), 1);
+        assert!(
+            psbt.unsigned_tx
+                .input
+                .iter()
+                .all(|input| input.previous_output != locked_outpoint)
+        );
+        // Building a PSBT does not mark its inputs spent. Once the imported wallet sees the
+        // spending transaction, the locked coin is the only imported balance left.
+        let spent_outpoint = psbt.unsigned_tx.input[0].previous_output;
+        wallet
+            .sync_all(&MockedBDKElectrumWithSpendOf {
+                outpoint: spent_outpoint,
+            })
+            .await?;
+        assert_eq!(wallet.imported_balance().trusted_spendable(), locked.amount);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drain_imported_balance_updates_the_spent_balance() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        wallet.import_private_key(new_private_key(), None)?;
+        wallet.import_private_key(new_private_key(), None)?;
+        wallet.sync_all(&MockedBDKElectrumWithPending {}).await?;
+
+        let imported = wallet
+            .list_utxos()
+            .into_iter()
+            .filter(|utxo| utxo.imported)
+            .collect::<Vec<_>>();
+        let confirmed = imported
+            .iter()
+            .find(|utxo| utxo.num_confirmations > 0)
+            .expect("the test chain should provide one confirmed imported UTXO");
+        let pending = imported
+            .iter()
+            .find(|utxo| utxo.num_confirmations == 0)
+            .expect("the test chain should provide one pending imported UTXO");
+        let confirmed_outpoint = OutPoint::new(confirmed.tx_id, confirmed.vout);
+        let pending_outpoint = OutPoint::new(pending.tx_id, pending.vout);
+
+        wallet.lock_utxo(confirmed_outpoint)?;
+        assert_eq!(
+            wallet.imported_balance().confirmed,
+            Amount::from_sat(10_000)
+        );
+        assert_eq!(
+            wallet.imported_balance().untrusted_pending,
+            Amount::from_sat(20_000)
+        );
+
+        let psbt = wallet.drain_imported_balance(FeeRate::from_sat_per_kwu(25_000))?;
+
+        assert_eq!(psbt.unsigned_tx.input.len(), 1);
+        assert_eq!(psbt.unsigned_tx.input[0].previous_output, pending_outpoint);
+        // The balance is recomputed from the imported wallets, so the PSBT must be seen by the
+        // imported wallet before its input is considered spent.
+        wallet
+            .sync_all(&MockedBDKElectrumWithSpendOf {
+                outpoint: pending_outpoint,
+            })
+            .await?;
+        assert_eq!(
+            wallet.imported_balance().confirmed,
+            Amount::from_sat(10_000)
+        );
+        assert_eq!(wallet.imported_balance().untrusted_pending, Amount::ZERO);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drain_imported_balance_returns_insufficient_funds_when_fee_exceeds_amount()
+    -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        wallet.import_private_key(new_private_key(), None)?;
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let err = wallet
+            .drain_imported_balance(FeeRate::from_sat_per_kwu(1_000_000_000))
+            .expect_err("fees exceeding the imported amount must not panic");
+
+        assert!(matches!(
+            err,
+            WalletErrorKind::CreateTx(bdk_wallet::error::CreateTxError::CoinSelection(_))
+        ));
 
         Ok(())
     }
@@ -1194,6 +1693,151 @@ mod tests {
         Ok(())
     }
 
+    /// An imported-only payment with no change must be recorded by the imported wallet too. If it
+    /// is recorded only by the HD wallet, the imported coin remains selectable for a second
+    /// payment because the HD wallet ignores a transaction that has no HD-owned output.
+    #[tokio::test]
+    async fn imported_coin_spent_without_change_is_not_selected_again() -> anyhow::Result<()> {
+        let mut mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(
+            mem_storage.store.clone(),
+            &test_password(),
+            Network::Regtest,
+        )?;
+        wallet.import_private_key(new_private_key(), None)?;
+        mem_storage.anchor_imported_key(&wallet.imported_keys()[0])?;
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let imported_outpoint = wallet
+            .list_utxos()
+            .into_iter()
+            .find(|utxo| utxo.imported)
+            .map(|utxo| OutPoint {
+                txid: utxo.tx_id,
+                vout: utxo.vout,
+            })
+            .expect("the imported wallet should have one coin");
+        let own_outpoint = wallet
+            .list_utxos()
+            .into_iter()
+            .find(|utxo| !utxo.imported)
+            .map(|utxo| OutPoint {
+                txid: utxo.tx_id,
+                vout: utxo.vout,
+            })
+            .expect("the HD wallet should have one coin");
+        // Force the first transaction to be an imported-only spend so that it has no HD-owned
+        // output/change and exercises the source-of-truth bug from PR #228.
+        wallet.lock_utxo(own_outpoint)?;
+        let to_address = "tb1pyfv094rr0vk28lf8v9yx3veaacdzg26ztqk4ga84zucqqhafnn5q9my9rz"
+            .parse::<Address<_>>()?
+            .assume_checked();
+
+        let first = wallet.send_to_address(&to_address, Amount::ONE_BTC, FeeRate::ZERO)?;
+        assert_eq!(
+            first.input.len(),
+            1,
+            "the first payment must spend one coin"
+        );
+        assert_eq!(
+            first.output.len(),
+            1,
+            "the first payment must have no change: {:#?}",
+            first.output
+        );
+        assert!(
+            first
+                .input
+                .iter()
+                .any(|input| input.previous_output == imported_outpoint),
+            "the imported coin should be selected first"
+        );
+
+        wallet.unlock_utxo(own_outpoint)?;
+        let second = wallet.send_to_address(
+            &to_address,
+            Amount::from_sat(100_000),
+            FeeRate::from_sat_per_kwu(250),
+        )?;
+        assert!(
+            second
+                .input
+                .iter()
+                .all(|input| input.previous_output != imported_outpoint),
+            "an imported coin spent without change must not be selected again"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn imported_coin_spent_without_change_is_removed_from_utxo_list_and_balance()
+    -> anyhow::Result<()> {
+        let mut mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(
+            mem_storage.store.clone(),
+            &test_password(),
+            Network::Regtest,
+        )?;
+        wallet.import_private_key(new_private_key(), None)?;
+        mem_storage.anchor_imported_key(&wallet.imported_keys()[0])?;
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let imported_outpoint = wallet
+            .list_utxos()
+            .into_iter()
+            .find(|utxo| utxo.imported)
+            .map(|utxo| OutPoint {
+                txid: utxo.tx_id,
+                vout: utxo.vout,
+            })
+            .expect("the imported wallet should have one coin");
+        let own_outpoint = wallet
+            .list_utxos()
+            .into_iter()
+            .find(|utxo| !utxo.imported)
+            .map(|utxo| OutPoint {
+                txid: utxo.tx_id,
+                vout: utxo.vout,
+            })
+            .expect("the HD wallet should have one coin");
+        wallet.lock_utxo(own_outpoint)?;
+        let to_address = "tb1pyfv094rr0vk28lf8v9yx3veaacdzg26ztqk4ga84zucqqhafnn5q9my9rz"
+            .parse::<Address<_>>()?
+            .assume_checked();
+
+        let _ = wallet.send_to_address(&to_address, Amount::ONE_BTC, FeeRate::ZERO)?;
+
+        assert!(
+            wallet.list_utxos().iter().all(|utxo| !utxo.imported
+                || OutPoint {
+                    txid: utxo.tx_id,
+                    vout: utxo.vout,
+                } != imported_outpoint),
+            "the spent imported coin must not remain in the UTXO list"
+        );
+        assert_eq!(
+            wallet.imported_balance().total(),
+            Amount::ZERO,
+            "the spent imported coin must not remain in imported balance"
+        );
+
+        drop(wallet);
+        let reloaded =
+            BMPWallet::load_wallet(mem_storage.store, Network::Regtest, &test_password())?;
+        assert!(
+            reloaded.list_utxos().iter().all(|utxo| !utxo.imported
+                || OutPoint {
+                    txid: utxo.tx_id,
+                    vout: utxo.vout,
+                } != imported_outpoint),
+            "the spent imported coin must remain absent after reload"
+        );
+        assert_eq!(reloaded.imported_balance().total(), Amount::ZERO);
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn list_utxos_covers_own_and_imported_outputs() -> anyhow::Result<()> {
         let mem_storage = MemDbHandle::new()?;
@@ -1243,12 +1887,9 @@ mod tests {
         let imported = |w: &BMPWallet| w.list_utxos().iter().filter(|u| u.imported).count();
         assert_eq!(imported(&wallet), 1, "the imported coin starts out unspent");
 
-        // Sweep the imported coin, then let the wallet see the spending transaction. Imported
-        // outputs are floating txouts with no chain position, so the only way to know they are
-        // gone is that something in the graph spends them.
-        let psbt = wallet.drain_imported_balance(FeeRate::from_sat_per_kwu(25_000))?;
-        let spend = psbt.extract_tx()?;
-        bdk_wallet::test_utils::insert_tx(&mut wallet, spend);
+        // Let the imported wallet see a spending transaction. Its own `list_unspent()` result is
+        // the source of truth for whether an imported output remains available.
+        wallet.sync_all(&MockedBDKElectrumWithSpend {}).await?;
 
         assert_eq!(
             imported(&wallet),

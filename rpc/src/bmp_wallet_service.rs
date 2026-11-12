@@ -129,6 +129,14 @@ pub trait BmpWalletService {
 
     async fn full_balance(&self) -> anyhow::Result<Balance>;
 
+    /// Returns `(total, available, reserved)` from one wallet snapshot.
+    ///
+    /// `total` is the complete BDK balance breakdown, including reserved outputs. `available` is
+    /// the same breakdown after removing reserved outputs; the RPC's scalar `balance` is derived
+    /// from its trusted-spendable portion. `reserved` is the breakdown of outputs held out of coin
+    /// selection.
+    async fn balance_snapshot(&self) -> anyhow::Result<(Balance, Balance, Balance)>;
+
     /// The wallet's seed phrase, one word per element.
     ///
     /// `password` must be the wallet password; a wrong one fails with [`InvalidPassword`] rather
@@ -444,6 +452,16 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
         Ok(require_open(&mut guard)?.full_balance())
     }
 
+    async fn balance_snapshot(&self) -> anyhow::Result<(Balance, Balance, Balance)> {
+        let mut guard = self.wallet.lock().await;
+        let wallet = require_open(&mut guard)?;
+        Ok((
+            wallet.full_balance(),
+            wallet.available_balance(),
+            wallet.reserved_balance(),
+        ))
+    }
+
     async fn seed_words(&self, password: &str) -> anyhow::Result<Vec<String>> {
         let mut guard = self.wallet.lock().await;
         let wallet = require_open(&mut guard)?;
@@ -631,13 +649,17 @@ impl wallet_server::Wallet for BmpWalletImpl {
         request: Request<GetBalanceRequest>,
     ) -> Result<Response<GetBalanceResponse>> {
         handle_request_async(request, |_request| async {
-            let balance = self
+            let (total, available, reserved) = self
                 .wallet_service
-                .full_balance()
+                .balance_snapshot()
                 .await
                 .map_err(|e| status_from(&e))?;
 
-            Ok(balance.into())
+            Ok(GetBalanceResponse::from_balances(
+                &total,
+                &available,
+                &reserved,
+            ))
         })
         .await
     }
@@ -723,13 +745,26 @@ fn is_invalid_password(error: &anyhow::Error) -> bool {
 
 impl From<Balance> for GetBalanceResponse {
     fn from(value: Balance) -> Self {
+        let reserved = Balance::default();
+        Self::from_balances(&value, &value, &reserved)
+    }
+}
+
+impl GetBalanceResponse {
+    fn from_balances(total: &Balance, available: &Balance, reserved: &Balance) -> Self {
         Self {
-            // bisq2 reads only `balance`; keep it the trusted-spendable total it expects.
-            balance: value.trusted_spendable().to_sat(),
-            confirmed: value.confirmed.to_sat(),
-            trusted_pending: value.trusted_pending.to_sat(),
-            untrusted_pending: value.untrusted_pending.to_sat(),
-            immature: value.immature.to_sat(),
+            // bisq2 reads only `balance`; keep it the trusted-spendable amount that is actually
+            // available for a new transaction, excluding reserved outputs.
+            balance: available.trusted_spendable().to_sat(),
+            // These four fields come from `total`, so they include reserved outputs and describe
+            // the complete holdings rather than the filtered available balance.
+            confirmed: total.confirmed.to_sat(),
+            trusted_pending: total.trusted_pending.to_sat(),
+            untrusted_pending: total.untrusted_pending.to_sat(),
+            immature: total.immature.to_sat(),
+            // `total()` intentionally includes every balance category, including immature and
+            // untrusted-pending reserved outputs.
+            reserved: reserved.total().to_sat(),
         }
     }
 }
@@ -761,6 +796,7 @@ impl From<UtxoInfo> for bmp_wallet::Utxo {
             amount: value.amount.to_sat(),
             address: value.address.map(Into::into),
             num_confirmations: value.num_confirmations,
+            is_locked: value.is_locked,
         }
     }
 }
@@ -1231,8 +1267,33 @@ mod tests {
         assert_eq!(proto.trusted_pending, 20);
         assert_eq!(proto.untrusted_pending, 300);
         assert_eq!(proto.immature, 1);
+        assert_eq!(proto.reserved, 0);
         // Untrusted/immature funds must never be presented as spendable.
         assert!(proto.balance < balance.total().to_sat());
+    }
+
+    #[test]
+    fn balance_maps_available_and_reserved_amounts_for_get_balance() {
+        let total = Balance {
+            confirmed: Amount::from_sat(2_000),
+            ..Balance::default()
+        };
+        let available = Balance {
+            confirmed: Amount::from_sat(750),
+            ..Balance::default()
+        };
+        let reserved = Balance {
+            immature: Amount::from_sat(10),
+            trusted_pending: Amount::from_sat(20),
+            untrusted_pending: Amount::from_sat(30),
+            confirmed: Amount::from_sat(1_250),
+        };
+
+        let proto = GetBalanceResponse::from_balances(&total, &available, &reserved);
+
+        assert_eq!(proto.balance, 750);
+        assert_eq!(proto.confirmed, 2_000);
+        assert_eq!(proto.reserved, 1_310);
     }
 
     #[test]
@@ -1262,6 +1323,7 @@ mod tests {
             address: Some(address_info(REGTEST_ADDRESS)),
             num_confirmations: 6,
             imported: true,
+            is_locked: true,
         };
         let proto: bmp_wallet::Utxo = utxo.into();
 
@@ -1270,6 +1332,7 @@ mod tests {
         assert_eq!(proto.amount, 50_000);
         assert_eq!(proto.address.unwrap().address, REGTEST_ADDRESS);
         assert_eq!(proto.num_confirmations, 6);
+        assert!(proto.is_locked);
 
         // A non-standard script must come through as an absent address, not panic.
         let nameless = UtxoInfo {
@@ -1281,6 +1344,7 @@ mod tests {
                 address: None,
                 num_confirmations: 0,
                 imported: false,
+                is_locked: false,
             }
         };
         assert_eq!(bmp_wallet::Utxo::from(nameless).address, None);

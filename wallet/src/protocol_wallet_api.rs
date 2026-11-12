@@ -63,6 +63,11 @@ pub trait ProtocolWalletApi {
         pk: Scalar,
         tap_tree: Option<TapTree<XOnlyPublicKey>>,
     ) -> Result<()>;
+
+    fn lock_utxo(&mut self, utxo: OutPoint) -> Result<()>;
+    fn list_locked_utxos(&self) -> Vec<OutPoint>;
+    fn unlock_utxo(&mut self, utxo: OutPoint) -> Result<()>;
+    fn is_utxo_locked(&self, utxo: OutPoint) -> bool;
 }
 
 pub struct MemWallet {
@@ -210,6 +215,24 @@ impl ProtocolWalletApi for MemWallet {
         // If/when this is needed, mirror the `BMPWallet` implementation.
         todo!("MemWallet does not yet support importing private keys")
     }
+
+    fn lock_utxo(&mut self, utxo: OutPoint) -> Result<()> {
+        self.wallet.lock_outpoint(utxo);
+        Ok(())
+    }
+
+    fn list_locked_utxos(&self) -> Vec<OutPoint> {
+        self.wallet.list_locked_unspent().collect()
+    }
+
+    fn unlock_utxo(&mut self, utxo: OutPoint) -> Result<()> {
+        self.wallet.unlock_outpoint(utxo);
+        Ok(())
+    }
+
+    fn is_utxo_locked(&self, utxo: OutPoint) -> bool {
+        self.wallet.is_outpoint_locked(utxo)
+    }
 }
 
 impl ProtocolWalletApi for Wallet {
@@ -258,6 +281,25 @@ impl ProtocolWalletApi for Wallet {
             use BMPWallet for that"
         )
     }
+
+    fn lock_utxo(&mut self, utxo: OutPoint) -> Result<()> {
+        self.lock_outpoint(utxo);
+        Ok(())
+    }
+
+    fn list_locked_utxos(&self) -> Vec<OutPoint> {
+        self.list_locked_unspent().collect()
+    }
+
+    fn unlock_utxo(&mut self, utxo: OutPoint) -> Result<()> {
+        self.unlock_outpoint(utxo);
+        Ok(())
+    }
+
+    fn is_utxo_locked(&self, utxo: OutPoint) -> bool {
+        self.is_outpoint_locked(utxo)
+    }
+    // @TODO Add a new method, reserved_balance
 }
 
 /// Sign the wallet-owned inputs of `psbt` using the supplied `sign` closure, then transfer the

@@ -107,7 +107,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 peer_count = peers.len(),
                 "Syncing the BMP wallet over compact block filters once it has been opened."
             );
-            service = service.with_chain_data_source(CBFScanner::from_hostnames(peers.clone()));
+            service = service.with_chain_data_source(CBFScanner::from_hostnames(&peers.clone()));
         }
 
         let service = Arc::new(service);

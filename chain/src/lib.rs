@@ -96,7 +96,7 @@ impl CBFScanner {
 
     /// Builds a scanner from plain `host:port` peer addresses, so callers don't need to depend
     /// on `bdk_kyoto` just to name a peer.
-    pub fn from_hostnames(hostnames: Vec<String>) -> Self {
+    pub fn from_hostnames(hostnames: &[String]) -> Self {
         Self::new(
             hostnames
                 .iter()
