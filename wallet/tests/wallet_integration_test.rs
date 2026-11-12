@@ -490,7 +490,7 @@ fn load_recovers_an_interrupted_salt_rotation() -> anyhow::Result<()> {
     let storage: DBStorage = dir.path().into();
     let seed = {
         let wallet = BMPWallet::new(storage.clone(), &test_password(), Network::Regtest)?;
-        wallet.get_seed_phrase()?
+        wallet.get_seed_phrase(&test_password())?
     };
 
     let db_path = dir.path().join(db_name);
@@ -515,7 +515,7 @@ fn load_recovers_an_interrupted_salt_rotation() -> anyhow::Result<()> {
 
     let wallet = BMPWallet::load_wallet(dir.path().into(), Network::Regtest, &test_password())?;
     assert_eq!(
-        wallet.get_seed_phrase()?,
+        wallet.get_seed_phrase(&test_password())?,
         seed,
         "recovery must yield the same wallet"
     );
@@ -538,7 +538,7 @@ fn load_recovers_an_interrupted_salt_rotation() -> anyhow::Result<()> {
 
     // And a subsequent plain load works off the committed salt.
     let reloaded = BMPWallet::load_wallet(dir.path().into(), Network::Regtest, &test_password())?;
-    assert_eq!(reloaded.get_seed_phrase()?, seed);
+    assert_eq!(reloaded.get_seed_phrase(&test_password())?, seed);
 
     Ok(())
 }
@@ -550,14 +550,14 @@ fn load_ignores_and_cleans_a_stale_staged_salt() -> anyhow::Result<()> {
     let dir = get_dir();
     let seed = {
         let wallet = BMPWallet::new(dir.path().into(), &test_password(), Network::Regtest)?;
-        wallet.get_seed_phrase()?
+        wallet.get_seed_phrase(&test_password())?
     };
 
     let staged_salt_path = dir.path().join(format!("{}.salt.new", BMPWallet::DB_NAME));
     fs::write(&staged_salt_path, "bm90LXRoZS1yZWFsLXNhbHQ=")?; // valid base64, wrong salt
 
     let wallet = BMPWallet::load_wallet(dir.path().into(), Network::Regtest, &test_password())?;
-    assert_eq!(wallet.get_seed_phrase()?, seed);
+    assert_eq!(wallet.get_seed_phrase(&test_password())?, seed);
     assert!(
         !staged_salt_path.exists(),
         "the stale staged salt must be cleaned up"
@@ -577,7 +577,7 @@ fn change_password_rotates_the_key_and_survives_a_reload() -> anyhow::Result<()>
             "the password the wallet was created with is the current one"
         );
 
-        let seed = wallet.get_seed_phrase()?;
+        let seed = wallet.get_seed_phrase(&test_password())?;
         wallet.change_password(&test_password(), &new_password)?;
 
         assert!(
@@ -589,7 +589,7 @@ fn change_password_rotates_the_key_and_survives_a_reload() -> anyhow::Result<()>
             "old password must stop verifying"
         );
         assert_eq!(
-            wallet.get_seed_phrase()?,
+            wallet.get_seed_phrase(&new_password)?,
             seed,
             "seed must survive the re-key"
         );
@@ -599,12 +599,12 @@ fn change_password_rotates_the_key_and_survives_a_reload() -> anyhow::Result<()>
     // The rotated salt and key must both have reached disk.
     {
         let reloaded = BMPWallet::load_wallet(dir.path().into(), Network::Regtest, &new_password)?;
-        assert_eq!(reloaded.get_seed_phrase()?, seed);
+        assert_eq!(reloaded.get_seed_phrase(&new_password)?, seed);
     }
 
     let stale = BMPWallet::load_wallet(dir.path().into(), Network::Regtest, &test_password());
     assert!(
-        stale.is_err() || stale.unwrap().get_seed_phrase().is_err(),
+        stale.is_err() || stale.unwrap().get_seed_phrase(&test_password()).is_err(),
         "the replaced password must no longer open the wallet"
     );
 
@@ -621,7 +621,7 @@ fn new_refuses_to_overwrite_an_existing_wallet() -> anyhow::Result<()> {
 
     let seed = {
         let wallet = BMPWallet::new(dir.path().into(), &test_password(), Network::Regtest)?;
-        wallet.get_seed_phrase()?
+        wallet.get_seed_phrase(&test_password())?
     };
     let salt_before = fs::read(&salt_path)?;
 
@@ -645,7 +645,7 @@ fn new_refuses_to_overwrite_an_existing_wallet() -> anyhow::Result<()> {
 
     // The original password still opens the original wallet.
     let reloaded = BMPWallet::load_wallet(dir.path().into(), Network::Regtest, &test_password())?;
-    assert_eq!(reloaded.get_seed_phrase()?, seed);
+    assert_eq!(reloaded.get_seed_phrase(&test_password())?, seed);
 
     Ok(())
 }
@@ -656,7 +656,7 @@ fn load_wallet_rejects_a_wrong_password() {
     let dir = dir.path();
 
     let bmp_wallet = BMPWallet::new(dir.into(), &test_password(), Network::Regtest).unwrap();
-    let seed = bmp_wallet.get_seed_phrase().unwrap();
+    let seed = bmp_wallet.get_seed_phrase(&test_password()).unwrap();
 
     assert_eq!(seed.word_count(), 24);
 

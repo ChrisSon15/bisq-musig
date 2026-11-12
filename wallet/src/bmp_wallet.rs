@@ -880,7 +880,7 @@ pub trait WalletApi {
     ///
     /// The returned [`Mnemonic`] is wiped when dropped. Copies the caller makes from it, such as a
     /// `String` of its words, are not.
-    fn get_seed_phrase(&self) -> Result<Mnemonic>;
+    fn get_seed_phrase(&self, password: &Password) -> Result<Mnemonic>;
 
     fn balance(&self) -> Amount;
 
@@ -1030,8 +1030,7 @@ impl WalletApi for BMPWallet {
         // Check whether the signing keys were loaded if not load them into the wallet
         if !self.signers_loaded {
             tracing::info!("Loading the signers into the wallet");
-            let recovery_phrase = self
-                .get_seed_phrase()
+            let recovery_phrase = Self::load_mnemonic(&self.db)
                 .map_err(|_| SignerError::External("Unable to load keys.".to_owned()))?;
             let Bip86Keys {
                 external: (external_descriptor, external_map),
@@ -1107,7 +1106,11 @@ impl WalletApi for BMPWallet {
         self.available_balance().trusted_spendable()
     }
 
-    fn get_seed_phrase(&self) -> Result<Mnemonic> {
+    fn get_seed_phrase(&self, password: &Password) -> Result<Mnemonic> {
+        if !self.check_password(password)? {
+            return Err(WalletErrorKind::InvalidPassword);
+        }
+
         Self::load_mnemonic(&self.db)
     }
 
