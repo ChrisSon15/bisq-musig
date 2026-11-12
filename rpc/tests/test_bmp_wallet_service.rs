@@ -4,14 +4,22 @@
 //!
 //! The full gRPC stack is exercised — a real tonic server on a loopback port, driven through the
 //! generated client — but no chain backend is needed: everything under test is pure wallet-
-//! database state, which is exactly what `OpenOrCreateWallet` manages.
+//! database state, which is exactly what `OpenOrCreateWallet` manages. The background sync loop
+//! is exercised too, against a stub chain data source, since it needs neither a chain nor a
+//! Bitcoin Core node.
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
+use anyhow::Context as _;
+use bdk_wallet::PersistedWallet;
 use bdk_wallet::bitcoin::Network;
 use chain::CBFScanner;
-use rpc::bmp_wallet_service::{BMPWalletServiceImpl, BmpWalletImpl, BmpWalletServer};
+use rpc::bmp_wallet_service::{
+    BMPWalletServiceImpl, BmpWalletImpl, BmpWalletServer, BmpWalletService as _,
+};
 use rpc::pb::bmp_wallet::wallet_client::WalletClient;
 use rpc::pb::bmp_wallet::{
     ChangePasswordRequest, GetBalanceRequest, GetSeedWordsRequest, GetUnusedAddressRequest,
@@ -23,6 +31,9 @@ use tokio::task::JoinHandle;
 use tonic::Code;
 use tonic::transport::Channel;
 use tonic::transport::server::TcpIncoming;
+use wallet::chain_data_source::ChainDataSource;
+use wallet::error::ChainDataSourceError;
+use wallet::persisted::BMPWalletPersister;
 
 /// Passwords following the wallet's password rules.
 const PASSWORD: &str = "S3cret!!";
@@ -368,6 +379,80 @@ async fn addresses_travel_as_address_infos_over_grpc() -> anyhow::Result<()> {
         .expect_err("a missing address must be rejected");
     assert_eq!(err.code(), Code::InvalidArgument, "got: {err}");
     fixture.stop();
+
+    Ok(())
+}
+
+/// A chain data source that sees no chain at all: it only counts how often a wallet was synced
+/// against it.
+#[derive(Clone, Default)]
+struct CountingChainSource(Arc<AtomicUsize>);
+
+impl CountingChainSource {
+    fn syncs(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl ChainDataSource for CountingChainSource {
+    const RECOVERY_HEIGHT: usize = 0;
+    const BATCH_SIZE: usize = 1;
+    const STOP_GAP: usize = 1;
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the ChainDataSource trait requires an async method"
+    )]
+    async fn sync(
+        &self,
+        _wallets: Vec<&mut PersistedWallet<impl BMPWalletPersister>>,
+    ) -> Result<(), ChainDataSourceError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// The background sync loop needs only the chain data source: no Bitcoin Core client is passed
+/// in, and none is contacted. Run on a current-thread runtime, which a blocking call made from
+/// inside the loop (such as a Bitcoin Core RPC through `block_in_place`) would not survive.
+#[tokio::test]
+async fn background_sync_needs_only_the_chain_data_source() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let source = CountingChainSource::default();
+    let service = Arc::new(
+        BMPWalletServiceImpl::new(dir.path(), Network::Regtest)
+            .with_chain_data_source(source.clone())
+            .with_poll_period(Duration::from_millis(10)),
+    );
+    let connection = Arc::clone(&service).spawn_connection();
+
+    // Until the wallet is opened there is nothing to sync, so nothing is ready either.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !connection.is_finished(),
+        "the sync loop must wait for the wallet to be opened"
+    );
+    assert_eq!(source.syncs(), 0);
+    assert!(!service.is_ready());
+
+    service.open_or_create_wallet(PASSWORD).await?;
+
+    // Once open, the first sync makes the wallet ready and the loop keeps re-syncing it.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !(service.is_ready() && source.syncs() >= 3) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "the sync loop must make the wallet ready and keep syncing it (ready: {}, syncs: {})",
+            service.is_ready(),
+            source.syncs()
+        )
+    })?;
+    assert!(!connection.is_finished(), "the sync loop must keep running");
+    connection.abort();
 
     Ok(())
 }

@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use bdk_kyoto::bip157::{Builder, Network};
@@ -96,11 +96,31 @@ impl CBFScanner {
 
     /// Builds a scanner from plain `host:port` peer addresses, so callers don't need to depend
     /// on `bdk_kyoto` just to name a peer.
-    pub fn from_socket_addrs(addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
+    pub fn from_hostnames(hostnames: &[String]) -> Self {
         Self::new(
-            addrs
-                .into_iter()
-                .map(TrustedPeer::from_socket_addr)
+            hostnames
+                .iter()
+                .map(|peer| {
+                    let peer = peer.trim();
+
+                    // IP literal with port (v4 or bracketed v6): no hostname handling needed
+                    if let Ok(addr) = peer.parse::<SocketAddr>() {
+                        return TrustedPeer::from_socket_addr(addr);
+                    }
+
+                    let (host, port) = peer
+                        .rsplit_once(':')
+                        .unwrap_or_else(|| panic!("Missing host or port in peer {peer:?}"));
+                    let port: u16 = port
+                        .parse()
+                        .unwrap_or_else(|e| panic!("Invalid port in peer {peer:?}: {e}"));
+
+                    if host.eq_ignore_ascii_case("localhost") {
+                        TrustedPeer::from_socket_addr(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port))
+                    } else {
+                        TrustedPeer::from_hostname(host, port)
+                    }
+                })
                 .collect(),
         )
     }

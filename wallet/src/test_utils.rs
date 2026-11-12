@@ -11,15 +11,17 @@ use bdk_wallet::bitcoin::{
 };
 use bdk_wallet::chain::{BlockId, ChainPosition, ConfirmationBlockTime};
 use bdk_wallet::rusqlite::Connection;
-use bdk_wallet::test_utils::{insert_checkpoint, receive_output_in_latest_block};
+use bdk_wallet::test_utils::{
+    ReceiveTo, insert_checkpoint, insert_tx, receive_output, receive_output_in_latest_block,
+};
 use bdk_wallet::{KeychainKind, LocalOutput, PersistedWallet, Utxo, WeightedUtxo};
 use rand::RngCore as _;
 use secp::Scalar;
 
 use crate::bmp_wallet::ImportedKey;
 use crate::chain_data_source::ChainDataSource;
-use crate::password::Password;
 use crate::error::ChainDataSourceError;
+use crate::password::Password;
 use crate::persisted::{BMPWalletPersister, DBStorage};
 
 /// A password that follows the wallet's password rules, for tests that need some password.
@@ -70,6 +72,262 @@ impl ChainDataSource for MockedBDKElectrum {
                 },
             );
             receive_output_in_latest_block(w, Amount::ONE_BTC);
+        }
+        Ok(())
+    }
+}
+
+pub struct MockedBDKElectrumWithPending;
+
+impl ChainDataSource for MockedBDKElectrumWithPending {
+    const RECOVERY_HEIGHT: usize = 10;
+    const BATCH_SIZE: usize = 10;
+    const STOP_GAP: usize = 10;
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the ChainDataSource trait requires an async method"
+    )]
+    async fn sync(
+        &self,
+        persister: Vec<&mut PersistedWallet<impl BMPWalletPersister>>,
+    ) -> Result<(), ChainDataSourceError> {
+        for (wallet_index, wallet) in persister.into_iter().enumerate() {
+            insert_checkpoint(
+                wallet,
+                BlockId {
+                    height: 42,
+                    hash: BlockHash::all_zeros(),
+                },
+            );
+            insert_checkpoint(
+                wallet,
+                BlockId {
+                    height: 1_000,
+                    hash: BlockHash::all_zeros(),
+                },
+            );
+            insert_checkpoint(
+                wallet,
+                BlockId {
+                    height: 2_000,
+                    hash: BlockHash::all_zeros(),
+                },
+            );
+
+            match wallet_index {
+                1 => {
+                    let block_id = wallet.latest_checkpoint().block_id();
+                    receive_output(
+                        wallet,
+                        Amount::from_sat(10_000),
+                        ReceiveTo::Block(ConfirmationBlockTime {
+                            block_id,
+                            confirmation_time: 2_000,
+                        }),
+                    );
+                }
+                2 => {
+                    receive_output(wallet, Amount::from_sat(20_000), ReceiveTo::Mempool(2_000));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+pub struct MockedBDKElectrumWithSpend;
+
+impl ChainDataSource for MockedBDKElectrumWithSpend {
+    const RECOVERY_HEIGHT: usize = 10;
+    const BATCH_SIZE: usize = 1;
+    const STOP_GAP: usize = 1;
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the ChainDataSource trait requires an async method"
+    )]
+    async fn sync(
+        &self,
+        persister: Vec<&mut PersistedWallet<impl BMPWalletPersister>>,
+    ) -> Result<(), ChainDataSourceError> {
+        for wallet in persister {
+            let previous_output = wallet
+                .list_unspent()
+                .next()
+                .expect("wallet should have an output to spend")
+                .outpoint;
+            insert_tx(
+                wallet,
+                Transaction {
+                    version: bdk_wallet::bitcoin::transaction::Version::ONE,
+                    lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+                    input: vec![bdk_wallet::bitcoin::TxIn {
+                        previous_output,
+                        ..Default::default()
+                    }],
+                    output: vec![TxOut {
+                        value: Amount::from_sat(1),
+                        script_pubkey: ScriptBuf::new(),
+                    }],
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+pub struct MockedBDKElectrumWithSpendOf {
+    pub outpoint: OutPoint,
+}
+
+impl ChainDataSource for MockedBDKElectrumWithSpendOf {
+    const RECOVERY_HEIGHT: usize = 10;
+    const BATCH_SIZE: usize = 1;
+    const STOP_GAP: usize = 1;
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the ChainDataSource trait requires an async method"
+    )]
+    async fn sync(
+        &self,
+        persister: Vec<&mut PersistedWallet<impl BMPWalletPersister>>,
+    ) -> Result<(), ChainDataSourceError> {
+        for wallet in persister {
+            if !wallet
+                .list_unspent()
+                .any(|utxo| utxo.outpoint == self.outpoint)
+            {
+                continue;
+            }
+
+            insert_tx(
+                wallet,
+                Transaction {
+                    version: bdk_wallet::bitcoin::transaction::Version::ONE,
+                    lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+                    input: vec![bdk_wallet::bitcoin::TxIn {
+                        previous_output: self.outpoint,
+                        ..Default::default()
+                    }],
+                    output: vec![TxOut {
+                        value: Amount::from_sat(1),
+                        script_pubkey: ScriptBuf::new(),
+                    }],
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+pub struct MockedBDKElectrumWithEvictedSpend {
+    pub outpoint: OutPoint,
+}
+
+impl ChainDataSource for MockedBDKElectrumWithEvictedSpend {
+    const RECOVERY_HEIGHT: usize = 10;
+    const BATCH_SIZE: usize = 1;
+    const STOP_GAP: usize = 1;
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the ChainDataSource trait requires an async method"
+    )]
+    async fn sync(
+        &self,
+        persister: Vec<&mut PersistedWallet<impl BMPWalletPersister>>,
+    ) -> Result<(), ChainDataSourceError> {
+        for (wallet_index, wallet) in persister.into_iter().enumerate() {
+            if wallet_index != 0 {
+                continue;
+            }
+
+            let tx = Transaction {
+                version: bdk_wallet::bitcoin::transaction::Version::ONE,
+                lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+                input: vec![bdk_wallet::bitcoin::TxIn {
+                    previous_output: self.outpoint,
+                    ..Default::default()
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: ScriptBuf::new(),
+                }],
+            };
+            let txid = tx.compute_txid();
+            wallet.apply_unconfirmed_txs([(tx, 100)]);
+            wallet.apply_evicted_txs([(txid, 200)]);
+        }
+        Ok(())
+    }
+}
+
+pub struct MockedBDKElectrumWithCoinbase {
+    pub tip_height: u32,
+}
+
+impl ChainDataSource for MockedBDKElectrumWithCoinbase {
+    const RECOVERY_HEIGHT: usize = 1;
+    const BATCH_SIZE: usize = 1;
+    const STOP_GAP: usize = 1;
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the ChainDataSource trait requires an async method"
+    )]
+    async fn sync(
+        &self,
+        persister: Vec<&mut PersistedWallet<impl BMPWalletPersister>>,
+    ) -> Result<(), ChainDataSourceError> {
+        let confirmation = BlockId {
+            height: 1,
+            hash: BlockHash::all_zeros(),
+        };
+        for wallet in persister {
+            insert_checkpoint(wallet, confirmation);
+            insert_checkpoint(
+                wallet,
+                BlockId {
+                    height: self.tip_height,
+                    hash: BlockHash::all_zeros(),
+                },
+            );
+
+            let tx = Transaction {
+                version: bdk_wallet::bitcoin::transaction::Version::ONE,
+                lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+                input: vec![bdk_wallet::bitcoin::TxIn {
+                    previous_output: OutPoint::null(),
+                    ..Default::default()
+                }],
+                output: vec![TxOut {
+                    script_pubkey: wallet
+                        .peek_address(KeychainKind::External, 0)
+                        .address
+                        .script_pubkey(),
+                    value: Amount::ONE_BTC,
+                }],
+            };
+            let txid = tx.compute_txid();
+            let mut tx_update = bdk_wallet::chain::TxUpdate::default();
+            tx_update.txs = vec![std::sync::Arc::new(tx)];
+            tx_update.anchors = [(
+                ConfirmationBlockTime {
+                    block_id: confirmation,
+                    confirmation_time: 1,
+                },
+                txid,
+            )]
+            .into();
+            wallet
+                .apply_update(bdk_wallet::Update {
+                    tx_update,
+                    ..Default::default()
+                })
+                .expect("failed to apply coinbase update");
         }
         Ok(())
     }

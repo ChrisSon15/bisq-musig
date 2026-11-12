@@ -9,6 +9,7 @@ base64 = { workspace = true }
 bdk_electrum = { workspace = true }
 bdk_kyoto = { workspace = true }
 bdk_wallet = { workspace = true }
+bip39 = { workspace = true, features = ["zeroize"] }
 chain = { workspace = true }
 fancy-regex = { workspace = true }
 hex = { workspace = true }

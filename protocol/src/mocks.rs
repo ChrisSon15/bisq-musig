@@ -160,6 +160,22 @@ impl<Cs: Iterator<Item = TxOutput>, As: Iterator<Item = Address>> ProtocolWallet
     ) -> Result<(), WalletErrorKind> {
         unimplemented!("MockTradeWallet does not support importing private keys")
     }
+
+    fn lock_utxo(&mut self, _utxo: OutPoint) -> wallet::error::Result<()> {
+        unimplemented!("To be determined")
+    }
+
+    fn list_locked_utxos(&self) -> Vec<OutPoint> {
+        unimplemented!("To be determined")
+    }
+
+    fn unlock_utxo(&mut self, _utxo: OutPoint) -> wallet::error::Result<()> {
+        unimplemented!("To be determined")
+    }
+
+    fn is_utxo_locked(&self, _utxo: OutPoint) -> bool {
+        unimplemented!("To be determined")
+    }
 }
 
 //noinspection SpellCheckingInspection

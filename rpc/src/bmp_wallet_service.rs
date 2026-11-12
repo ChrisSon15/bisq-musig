@@ -141,10 +141,18 @@ pub trait BmpWalletService {
 
     async fn full_balance(&self) -> anyhow::Result<Balance>;
 
+    /// Returns `(total, available, reserved)` from one wallet snapshot.
+    ///
+    /// `total` is the complete BDK balance breakdown, including reserved outputs. `available` is
+    /// the same breakdown after removing reserved outputs; the RPC's scalar `balance` is derived
+    /// from its trusted-spendable portion. `reserved` is the breakdown of outputs held out of coin
+    /// selection.
+    async fn balance_snapshot(&self) -> anyhow::Result<(Balance, Balance, Balance)>;
+
     /// The wallet's seed phrase, one word per element.
     ///
     /// `password` must be the wallet password; a wrong one fails with [`InvalidPassword`] rather
-    /// than revealing anything.
+    /// than revealing anything. A stored seed that is not a valid BIP39 mnemonic also fails.
     async fn seed_words(&self, password: &str) -> anyhow::Result<Vec<String>>;
 }
 
@@ -265,22 +273,16 @@ impl<S: ChainDataSource + Send + Sync + 'static> BMPWalletServiceImpl<S> {
     /// [`crate::wallet::WalletService::connect`] does for the bitcoind-backed wallet without
     /// this type having to implement that trait.
     ///
-    /// The `rpc` argument is used only to log which node we're pointed at — `BMPWallet` reaches
-    /// the chain over compact block filters, not Bitcoin Core RPC, so it plays no part in
-    /// syncing here.
+    /// Unlike that method it takes no Bitcoin Core client: `BMPWallet` reaches the chain only
+    /// through the chain data source (compact block filters by default), and the node used to
+    /// publish transactions is the broadcaster's business (see [`Self::with_broadcaster`]).
     ///
     /// The wallet itself is opened by the `OpenOrCreateWallet` RPC, so syncing (and with it the
     /// ready flag) waits until that has happened.
     ///
     /// # Errors
     /// Will return `Err` if the initial or any subsequent sync fails.
-    pub async fn connect(&self, rpc: Arc<Client>) -> WalletResult<Never> {
-        match task::block_in_place(|| rpc.get_blockchain_info()) {
-            Ok(info) => info!(chain = %info.chain, blocks = info.blocks,
-                "Bitcoin Core reachable (informational only; syncing uses the chain data source)."),
-            Err(e) => debug!("Bitcoin Core RPC not reachable ({e}); continuing regardless."),
-        }
-
+    pub async fn connect(&self) -> WalletResult<Never> {
         let Some(chain_data_source) = self.chain_data_source.as_ref() else {
             info!("No chain data source configured; wallet will not sync.");
             // `open_or_create_wallet` flips the ready flag as soon as the wallet is open, since
@@ -316,12 +318,9 @@ impl<S: ChainDataSource + Send + Sync + 'static> BMPWalletServiceImpl<S> {
     ///
     /// # Panics
     /// Will panic if called outside the context of a Tokio runtime.
-    pub fn spawn_connection(
-        self: Arc<Self>,
-        client: Arc<Client>,
-    ) -> JoinHandle<WalletResult<Never>> {
+    pub fn spawn_connection(self: Arc<Self>) -> JoinHandle<WalletResult<Never>> {
         task::spawn(async move {
-            self.connect(client)
+            self.connect()
                 .await
                 .inspect_err(|e| error!("Wallet connection error: {e}"))
         })
@@ -483,16 +482,22 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
         Ok(require_open(&mut guard)?.full_balance())
     }
 
+    async fn balance_snapshot(&self) -> anyhow::Result<(Balance, Balance, Balance)> {
+        let mut guard = self.wallet.lock().await;
+        let wallet = require_open(&mut guard)?;
+        Ok((
+            wallet.full_balance(),
+            wallet.available_balance(),
+            wallet.reserved_balance(),
+        ))
+    }
+
     async fn seed_words(&self, password: &str) -> anyhow::Result<Vec<String>> {
         let mut guard = self.wallet.lock().await;
         let wallet = require_open(&mut guard)?;
-
-        if !wallet.check_password(&Password::check(password)?)? {
-            return Err(InvalidPassword.into());
-        }
-
-        let phrase = wallet.get_seed_phrase()?;
-        Ok(phrase.split_whitespace().map(ToOwned::to_owned).collect())
+        let password = Password::check(password)?;
+        let mnemonic = wallet.get_seed_phrase(&password)?;
+        Ok(mnemonic.words().map(ToOwned::to_owned).collect())
     }
 }
 
@@ -678,13 +683,17 @@ impl wallet_server::Wallet for BmpWalletImpl {
         request: Request<GetBalanceRequest>,
     ) -> Result<Response<GetBalanceResponse>> {
         handle_request_async(request, |_request| async {
-            let balance = self
+            let (total, available, reserved) = self
                 .wallet_service
-                .full_balance()
+                .balance_snapshot()
                 .await
                 .map_err(|e| status_from(&e))?;
 
-            Ok(balance.into())
+            Ok(GetBalanceResponse::from_balances(
+                &total,
+                &available,
+                &reserved,
+            ))
         })
         .await
     }
@@ -770,13 +779,26 @@ fn is_invalid_password(error: &anyhow::Error) -> bool {
 
 impl From<Balance> for GetBalanceResponse {
     fn from(value: Balance) -> Self {
+        let reserved = Balance::default();
+        Self::from_balances(&value, &value, &reserved)
+    }
+}
+
+impl GetBalanceResponse {
+    fn from_balances(total: &Balance, available: &Balance, reserved: &Balance) -> Self {
         Self {
-            // bisq2 reads only `balance`; keep it the trusted-spendable total it expects.
-            balance: value.trusted_spendable().to_sat(),
-            confirmed: value.confirmed.to_sat(),
-            trusted_pending: value.trusted_pending.to_sat(),
-            untrusted_pending: value.untrusted_pending.to_sat(),
-            immature: value.immature.to_sat(),
+            // bisq2 reads only `balance`; keep it the trusted-spendable amount that is actually
+            // available for a new transaction, excluding reserved outputs.
+            balance: available.trusted_spendable().to_sat(),
+            // These four fields come from `total`, so they include reserved outputs and describe
+            // the complete holdings rather than the filtered available balance.
+            confirmed: total.confirmed.to_sat(),
+            trusted_pending: total.trusted_pending.to_sat(),
+            untrusted_pending: total.untrusted_pending.to_sat(),
+            immature: total.immature.to_sat(),
+            // `total()` intentionally includes every balance category, including immature and
+            // untrusted-pending reserved outputs.
+            reserved: reserved.total().to_sat(),
         }
     }
 }
@@ -808,6 +830,7 @@ impl From<UtxoInfo> for bmp_wallet::Utxo {
             amount: value.amount.to_sat(),
             address: value.address.map(Into::into),
             num_confirmations: value.num_confirmations,
+            is_locked: value.is_locked,
         }
     }
 }
@@ -1096,6 +1119,44 @@ mod tests {
         );
         assert!(reopened.unused_address().await.is_ok());
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seed_words_fails_for_a_corrupt_persisted_seed() {
+        let dir = tempdir().unwrap();
+        let created =
+            BMPWalletServiceImpl::<NoopChainDataSource>::new(dir.path(), Network::Regtest);
+        created.open_or_create_wallet(PASSWORD).await.unwrap();
+        drop(created);
+
+        let storage = DBStorage::File(dir.path().to_path_buf());
+        let salt = storage.load_salt(BMPWallet::DB_NAME).unwrap();
+        let mut db = storage.open(BMPWallet::DB_NAME).unwrap();
+        let key = derive_key_from_password(&PASSWORD.parse().unwrap(), &salt).unwrap();
+        db.pragma_update(None, "key", key.as_str()).unwrap();
+        db.execute(&format!("DELETE FROM {}", BMPWallet::SEEDS_TABLE_NAME), [])
+            .unwrap();
+        Connection::persist_seed_phrase(
+            &mut db,
+            BMPWallet::SEEDS_TABLE_NAME,
+            "abandon abandon abandon",
+        )
+        .unwrap();
+        drop(db);
+
+        let reopened =
+            BMPWalletServiceImpl::<NoopChainDataSource>::new(dir.path(), Network::Regtest);
+        reopened.open_or_create_wallet(PASSWORD).await.unwrap();
+
+        let error = reopened.seed_words(PASSWORD).await.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<WalletErrorKind>(),
+                Some(WalletErrorKind::Mnemonic(_))
+            ),
+            "unexpected error: {error:#}"
+        );
+        assert!(!format!("{error:#}").contains("abandon"));
+    }
     
     #[tokio::test(flavor = "multi_thread")]
     async fn creating_a_wallet_requires_an_acceptable_password() {
@@ -1289,8 +1350,33 @@ mod tests {
         assert_eq!(proto.trusted_pending, 20);
         assert_eq!(proto.untrusted_pending, 300);
         assert_eq!(proto.immature, 1);
+        assert_eq!(proto.reserved, 0);
         // Untrusted/immature funds must never be presented as spendable.
         assert!(proto.balance < balance.total().to_sat());
+    }
+
+    #[test]
+    fn balance_maps_available_and_reserved_amounts_for_get_balance() {
+        let total = Balance {
+            confirmed: Amount::from_sat(2_000),
+            ..Balance::default()
+        };
+        let available = Balance {
+            confirmed: Amount::from_sat(750),
+            ..Balance::default()
+        };
+        let reserved = Balance {
+            immature: Amount::from_sat(10),
+            trusted_pending: Amount::from_sat(20),
+            untrusted_pending: Amount::from_sat(30),
+            confirmed: Amount::from_sat(1_250),
+        };
+
+        let proto = GetBalanceResponse::from_balances(&total, &available, &reserved);
+
+        assert_eq!(proto.balance, 750);
+        assert_eq!(proto.confirmed, 2_000);
+        assert_eq!(proto.reserved, 1_310);
     }
 
     #[test]
@@ -1320,6 +1406,7 @@ mod tests {
             address: Some(address_info(REGTEST_ADDRESS)),
             num_confirmations: 6,
             imported: true,
+            is_locked: true,
         };
         let proto: bmp_wallet::Utxo = utxo.into();
 
@@ -1328,6 +1415,7 @@ mod tests {
         assert_eq!(proto.amount, 50_000);
         assert_eq!(proto.address.unwrap().address, REGTEST_ADDRESS);
         assert_eq!(proto.num_confirmations, 6);
+        assert!(proto.is_locked);
 
         // A non-standard script must come through as an absent address, not panic.
         let nameless = UtxoInfo {
@@ -1339,6 +1427,7 @@ mod tests {
                 address: None,
                 num_confirmations: 0,
                 imported: false,
+                is_locked: false,
             }
         };
         assert_eq!(bmp_wallet::Utxo::from(nameless).address, None);
