@@ -43,6 +43,7 @@ mod tests {
 
     use crate::bmp_wallet::{BMPWallet, ImportedKey, STOP_GAP, WalletApi as _};
     use crate::error::WalletErrorKind;
+    use crate::error::WalletErrorKind::InvalidUTXO;
     use crate::password::Password;
     use crate::persisted::{BMPWalletPersister as _, DBStorage};
     use crate::protocol_wallet_api::ProtocolWalletApi as _;
@@ -924,14 +925,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lock_utxo_only_accepts_valid_outpoints() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let valid = wallet
+            .list_unspent()
+            .next()
+            .expect("sync should provide a valid UTXO")
+            .outpoint;
+        wallet.lock_utxo(valid)?;
+        assert!(wallet.is_utxo_locked(valid));
+
+        let unknown = OutPoint::null();
+        assert!(matches!(wallet.lock_utxo(unknown), Err(InvalidUTXO)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn list_locked_utxos_omits_unknown_outpoints() -> anyhow::Result<()> {
         let mem_storage = MemDbHandle::new()?;
         let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
         wallet.sync_all(&MockedBDKElectrum {}).await?;
 
         let unknown = OutPoint::null();
-        wallet.lock_utxo(unknown)?;
-
+        // bypass lock_utxo to add unknown outpoint to the wallet without an error
+        wallet.lock_outpoint(unknown);
+        wallet.persist()?;
         assert!(wallet.is_utxo_locked(unknown));
         assert!(!wallet.list_locked_utxos().contains(&unknown));
 

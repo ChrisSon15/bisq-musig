@@ -29,6 +29,7 @@ use zeroize::Zeroizing;
 use crate::chain_data_source::ChainDataSource;
 use crate::coin_selection::{AlwaysSpendImportedFirst, SpendImportedOnly};
 use crate::error::{Result, WalletErrorKind};
+use crate::error::WalletErrorKind::InvalidUTXO;
 use crate::password::Password;
 use crate::persisted::{BMPDatabase, BMPWalletPersister as _, DBStorage, PersistenceError};
 use crate::protocol_wallet_api::{
@@ -840,6 +841,18 @@ impl ProtocolWalletApi for BMPWallet {
     }
 
     fn lock_utxo(&mut self, utxo: OutPoint) -> Result<()> {
+        let is_wallet_utxo = self.list_utxos().iter().any(|u| {
+            u.tx_id == utxo.txid && u.vout == utxo.vout
+        });
+
+        if !is_wallet_utxo {
+            return Err(InvalidUTXO);
+        }
+
+        if self.is_outpoint_locked(utxo) {
+            return Ok(());
+        }
+
         self.lock_outpoint(utxo);
         self.persist()?;
         Ok(())
