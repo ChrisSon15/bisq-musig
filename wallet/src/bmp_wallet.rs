@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::time::UNIX_EPOCH;
 use std::vec;
@@ -267,14 +267,15 @@ impl BMPWallet {
             })
     }
 
-    /// The balance reserved by currently unspent outputs held out of coin selection.
-    pub fn reserved_balance(&self) -> Balance {
+    /// The aggregate balance of currently unspent locked outputs.
+    pub fn locked_balance(&self) -> Balance {
         self.balance_for_lock_state(true) + self.imported_balance_for_lock_state(true)
     }
 
     /// The balance available to a newly-built transaction.
     ///
-    /// `full_balance` remains the complete balance breakdown, including reserved funds.
+    /// `full_balance` remains the complete balance breakdown, including the reserved balance of
+    /// locked outputs.
     pub fn available_balance(&self) -> Balance {
         self.balance_for_lock_state(false) + self.imported_balance_for_lock_state(false)
     }
@@ -652,16 +653,21 @@ impl BMPWallet {
             .elapsed()
             .map_err(WalletErrorKind::generic)?
             .as_secs();
-        self.wallet.apply_unconfirmed_txs([(tx.clone(), last_seen)]);
-        for imported in &mut self.imported_wallets {
-            if imported.wallet.list_unspent().any(|utxo| {
-                tx.input
-                    .iter()
-                    .any(|input| input.previous_output == utxo.outpoint)
-            }) {
-                imported
-                    .wallet
-                    .apply_unconfirmed_txs([(tx.clone(), last_seen)]);
+        let spent_outpoints: HashSet<_> =
+            tx.input.iter().map(|input| input.previous_output).collect();
+        let mut wallets = vec![&mut self.wallet];
+        wallets.extend(
+            self.imported_wallets
+                .iter_mut()
+                .map(|imported| &mut imported.wallet),
+        );
+
+        for wallet in wallets {
+            let owns_spent_input = wallet
+                .list_unspent()
+                .any(|utxo| spent_outpoints.contains(&utxo.outpoint));
+            if owns_spent_input {
+                wallet.apply_unconfirmed_txs([(tx.clone(), last_seen)]);
             }
         }
         <Self as WalletApi>::persist(self)?;

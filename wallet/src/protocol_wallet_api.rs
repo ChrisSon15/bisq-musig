@@ -64,9 +64,13 @@ pub trait ProtocolWalletApi {
         tap_tree: Option<TapTree<XOnlyPublicKey>>,
     ) -> Result<()>;
 
+    /// Lock one UTXO and exclude it from coin selection.
     fn lock_utxo(&mut self, utxo: OutPoint) -> Result<()>;
+    /// List currently unspent UTXOs that are locked.
     fn list_locked_utxos(&self) -> Vec<OutPoint>;
+    /// Unlock one UTXO so it can be selected again.
     fn unlock_utxo(&mut self, utxo: OutPoint) -> Result<()>;
+    /// Whether an outpoint is currently locked.
     fn is_utxo_locked(&self, utxo: OutPoint) -> bool;
 }
 
@@ -299,7 +303,6 @@ impl ProtocolWalletApi for Wallet {
     fn is_utxo_locked(&self, utxo: OutPoint) -> bool {
         self.is_outpoint_locked(utxo)
     }
-    // @TODO Add a new method, reserved_balance
 }
 
 /// Sign the wallet-owned inputs of `psbt` using the supplied `sign` closure, then transfer the

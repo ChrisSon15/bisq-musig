@@ -216,6 +216,7 @@ public class BmpWalletEndToEndIntegrationTest {
         assertEquals(0, balance.getTrustedPending());
         assertEquals(0, balance.getUntrustedPending());
         assertEquals(0, balance.getImmature());
+        assertEquals(0, balance.getLocked());
         assertTrue(transactions().isEmpty(), "a fresh wallet has no transactions");
         assertTrue(utxos().isEmpty(), "a fresh wallet has no UTXOs");
         assertTrue(walletAddresses().isEmpty(),
@@ -277,6 +278,7 @@ public class BmpWalletEndToEndIntegrationTest {
         assertEquals(0, balance.getTrustedPending());
         assertEquals(0, balance.getUntrustedPending());
         assertEquals(0, balance.getImmature());
+        assertEquals(0, balance.getLocked());
 
         // --- ListUtxos: one output per funded address, both from tx1 ---
         List<Utxo> utxos = utxos();
@@ -413,6 +415,7 @@ public class BmpWalletEndToEndIntegrationTest {
                 "the inputs are spent, whatever tx1 output(s) remain are still confirmed");
         assertEquals(change, pending.getTrustedPending(), "our own unconfirmed change is trusted");
         assertEquals(0, pending.getUntrustedPending());
+        assertEquals(0, pending.getLocked());
         assertEquals(FUNDED_SATS - PAYMENT_1_SATS - payment1FeeSats, pending.getBalance(),
                 "the balance drops by the payment plus the fee, no more");
 
@@ -456,6 +459,7 @@ public class BmpWalletEndToEndIntegrationTest {
         GetBalanceResponse settled = balance();
         assertEquals(FUNDED_SATS - PAYMENT_1_SATS - payment1FeeSats, settled.getConfirmed());
         assertEquals(0, settled.getTrustedPending(), "nothing pending once mined");
+        assertEquals(0, settled.getLocked());
         assertEquals(settled.getConfirmed(), settled.getBalance());
         assertEquals(1, utxoAt(changeAddress).getNumConfirmations());
         balanceAfterPayment1 = settled.getBalance();
@@ -517,6 +521,7 @@ public class BmpWalletEndToEndIntegrationTest {
         assertEquals(balanceAfterPayment1, balance.getBalance(), "the balance came back");
         assertEquals(balanceAfterPayment1, balance.getConfirmed());
         assertEquals(0, balance.getTrustedPending());
+        assertEquals(0, balance.getLocked());
         assertEquals(Set.of(fundingTxId, payment1TxId), txIds(transactions()), "the history came back");
         assertEquals(new HashSet<>(utxosBefore), new HashSet<>(utxos()), "the UTXO set came back");
         assertEquals(addressesBefore, walletAddresses(), "the revealed addresses came back");
@@ -573,6 +578,7 @@ public class BmpWalletEndToEndIntegrationTest {
         assertEquals(expected, balance.getBalance(), "what's left after tx3");
         assertEquals(expected, balance.getConfirmed());
         assertEquals(0, balance.getTrustedPending());
+        assertEquals(0, balance.getLocked());
         List<Utxo> utxos = utxos();
         assertEquals(1, utxos.size(), "only tx3's change remains: " + utxos);
         assertEquals(txId, utxos.get(0).getTxId());

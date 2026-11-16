@@ -133,22 +133,22 @@ message SendToAddressResponse {
 message GetBalanceRequest {}
 
 message GetBalanceResponse {
-    // Trusted-spendable balance in satoshis from outputs that are not reserved. This is the
+    // Trusted-spendable balance in satoshis from outputs that are not locked. This is the
     // confirmed plus trusted-pending portion of the available balance; immature and untrusted
     // pending amounts are excluded.
     uint64 balance = 1;
-    // Total confirmed balance in satoshis, including reserved outputs.
+    // Total confirmed balance in satoshis, including locked outputs.
     uint64 confirmed = 2;
-    // Total trusted-pending balance in satoshis, including reserved outputs.
+    // Total trusted-pending balance in satoshis, including locked outputs.
     uint64 trustedPending = 3;
-    // Total untrusted-pending balance in satoshis, including reserved outputs.
+    // Total untrusted-pending balance in satoshis, including locked outputs.
     uint64 untrustedPending = 4;
-    // Total immature balance in satoshis, including reserved outputs.
+    // Total immature balance in satoshis, including locked outputs.
     uint64 immature = 5;
-    // Total value in satoshis of outputs currently reserved and excluded from coin selection.
+    // Total value in satoshis of currently unspent locked outputs excluded from coin selection.
     // This is the sum of all balance categories, so it can include immature and untrusted-pending
     // amounts.
-    uint64 reserved = 6;
+    uint64 locked = 6;
 }
 
 message GetSeedWordsRequest {
