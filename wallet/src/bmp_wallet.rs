@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use std::vec;
 
@@ -633,7 +634,6 @@ impl BMPWallet {
     /// in the mempool. Treating a signed-and-handed-out transaction as spent is the safe
     /// direction: a payment that never made it to the network leaves coins looking locked
     /// (recoverable) rather than double-spent (not).
-    ///
     pub fn send_to_address(
         &mut self,
         address: &Address,
@@ -653,22 +653,14 @@ impl BMPWallet {
             .elapsed()
             .map_err(WalletErrorKind::generic)?
             .as_secs();
-        let spent_outpoints: HashSet<_> =
-            tx.input.iter().map(|input| input.previous_output).collect();
-        let mut wallets = vec![&mut self.wallet];
-        wallets.extend(
+        let tx_ref = Arc::new(tx.clone());
+        let wallets = std::iter::once(&mut self.wallet).chain(
             self.imported_wallets
                 .iter_mut()
                 .map(|imported| &mut imported.wallet),
         );
-
         for wallet in wallets {
-            let owns_spent_input = wallet
-                .list_unspent()
-                .any(|utxo| spent_outpoints.contains(&utxo.outpoint));
-            if owns_spent_input {
-                wallet.apply_unconfirmed_txs([(tx.clone(), last_seen)]);
-            }
+            wallet.apply_unconfirmed_txs([(Arc::clone(&tx_ref), last_seen)]);
         }
         <Self as WalletApi>::persist(self)?;
 
