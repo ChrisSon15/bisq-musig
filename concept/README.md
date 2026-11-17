@@ -1,5 +1,10 @@
 # Concept of the Protocol Bisq-MuSig
 
+## Current status and plan
+
+- [CompletionPlan.md](CompletionPlan.md) - what is implemented, which documents below are outdated,
+  what is missing, and the test plan
+
 ## Initial idea
 
 - [SingleTxOverview.md](SingleTxOverview.md)
