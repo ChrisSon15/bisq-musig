@@ -3,8 +3,11 @@
 Status: plan only, no code was changed. Revision 2, written 2026-11-17 against `main` at commit
 `7a322e9`. Revision 2 includes the decisions D1 to D16 (section 7). Revision 1 listed them as open.
 
+Revision 3 (same day) includes the answers to the open questions of revision 2. The questions and
+answers are kept in section 12 for a later review.
+
 The identifiers of revision 1 are unchanged: findings F1 to F26, decisions D1 to D16, work packages
-WP0 to WP8, test groups A to L. Revision 2 adds findings F27 and F28, the open points N1 to N9
+WP0 to WP8, test groups A to L. Revision 2 added findings F27 and F28, the points N1 to N9
 (section 7.2) and test group M.
 
 ## 1. Purpose and method
@@ -79,8 +82,11 @@ The decisions of section 7 fix the target design:
 - Lock times and amounts become explicit trade parameters (D5). The deposit needs 3 confirmations
   (D6).
 - Key shares are derived from the wallet seed (D10).
-- `musigd` watches closed trades while it runs. When the wallet closes, it moves all imported
-  coins to the seed wallet (D8).
+- `musigd` watches closed trades while it runs, which is only while bisq2 runs. When the user ends
+  the program, Java calls a new `close` method of the wallet service. This method moves all
+  imported coins to the seed wallet (D8).
+- The engine takes the fee rate for its own transactions from one method. For now this method
+  returns a fixed value of 10 sat/vB (N1).
 - The gRPC port has no authentication (D11). `walletrpc.Wallet` and the `mem` crate are removed
   now (D16).
 
@@ -189,11 +195,11 @@ are ported.
 | Trade state model (`protocol/src/state.rs`) | Complete as a model, unit tested | Not persisted; warning states are never entered |
 | Trade engine | Two partial versions (4.3) | One engine with wallet, chain, persistence, timers |
 | Wallet `BMPWallet` | Real: encrypted, seed, CBF sync, imported keys, coin locks, `drain_imported_balance` | Section 6.2; fee bumping; recording of external transactions; key share derivation (D10) |
-| Wallet gRPC `wallet.Wallet` (`bmp_wallet.proto`) | Real, tested in Rust and Java. bisq2 contains a client for it (`wallet/src/main/java/bisq/wallet/WalletGrpcClient.java`); whether bisq2 uses the client in normal operation was not checked. | Notifications |
+| Wallet gRPC `wallet.Wallet` (`bmp_wallet.proto`) | Real, tested in Rust and Java. bisq2 contains a client for it (`wallet/src/main/java/bisq/wallet/WalletGrpcClient.java`); whether bisq2 uses the client in normal operation was not checked. | Notifications; a `Close` RPC that drains the imported coins (D8) |
 | Old wallet gRPC `walletrpc.Wallet` (`wallet.proto`) | Test wallet with a fixed regtest descriptor | Removed in WP1 (D16) |
 | Chain access (`chain`) | Broadcast trait; CBF scanner that builds a new client for every wallet sync | Long-running CBF client; watching scripts and outpoints; block height; reorganisation events; broadcast over the peer-to-peer network (D2) |
 | `mem` crate | ZMQ transaction stream; no crate uses it | Removed in WP1 (D16) |
-| `musigd` | Starts the services on `127.0.0.1`. Broadcasts wallet transactions through Bitcoin Core RPC (F27). | Shutdown handling with drain (D8), network checks, configuration, removal of the Bitcoin Core options (D2) |
+| `musigd` | Starts the services on `127.0.0.1`. Broadcasts wallet transactions through Bitcoin Core RPC (F27). | Drain when Java calls `close` (D8), network checks, configuration, removal of the Bitcoin Core options (D2) |
 | `testenv` | bitcoind 29.0 and electrs on regtest, mining, funding; block filters are enabled | Helpers for reorganisations, mempool checks, lock time maturity, node restart |
 | Tests | See section 9.1 | See section 9 |
 | CI | Builds and tests when `wallet/**` or `protocol/**` change | `rpc` changes, formatting, dependency audit, Java tests |
@@ -256,15 +262,15 @@ All sixteen decisions were taken by the project owner on 2026-11-17.
 | # | Question | Decision | What follows for the work |
 |---|---|---|---|
 | D1 | Which implementation becomes the single engine? | `TradeModel`. | Move it into the `protocol` crate. Remove `BMPProtocol` after its integration tests are ported (WP1). |
-| D2 | How does the engine observe the chain? | Compact block filters over the peer-to-peer network only. No direct use of Bitcoin Core RPC. Reason: privacy. | One implementation of the chain interface. The engine sees confirmed transactions only. Broadcast goes to peers and returns no acceptance result. `musigd` loses its Bitcoin Core options (F27). The tests still start bitcoind, as the peer that the client connects to and for assertions. Open points N1 to N4. |
+| D2 | How does the engine observe the chain? | Compact block filters over the peer-to-peer network only. No direct use of Bitcoin Core RPC. Reason: privacy. | One implementation of the chain interface. The engine sees confirmed transactions only. Broadcast goes to peers and returns no acceptance result. `musigd` loses its Bitcoin Core options (F27). The tests still start bitcoind, as the peer that the client connects to and for assertions. Points N1 to N4. |
 | D3 | Claim by pre-signed transaction or by script? | By script spend. | The claim transaction leaves the set of pre-signed transactions: two signing sessions and three protobuf fields less. The claimer builds and signs it alone, with a current fee rate, and can replace it with a higher fee. The escrow output does not change (section 4.1). |
 | D4 | Redirect lock time of 1 block? | Yes. | Constant of the protocol, not a trade parameter. A redirect can be sent when the warning has 1 confirmation. |
 | D5 | Final lock times; values per payment method? | Explicit trade parameters that both peers agree on and that are part of the contract. `NetworkParams for Network` is removed. | Java passes the parameters at trade start. The engine checks limits and that both peers use the same values. Tests can use any value. The values per payment method are still open (N9). |
 | D6 | Confirmations before the payment may start? | A constant with the value 3. | `MIN_CONFIRMATIONS = 3` in the `protocol` crate. The engine refuses to sign the swap transaction and to release a key share below this depth (F9). The handling of reorganisations is specified in WP0 (N8). |
-| D7 | Who starts time-critical reactions? | The engine, automatically, while `musigd` runs. | Penalty, redirect after the peer's warning, claim, and the swap transaction before the warning lock time are started by the engine. Java receives events and decides only where the protocol allows a choice. |
-| D8 | Protection after the trade is closed. | `musigd` keeps watching closed trades. When the wallet closes, all imported coins are moved to the seed wallet with `drain_imported_balance`. Spending imported coins first stays mandatory. | Watching in WP4. An orderly shutdown that builds, signs, stores and broadcasts the drain transaction (WP4, WP7). F15 stays as it is. Open point N5. |
+| D7 | Who starts time-critical reactions? | The engine, automatically, while `musigd` runs. `musigd` runs only while bisq2 runs (section 12, answer 7). | Penalty, redirect after the peer's warning, claim, and the swap transaction before the warning lock time are started by the engine. Java receives events and decides only where the protocol allows a choice. |
+| D8 | Protection after the trade is closed. | `musigd` keeps watching closed trades. When the wallet closes, all imported coins are moved to the seed wallet with `drain_imported_balance`. "The wallet closes" means: Java calls a new method `close` of `BmpWalletService` when the user ends the program (section 12, answer 1). Spending imported coins first stays mandatory. | Watching in WP4. A new `close` method and a `Close` RPC that build, sign, store and send the drain transaction (WP2, WP4, WP7). F15 stays as it is. Point N5. |
 | D9 | Trade fee payment in the first version. | One fee output in the deposit transaction. | Supported by the builder. Silent payments and fee channels are not part of this plan. |
-| D10 | Random or derived key shares? | Derived from the wallet seed. | A new wallet method derives the two key shares of a trade. The derivation rule is part of the specification. Nonces stay random and are never stored. Open point N6. |
+| D10 | Random or derived key shares? | Derived from the wallet seed. | A new wallet method derives the two key shares of a trade. The derivation rule is part of the specification. Nonces stay random and are never stored. Point N6. |
 | D11 | Authentication for the gRPC port. | None. | No work. The port stays bound to the loopback address. The risk of F8 is accepted (N7). |
 | D12 | Check the peer's deposit inputs on chain? | No. | No work. A deposit that cannot confirm is handled by the abort of D13. |
 | D13 | Deposit signed but not confirmed. | After a timeout, spend the own deposit input back to the own wallet with a higher fee. | The engine cannot see the mempool (D2), so the timeout counts blocks without a confirmation. The engine follows the transaction that confirms. Needs replace-by-fee support in the wallet (WP2). |
@@ -272,26 +278,29 @@ All sixteen decisions were taken by the project owner on 2026-11-17.
 | D15 | Where do authoritative specifications live? | `docs/specifications/trade/`. `concept/` keeps the history. | WP0 writes the specification files. Concept files are not updated; section 3 says which ones are outdated. |
 | D16 | Future of `walletrpc.Wallet` and the `mem` crate. | Remove both now, also if this breaks bisq2. | First step of WP1. bisq2 at commit `bac6dd1d1c` contains no reference to `walletrpc` (text search), so no break is expected there. |
 
-Assumption about D8: "when the wallet closes" is read as "when `musigd` shuts down in an orderly
-way, or when the wallet is closed or locked". If it means "when the trade closes", the drain would
-run after every trade instead. This changes WP4 and test group M. To be confirmed.
+What D8 and answer 7 of section 12 mean together: `musigd` does not run while bisq2 is closed, so
+nothing is watched in that time. For closed trades the drain at `close` is then the only
+protection. For open trades the user must start the program often enough: after the peer's
+warning transaction confirms, the redirect or penalty must confirm before the claim lock time
+ends. The specification (`post-trade-protection.md`) must state this as a requirement for the
+user.
 
 ### 7.2 Points that the decisions open
 
 These points do not question the decisions. They are consequences that the specification (WP0)
-must settle, with a proposal for each.
+must settle. The last column gives the status after the answers of section 12.
 
-| # | Point | Proposal |
-|---|---|---|
-| N1 | **Fee rate source (D2, D7).** The engine builds transactions on its own: claim, CPFP children, drain, deposit abort. A CBF client has no fee estimator. The `bip157` client offers only the minimum relay fee of the connected peers (`broadcast_min_feerate`) and the average fee rate of a block (`average_fee_rate`). | Java sends a current fee rate to `musigd` at regular intervals through a new RPC. The engine uses it with a lower limit from `broadcast_min_feerate` and an upper sanity limit. If no recent value exists, the engine uses the fee rates of the last blocks. |
-| N2 | **Broadcast has no result (D2).** `submit_package` returns when the data was sent to one peer. The engine does not learn whether a node accepted the transaction. | The engine checks everything it can before sending (lock time reached, inputs unspent as far as known). A sent transaction has the state "sent" until it is seen in a block. The engine sends it again at intervals until it confirms or a conflicting transaction confirms. Test assertions about the mempool use bitcoind RPC in `testenv` only. |
-| N3 | **CPFP over the peer-to-peer network (D2).** `bip157` 0.6.3 accepts a package of one parent and one child. Whether a parent below the minimum relay fee is accepted this way depends on the receiving nodes. I believe Bitcoin Core supports this since version 28.0, but I did not verify it. | Verify with a regtest test against bitcoind 29.0 early in WP3, before WP6 depends on it. If it does not work, the pre-signed fee rates need a larger safety margin. |
-| N4 | **Peers (D2).** The client must connect to peers that serve block filters. The peers see the IP address that broadcasts the trade transactions. | Out of scope for this plan (issues #127, #129). The specification states the limit. The peer list stays a start option of `musigd`. |
-| N5 | **Limits of the drain at wallet close (D8).** (a) A process that is killed or loses power does not drain. (b) The drain transaction is only sent, not confirmed, when the process ends. (c) A drain links all open payouts in one transaction. (d) Imported coins that are locked for an open trade are not drained (existing behaviour of `drain_imported_balance`). | Store the signed drain transaction before sending it. At the next start, check whether it confirmed; if not, send it again or replace it with a higher fee. Document the remaining risk: after an unclean stop, a dishonest peer can win the payout if the user stays offline until the peer's warning lock time and the claim lock time have both ended. |
-| N6 | **Derivation rule (D10).** The rule must give different key shares for every trade, must not collide with wallet keys, and must not be computable from a public key of the wallet. | A hardened BIP32 path that the BIP86 wallet does not use gives a trade root secret. Key share = tagged hash of (trade root secret, trade id, label "buyer payout" or "seller payout"), reduced to a valid scalar. A trade id is never accepted twice, also not after the trade is closed (F2). The specification contains test vectors. |
-| N7 | **Accepted risk (D11).** Every local process, also of other users on the same computer, can call all RPCs: close a trade, sign the swap transaction, send wallet funds while the wallet is unlocked. Reading the seed phrase needs the wallet password. | Record this as a security assumption in the specification: the computer and all its local users are trusted. Keep the fixed loopback bind address and test it (K4). |
-| N8 | **Reorganisations (D6).** The constant covers the deposit. The rule for other transactions is not decided. | Deposit: below 3 confirmations no secret leaves the engine; if a reorganisation lowers the depth below 3 before the payment started, the state goes back. Reactions to a peer transaction (redirect, penalty) start at 1 confirmation, because waiting costs time before the claim lock time ends. A trade is final, and watching ends, when its closing transaction has 3 confirmations. |
-| N9 | **Parameter values (D5).** Which payment methods need which lock times is not decided. The warning lock time (10 days on mainnet today) is also the latest time by which a seller must have received the fiat payment or started mediation. The timeout of D13 and the safety margin of F6 also need values. | Decide with bisq2. The engine only enforces limits, for example: warning lock time larger than `MIN_CONFIRMATIONS` plus the F6 margin. |
+| # | Point | Proposal | Status |
+|---|---|---|---|
+| N1 | **Fee rate source (D2, D7).** The engine builds transactions on its own: claim, CPFP children, drain, deposit abort. A CBF client has no fee estimator. The `bip157` client offers only the minimum relay fee of the connected peers (`broadcast_min_feerate`) and the average fee rate of a block (`average_fee_rate`). | Java sends a current fee rate to `musigd` at regular intervals through a new RPC. The engine uses it with a lower limit from `broadcast_min_feerate` and an upper sanity limit. If no recent value exists, the engine uses the fee rates of the last blocks. | Postponed (answer 3). The real source is supplied later. For now one method returns a fixed 10 sat/vB and carries a TODO. Every transaction that the engine builds on its own takes its fee rate from this method. Limit of the fixed value: when the network needs more than 10 sat/vB, these transactions can stay unconfirmed, also the time-critical ones. |
+| N2 | **Broadcast has no result (D2).** `submit_package` returns when the data was sent to one peer. The engine does not learn whether a node accepted the transaction. | The engine checks everything it can before sending (lock time reached, inputs unspent as far as known). A sent transaction has the state "sent" until it is seen in a block. The engine sends it again at intervals until it confirms or a conflicting transaction confirms. Test assertions about the mempool use bitcoind RPC in `testenv` only. | Not asked. The proposal stands until WP0. |
+| N3 | **CPFP over the peer-to-peer network (D2).** `bip157` 0.6.3 accepts a package of one parent and one child. Whether a parent below the minimum relay fee is accepted this way depends on the receiving nodes. I believe Bitcoin Core supports this since version 28.0, but I did not verify it. | Verify with a regtest test against bitcoind 29.0 early in WP3, before WP6 depends on it. If it does not work, the pre-signed fee rates need a larger safety margin. | Assumed to work (answer 4). Test J7 stays in the plan and shows whether the assumption holds for bitcoind 29.0. |
+| N4 | **Peers (D2).** The client must connect to peers that serve block filters. The peers see the IP address that broadcasts the trade transactions. | Out of scope for this plan (issues #127, #129). The specification states the limit. The peer list stays a start option of `musigd`. | Not asked. The proposal stands until WP0. |
+| N5 | **Limits of the drain at wallet close (D8).** (a) The drain runs only when Java calls `close`. If bisq2 crashes, or the process is killed or loses power, nothing is drained. (b) The drain transaction is only sent, not confirmed, when the process ends. (c) A drain links all open payouts in one transaction. (d) Imported coins that are locked for an open trade are not drained (existing behaviour of `drain_imported_balance`). | Store the signed drain transaction before sending it. At the next start, check whether it confirmed; if not, send it again or replace it with a higher fee. Document the remaining risk: after an unclean stop, a dishonest peer can win the payout if the user stays offline until the peer's warning lock time and the claim lock time have both ended. | Trigger clarified (answer 1): the `close` method. `musigd` does not run while bisq2 is closed (answer 7), so the limits (a) and (b) matter. The proposal stands. |
+| N6 | **Derivation rule (D10).** The rule must give different key shares for every trade, must not collide with wallet keys, and must not be computable from a public key of the wallet. | A hardened BIP32 path that the BIP86 wallet does not use gives a trade root secret. Key share = tagged hash of (trade root secret, trade id, label "buyer payout" or "seller payout"), reduced to a valid scalar. A trade id is never accepted twice, also not after the trade is closed (F2). The specification contains test vectors. | Accepted (answer 5). |
+| N7 | **Accepted risk (D11).** Every local process, also of other users on the same computer, can call all RPCs: close a trade, sign the swap transaction, send wallet funds while the wallet is unlocked. Reading the seed phrase needs the wallet password. | Record this as a security assumption in the specification: the computer and all its local users are trusted. Keep the fixed loopback bind address and test it (K4). | Not asked. The proposal stands until WP0. |
+| N8 | **Reorganisations (D6).** The constant covers the deposit. The rule for other transactions is not decided. | Deposit: below 3 confirmations no secret leaves the engine; if a reorganisation lowers the depth below 3 before the payment started, the state goes back. Reactions to a peer transaction (redirect, penalty) start at 1 confirmation, because waiting costs time before the claim lock time ends. A trade is final, and watching ends, when its closing transaction has 3 confirmations. | Accepted (answer 6). |
+| N9 | **Parameter values (D5).** Which payment methods need which lock times is not decided. The warning lock time (10 days on mainnet today) is also the latest time by which a seller must have received the fiat payment or started mediation. The timeout of D13 and the safety margin of F6 also need values. | Decide with bisq2. The engine only enforces limits, for example: warning lock time larger than `MIN_CONFIRMATIONS` plus the F6 margin. | Answered (answer 2): the values are configurable. The plan fixes no values. Lock times are trade parameters (D5). The deposit timeout and the release safety margin are configuration values of the engine with defaults. |
 
 What a restore from the seed gives after D10: the trader's own key shares of every trade whose
 trade id is known. It does not give the peer's public key shares, the trade parameters, the
@@ -324,7 +333,8 @@ The packages are ordered by dependency. Tests belong to each package; section 9 
   | `persistence-and-recovery.md` | What is stored and when, restart, restore from seed and from backup |
   | `service-interface.md` | Meaning of each RPC, repeated calls, errors, security assumptions (D11, N7) |
 
-- Settle N1 to N9 and the assumption about D8.
+- Write the answered points of section 7.2 into the specification, and settle the points that
+  were not asked (N2, N4, N7).
 - Write down the security argument for blind signing of the swap transaction. The concept file
   leaves it open.
 
@@ -344,7 +354,8 @@ Done when: every state transition and every chain event has a specified reaction
 - Give the engine its dependencies as parameters: wallet (`ProtocolWalletApi`), chain interface,
   trade store, trade parameters.
 - Replace `NetworkParams for Network` by a trade parameter structure (D5). Redirect lock time 1
-  (D4) and `MIN_CONFIRMATIONS = 3` (D6) are constants.
+  (D4) and `MIN_CONFIRMATIONS = 3` (D6) are constants. The deposit timeout (D13) and the release
+  safety margin (F6) are configuration values of the engine with defaults (N9).
 - Port the scenarios of `protocol/tests/protocol_integration_tests.rs` to the engine.
 - Remove `BMPProtocol`, `bmp_protocol.proto`, `rpc/src/pb/bmp_converter.rs`,
   `rpc/tests/test_bmp_service.rs`, `BmpClient.java` and `BmpServiceIntegrationTest.java`.
@@ -369,7 +380,7 @@ mock wallet, and the workspace contains neither `walletrpc` nor `mem`.
 - Imported coins are spent first in every transaction (D8, F15): keep the rule, specify it, and
   define what happens when the caller selects coins by hand.
 - Drain: `drain_imported_balance` returns an unsigned PSBT today. Add signing, recording and
-  storing of the drain transaction for the shutdown path (D8).
+  storing of the drain transaction, as the wallet part of the `close` method (D8).
 - Fee bumping: build a child transaction that spends an anchor output or an own unconfirmed
   output; replace-by-fee for wallet payments, the deposit abort (D13) and the claim (D3) (F20,
   #187). Rebroadcast and abandon are in pull request #235.
@@ -399,14 +410,17 @@ first milestone, and it contains the largest technical uncertainty of the plan.
   warning escrow outputs, and its own broadcasts.
 - Broadcast without acceptance result (N2): state "sent", repeated sending, end on confirmation
   of the transaction or of a conflict.
-- Verify CPFP package relay over the peer-to-peer network against bitcoind (N3).
+- CPFP package relay over the peer-to-peer network is assumed to work (N3). Test J7 checks the
+  assumption against bitcoind early in this package.
 - Replace `BitcoinCoreChainApi` (F27). Remove the Bitcoin Core options of `musigd`.
 - Sync loop with retry and backoff (F18, #190). Defined behaviour when no peer is reachable or no
   peer serves filters (#188). Check that wallet network and peer network match. Remove the panics
   in `from_hostnames` (F22).
 - Replace the simulated streams of `PublishDepositTx` and `SubscribeTxConfirmationStatus`, and the
   constant block height in `InitTrade`.
-- Fee rate source for the engine's own transactions (N1).
+- One method that returns the fee rate for the engine's own transactions (claim, CPFP children,
+  drain, deposit abort). For now it returns a fixed 10 sat/vB and contains a TODO comment; the
+  real source is supplied later (N1). No other code contains a fee rate for these transactions.
 
 Done when: the engine reports confirmations, spends and reorganisations of trade outputs on
 regtest, also after a restart with blocks mined while it was stopped, and `musigd` runs without
@@ -435,8 +449,11 @@ any Bitcoin Core RPC connection.
   `:812`). The protobuf change should reach bisq2 together with the changes of WP7.
 - The engine enforces chain preconditions before it releases a signature or a key share (F9, D6).
 - Protection after close (D8): watch closed trades while a payout is unspent; penalty when the
-  peer publishes a warning. At orderly shutdown or wallet close: build, sign, store and send the
-  drain transaction; at start: check it and send it again if needed (N5).
+  peer publishes a warning. New method `close` on `BmpWalletService`
+  (`rpc/src/bmp_wallet_service.rs:84`) and a `Close` RPC in `bmp_wallet.proto`: call
+  `drain_imported_balance`, then sign, store and send the drain transaction. A second call
+  creates no second drain. At start: check the stored drain transaction and send it again if
+  needed (N5).
 - One event stream per trade for Java: state changes, transactions sent and confirmed, deadlines
   as block heights, required user actions.
 - Validate trade parameters, redirect receivers and the fee receiver from Java: limits, count,
@@ -476,6 +493,7 @@ uninterrupted run.
   fee is chosen at claim time and it can be replaced (D3).
 - Fee bump schedule without mempool view: the engine raises the fee after a number of blocks
   without confirmation, so that a redirect or penalty confirms before the claim lock time ends.
+  The start value comes from the fee rate method of N1; the schedule raises it in steps.
 - Redirect lock time 1 (D4) and the reaction to a replaced warning transaction.
 - Review of anchor amount and transaction weights against current relay policy.
 
@@ -484,15 +502,16 @@ transaction with a too low fee confirms through CPFP.
 
 ### WP7 Interface and operation (estimate: 1 to 2 weeks for the Rust side; issues #33, #58, #180)
 
-- Protobuf changes for WP4 and WP5; structured error codes that separate permanent, retryable and
-  unknown results; the fee rate RPC of N1.
-- `musigd`: orderly shutdown that runs the drain (D8), on a shutdown RPC and on the termination
-  signal; configuration of network, peers and data directory; no secrets on the command line.
-  No authentication (D11); the listen address stays fixed to loopback.
+- Protobuf changes for WP4 and WP5, including the `Close` RPC of the wallet service (D8);
+  structured error codes that separate permanent, retryable and unknown results.
+- `musigd`: configuration of network, peers, data directory, deposit timeout and release safety
+  margin (N9); no secrets on the command line. No authentication (D11); the listen address stays
+  fixed to loopback.
 - Wallet events for bisq2.
 - Java work in bisq2, outside this repository but required: new protobuf, dispute states in the
   trade state machine, trade parameters and deposits from the contract instead of fixed values,
-  confirmation handling, regular fee rate updates.
+  confirmation handling, the `Close` RPC in bisq2's `wallet.proto` and its call when the user
+  ends the program.
 
 ### WP8 CI, review and release (estimate: 1 to 2 weeks plus external review)
 
@@ -500,14 +519,15 @@ transaction with a too low fee confirms through CPFP.
   audit; Java integration tests; a nightly job for slow tests.
 - Independent review of the protocol and of the cryptographic code before mainnet.
 - Trial phase on signet or testnet with real users.
-- Packaging and start of `musigd` together with bisq2 (issue #128).
+- Packaging of `musigd` with bisq2; `musigd` starts and stops together with bisq2 (issue #128;
+  section 12, answer 7).
 
 Estimated total for the Rust work: 21 to 33 weeks for one developer, plus the tests of section 9
 that are not already counted in a package (5 to 8 weeks). The decisions did not change the total:
 WP3 grew because the CBF client is now the only backend, WP7 shrank because authentication and the
 removal of `walletrpc.Wallet` left it. The largest uncertainties are the long-running CBF client
-with script watching (WP3), package relay over the peer-to-peer network (N3), and the missing fee
-estimator (N1).
+with script watching (WP3) and package relay over the peer-to-peer network (N3, assumed to work).
+The fixed fee rate (N1) is a placeholder; the work for the real source is not in the estimate.
 
 ## 9. Test plan
 
@@ -592,6 +612,7 @@ reason. "Engine refuses" means: the engine returns an error and sends nothing.
 | A12 | Trade parameters outside the limits: redirect lock time not 1, warning lock time not larger than `MIN_CONFIRMATIONS` plus margin, zero claim lock time | Rejected in `InitTrade` |
 | A13 | The peer's deposit input does not exist or is already spent (D12: not checked) | Deposit never confirms; abort as in A3; own coins are free again |
 | A14 | Swap signature or key share requested at 0, 1 and 2 confirmations (both roles) | Engine refuses; succeeds at 3 (D6, F9) |
+| A15 | Deposit timeout and release safety margin set to other values in the configuration | The engine uses the configured values; without configuration it uses the defaults (N9) |
 
 #### B. Cooperative close
 
@@ -705,6 +726,7 @@ reason. "Engine refuses" means: the engine returns an error and sends nothing.
 | I5 | Anchor outputs after an unused warning path | Not shown as spendable funds, or handled as specified |
 | I6 | Files on disk after a trade | No unencrypted file with trade data (F17) |
 | I7 | Import of a payout key at a known deposit height | The next sync starts at or after that height, not at the genesis block (F19) |
+| I8 | Fee rate of the transactions that the engine builds on its own: claim, CPFP child, drain, deposit abort | Each one pays the rate that the fee rate method returns, 10 sat/vB for now (N1) |
 
 #### J. Chain conditions
 
@@ -746,16 +768,17 @@ reason. "Engine refuses" means: the engine returns an error and sends nothing.
 
 | ID | Scenario | Expected result |
 |---|---|---|
-| M1 | Orderly shutdown with unspent payouts of closed trades | One drain transaction to an address of the seed wallet is stored and sent; after it confirms, the imported balance is zero |
+| M1 | `Close` is called with unspent payouts of closed trades | One drain transaction to an address of the seed wallet is stored and sent; after it confirms, the imported balance is zero |
 | M2 | After M1 the peer publishes his warning | Node rejects it, because its input is spent |
-| M3 | Shutdown while another trade is open and its coins are locked | Locked coins are not drained; the open trade continues after the restart |
+| M3 | `Close` while another trade is open and its coins are locked | Locked coins are not drained; the open trade continues after the restart |
 | M4 | The drain transaction is not confirmed at the next start | Sent again, or replaced with a higher fee; exactly one drain confirms |
-| M5 | Process is killed without shutdown; the peer's warning confirms; start before the claim lock time ends | Penalty in time (as F3) |
+| M5 | Process is killed without a `Close` call; the peer's warning confirms; start before the claim lock time ends | Penalty in time (as F3) |
 | M6 | As M5, start after the peer's claim confirmed | Engine reports the loss; documented risk (N5) |
-| M7 | Nothing to drain, or the amount is below the fee | Shutdown completes without error; no transaction |
-| M8 | No peer reachable at shutdown | Drain transaction is stored and sent at the next start |
-| M9 | Wallet is closed or locked through the wallet service while `musigd` keeps running | Same drain as M1, as specified |
-| M10 | `musigd` runs without interruption after a close; the peer publishes his warning late | Penalty (as F1); no drain is needed |
+| M7 | `Close` with nothing to drain, or with an amount below the fee | `Close` returns without error; no transaction |
+| M8 | No peer reachable at `Close` | Drain transaction is stored and sent at the next start |
+| M9 | `Close` is called twice; `Close` is called while no wallet is open | One drain transaction only; clear result for the second case |
+| M10 | The program keeps running after a trade close; the peer publishes his warning late | Penalty (as F1); no drain is needed |
+| M11 | `Close` through gRPC (L3) | The `Close` RPC of `wallet.Wallet` gives the same result as M1 |
 
 ### 9.5 Order of test work
 
@@ -791,20 +814,28 @@ implementation exists as a first step (D2).
 - Hiding the IP address towards the peers, for example with Tor (issues #127, #129; N4).
 - A second chain backend. The chain interface of WP3 allows one later.
 - Authentication for the gRPC port (D11).
+- A real fee rate source. The engine uses a fixed fee rate until it is supplied (N1).
+- Fixed values for lock times, deposit timeout and release safety margin. They are configurable
+  (N9).
 - A check of the peer's deposit inputs on chain (D12).
 - The Java implementation in bisq2, except as a listed dependency.
 
-## 12. Open questions
+## 12. Questions and answers, to be reviewed later
 
-1. Does "when the wallet closes" in D8 mean the shutdown of `musigd` and the closing or locking of
-   the wallet, as assumed in section 7.1, or the close of each trade?
-2. Which payment methods need which lock times, and which values do the deposit timeout (D13) and
-   the release safety margin (F6) get (N9)?
-3. Who supplies the fee rate for transactions that the engine builds on its own (N1)?
-4. Does package relay of a low-fee parent with its child work over the peer-to-peer network with
-   the nodes that users will connect to (N3)? A regtest test answers this for bitcoind 29.0 only.
-5. Is the derivation rule of N6 acceptable, including the rule that a trade id can never be used
-   twice?
-6. Is the reorganisation rule of N8 acceptable: reactions at 1 confirmation, final at 3?
-7. Does `musigd` keep running when bisq2 is closed? The value of the watching in D8 depends on it
-   (issue #128).
+These were the open questions of revision 2. The project owner answered them on 2026-11-17. The
+questions stay here so that the answers can be reviewed later. The column "Review later" names
+what should be checked at that review.
+
+| # | Question | Answer (2026-11-17) | Where it is in the plan | Review later |
+|---|---|---|---|---|
+| 1 | What does "when the wallet closes" in D8 mean: the shutdown of `musigd` and the closing or locking of the wallet, or the close of each trade? | `BmpWalletService` gets a new method `close`. Java calls it when the user ends the program. The method calls `drain_imported_balance`. | D8 in section 7.1; N5; WP2, WP4, WP7; test group M | The drain does not run when the program ends without the `close` call (crash, kill, power loss). Does `close` also end other work, for example the sync loop or open trades? |
+| 2 | Which payment methods need which lock times, and which values do the deposit timeout (D13) and the release safety margin (F6) get (N9)? | These values must be configurable. | N9; WP1, WP7; tests A11, A12, A15 | The default values, and the limits that the engine enforces. Both peers must use the same lock times. |
+| 3 | Who supplies the fee rate for transactions that the engine builds on its own (N1)? | It is supplied later. For now one method returns a fixed value of 10 sat/vB and contains a TODO. | N1; WP3, WP6; test I8; section 11 | The real fee rate source. With a fixed 10 sat/vB the claim, drain, abort and CPFP transactions can stay unconfirmed when the network needs a higher rate. |
+| 4 | Does package relay of a low-fee parent with its child work over the peer-to-peer network with the nodes that users will connect to (N3)? | Assume yes. | N3; WP3, WP6; test J7 | The result of test J7. It answers the question for bitcoind 29.0 only, not for all nodes that users connect to. |
+| 5 | Is the derivation rule of N6 acceptable, including the rule that a trade id can never be used twice? | Yes. | N6; WP2, WP5; tests H9, H10, K2 | The exact derivation path and the test vectors, when `key-derivation.md` is written. |
+| 6 | Is the reorganisation rule of N8 acceptable: reactions at 1 confirmation, final at 3? | Yes. | N8; WP4; tests A14, J1 to J4 | Nothing specific. |
+| 7 | Does `musigd` keep running when bisq2 is closed? | No. | D7 and the paragraph after the table in section 7.1; N5; WP8 | Nothing is watched while bisq2 is closed. For closed trades the drain at `close` is the only protection in that time. For open trades the user must start the program before the claim lock time ends after a peer warning. Is this acceptable for mainnet, or is a watching process needed later? |
+
+Points of section 7.2 that were not part of the questions and still need a decision in WP0: N2
+(broadcast without result), N4 (peers and the visible IP address), N7 (wording of the security
+assumption for the open gRPC port).
