@@ -42,9 +42,23 @@ The service converts between the protobuf messages and the operations of the tra
 warning and redirect transactions, with pubkey & nonce shares and partial signatures exchanged with the Java client, to
 pass them back in as fields of the peer's RPC requests, setting up the trade.
 
-The setup, the normal closure, the custom payout and the force-closure via the swap tx are implemented, on top of the
-wallet of the daemon. The service does not broadcast any transaction yet, and the tx confirmation status streams are
-mocked. The warning, redirect, claim and penalty transactions are built and signed, but no RPC publishes them yet.
+The setup, the normal closure, the custom payout, the force-closure via the swap tx and the dispute path (warning,
+redirect, claim, penalty) are implemented, on top of the wallet of the daemon and of its connection to the peers of the
+Bitcoin network.
+
+The service watches every trade on the chain while `musigd` runs, and it sends the transactions of the trade itself:
+
+- the deposit transaction after `PublishDepositTx`, the swap transaction after `CloseTrade` without data, the custom
+  payout transaction after `CustomCloseTrade`, and the trader's warning transaction after `PublishWarningTx`;
+- without a request: the swap transaction when the buyer did not answer the release in time, the redirect or the
+  penalty transaction when the warning transaction of the peer is confirmed, and the claim transaction when the claim
+  lock time of the trader's own warning has passed.
+
+A transaction is sent again after every new block until it is confirmed. `SubscribeTradeEvents` returns the events of
+one trade: its state, every transaction that was sent, a loss, and a problem with the peers. The requests that hand
+out a signature or a key share are refused until the deposit transaction has 3 confirmations.
+
+Not implemented: the deposit abort transaction after the deposit timeout, and fee increases of sent transactions.
 
 See [MuSig trade protocol messages](musig-trade-protocol-messages.txt) for my current (incomplete) picture of what the
 trade messages between the peers would look like, and thus the necessary data to exchange in an RPC interface between

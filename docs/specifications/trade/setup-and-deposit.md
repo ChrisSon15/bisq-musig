@@ -155,5 +155,9 @@ After the trader signed the deposit (`Deposit`), and the deposit is not confirme
 - While neither is confirmed, the engine sends the abort transaction again and can raise its fee
   ([fees.md](fees.md)).
 
+- Any other confirmed transaction that spends an input of the deposit transaction, of either
+  trader, has the same effect as the abort: the deposit can never confirm, the trade is closed as
+  `DepositAborted`, and the coins of the trader are free again.
+
 Rationale: without the abort, a peer who never publishes the deposit would keep the trader's coins
 reserved for ever, and could publish the deposit at any later time.

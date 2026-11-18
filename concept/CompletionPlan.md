@@ -606,6 +606,64 @@ Not done:
 Done when: every outcome of section 4.2 can be reached through the engine on regtest, for both
 roles, and the claim confirms through the script path.
 
+Status on 2026-11-18 (branch `wp4-trade-flows`): the condition holds for six of the seven
+outcomes of section 4.2, and the claim confirms through the script path
+(`protocol/tests/trade_model_integration_tests.rs`, tests `outcome_*`, and
+`b1_b2_cooperative_close_and_payout_in_the_wallet`). For the setup abort, the abort by the caller
+and the end by a conflicting spend of a deposit input work. The deposit abort transaction after
+the timeout does not exist.
+
+Done:
+
+- Claim by script (D3): the claim is built and signed at claim time, through the script path.
+  The claim nonces and the claim signature are removed from the signing rounds and from
+  `rpc.proto`.
+- Chain conditions of requests (F9, D6): no signature for the swap transaction, no key share and
+  no signature for a custom payout before the deposit has 3 confirmations. Release safety margin
+  (F6).
+- The engine derives the state of a trade from the confirmed transactions and names the
+  transactions that the trader should have on the network (D7): deposit, warning after
+  `PublishWarningTx`, redirect or penalty against a confirmed warning of the peer, claim, swap
+  transaction, custom payout. All closure types can be reached, also after two competing
+  warnings. The derived state goes back after a reorganisation (J1, J3, J4).
+- Forced close: the seller's engine publishes the swap transaction on request, and on its own at
+  the release safety margin. The buyer's engine reads the key share from any key path spend of
+  the seller's payout and imports the payout.
+- Protection after close (D8): a closed trade is watched until it is final, and a warning of the
+  peer is answered with the penalty.
+- A confirmed spend of a deposit input that is not the deposit closes the trade as
+  `DepositAborted` and releases the reserved coins (A13, J2).
+- Trade service: one task watches all trades and sends their transactions, once per block and
+  again after a failure. New requests `PublishWarningTx` and `SubscribeTradeEvents`. The event
+  stream reports the state, sent transactions, losses, unexpected events on the chain and a
+  problem with the peers (D21).
+- The chain client loads blocks with their witness data.
+- Tests: A1, A13, A14, C1, C2, C4, D1, D5, E1 to E6, E11, E14, F1, F3, J1 to J4, M1, M2 at the
+  level of the engine; six outcomes on regtest through the engines alone; four service tests; a
+  forced close between two `musigd` processes.
+
+Not done:
+
+- The deposit abort transaction (D13, test A3). After the deposit timeout the deposit is no
+  longer sent, and the coins stay reserved until a conflicting spend confirms or the user
+  releases them by hand. Needed: a wallet function that spends the reserved coins, also when the
+  wallet has recorded the unpublished deposit as their spend, with a fee that replaces the
+  deposit in the mempool of a node.
+- Fee increases of sent transactions (F20; tests C5, E9, E10, E15, F5): no child transaction for
+  an anchor output, no replacement. A reaction that does not confirm at its fee rate stays
+  unconfirmed.
+- The signatures of the peer in a custom payout PSBT are still not verified.
+- The event stream does not report the terminated mark, confirmations of the transactions of a
+  trade, deadlines as block heights or actions that the user must take.
+- The swap, custom payout, claim and penalty transactions are not recorded in the wallet when
+  they are sent. The wallet shows their outputs after they are confirmed.
+- The engine keeps no stored state "sent" (WP5), and a stored drain transaction is not sent again
+  at the next start (N5).
+- Validation of the caller's data (D5, D9, D14) was done in WP1 as far as it exists; no limit for
+  the number of redirection receivers exists (open point O10).
+- bisq2 does not call the new requests yet (WP7). The Java sources of this repository were
+  compiled, not run.
+
 ### WP5 Persistence and recovery (estimate: 3 to 4 weeks)
 
 - Durable, encrypted trade store. Rule: the new state is on disk before any signature, key share

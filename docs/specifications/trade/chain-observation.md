@@ -72,7 +72,7 @@ For every trade that is not final, from the moment the trader signed the deposit
 | Watched | Purpose |
 |---|---|
 | The deposit transaction | Confirmation depth; deposit timeout |
-| The trader's own deposit inputs | Confirmation of the deposit abort |
+| The inputs of the deposit transaction, of both traders | A confirmed transaction that spends one of them and is not the deposit: the deposit abort of a trader, or another spend. The deposit can then never confirm. |
 | The buyer's payout and the seller's payout | Any spend: swap, custom payout, warning, a payout that the owner spends |
 | The escrow output of the buyer's warning and of the seller's warning | Redirect, claim, penalty |
 | Every transaction that the engine sent | Confirmation; repeated sending |
@@ -158,7 +158,7 @@ output with a single signature and is not a warning transaction.
 |---|---|---|
 | Deposit has 3 confirmations | Reports it. Allows the next steps. | Same |
 | No deposit confirmation within the deposit timeout | Deposit abort | Same |
-| Deposit abort of either trader | `TradeClosed(DepositAborted)`; releases the coins | Same |
+| A transaction that is not the deposit spends an input of the deposit (the deposit abort of either trader, or another spend) | `TradeClosed(DepositAborted)`; releases the coins | Same |
 | Spend of the seller's payout with the key path, buyer not closed | Reads the seller's key share from the signature, imports the payout, `TradeClosed(Forced)` | Own swap transaction: `TradeClosed(Forced)` |
 | Spend of the seller's payout with the key path, trade closed cooperatively | None. The seller spent his payout. The buyer's warning is impossible now. | None |
 | Spend of the buyer's payout with the key path, trade closed | None | None. The buyer spent his payout. The seller's warning is impossible now. |
@@ -174,6 +174,12 @@ output with a single signature and is not a warning transaction.
 Events that the engine does not expect, for example a spend of a payout with a signature from
 which no valid key share can be read, are reported to the caller. The engine changes no state for
 them.
+
+How the engine tells a claim from a penalty: both spend the escrow output of a warning
+transaction, and neither has a transaction ID that is known in advance. A spend through the
+script path is the claim of the trader who published the warning. A spend through the key path
+that is not the redirect transaction is the penalty of the other trader. The engine therefore
+needs the witness of the transactions that it finds.
 
 ## Start-up
 

@@ -51,6 +51,8 @@ trade before the request.
 | `SignCustomPayoutTx` | Both | `Deposit`, `BuyerReadyToRelease` | Signs a custom payout. | [closing.md](closing.md) |
 | `CustomCloseTrade` | Both | `CustomPayoutSigned` | Takes the peer's custom payout PSBT. Finalises and publishes. | [closing.md](closing.md) |
 | `AbandonTrade` | Both | `Init` | Ends the trade and releases the reserved coins. Refused when the trader has signed the deposit transaction. | [setup-and-deposit.md](setup-and-deposit.md) |
+| `PublishWarningTx` | Both | `Deposit`, `BuyerReadyToRelease`, `CustomPayoutSigned` | Starts the dispute path: the trader decides to publish his warning transaction. Returns the transaction. | [dispute.md](dispute.md) |
+| `SubscribeTradeEvents` | Both | Any | Returns the events of the trade. The first event is the current state. | Below, "Events of a trade" |
 
 `CloseTrade` with a swap transaction, by which the buyer passes the swap transaction to his
 engine, exists for tests. In operation the buyer's engine finds the transaction on the chain.
@@ -59,9 +61,24 @@ Requests that the interface needs in addition:
 
 | Request | Role | Meaning | Defined in |
 |---|---|---|---|
-| Publish the warning transaction | Both | Starts the dispute path | [dispute.md](dispute.md) |
-| Events of a trade | Both | One stream per trade: state changes, the terminated mark, transactions sent and confirmed, deadlines as block heights, actions that the user must take, losses, a problem with the peers and its end | [chain-observation.md](chain-observation.md) |
 | Close of the wallet service (exists as `Close` of `wallet.Wallet`) | - | Drains the imported coins when the user ends the program | [post-trade-protection.md](post-trade-protection.md) |
+
+### Events of a trade
+
+`SubscribeTradeEvents` returns one stream per trade. Every event contains the state of the trade
+after the event, the closure type of a closed trade, whether the trade is final, and the height
+of the chain as the engine sees it.
+
+| Event | Meaning |
+|---|---|
+| State | The first event of a stream, and every change of the state. After a reorganisation the new state can be an earlier state of the trade. |
+| Transaction sent | The engine sent a transaction of the trade to the network: its kind and its ID. This does not mean that a node accepted it. |
+| Loss | The peer took funds of the trader with a claim or a penalty transaction. |
+| Unexpected | Something happened on the chain that the engine does not expect. No state changed. |
+| Problem with the peers, and its end | While the problem lasts, the chain is not observed and nothing can be sent ([chain-observation.md](chain-observation.md)). |
+
+The events must also report the terminated mark, the confirmation of a transaction of the trade,
+deadlines as block heights and actions that the user must take.
 
 Changes of existing messages that this specification requires:
 
@@ -126,13 +143,14 @@ of the status describes the reason:
 | Case | Status code |
 |---|---|
 | Refused: a precondition does not hold (role, state, order) | `FAILED_PRECONDITION` |
+| Refused: a condition of the chain does not hold yet (confirmations of the deposit, warning lock time, release safety margin, a spent payout) | `FAILED_PRECONDITION`. The message names the condition. The caller can repeat the request later. |
 | Refused: data of the caller is invalid (trade parameters, redirection receivers, a field that cannot be decoded) | `INVALID_ARGUMENT`; `OUT_OF_RANGE` for a number above its range; `NOT_FOUND` for a missing part of a request |
 | Terminated | `ABORTED`. The message starts with "trade was terminated" and contains the reason. |
 | Unknown trade | `NOT_FOUND` |
 | Known trade ID in `InitTrade` | `ALREADY_EXISTS` |
 | Temporary: no wallet is open | `FAILED_PRECONDITION` |
 | Temporary: `musigd` was started without a peer, so the engine has no access to the chain, and the request needs it | `FAILED_PRECONDITION` |
-| Temporary: no peer is reachable, or no peer serves compact block filters, and the request must send a transaction (`PublishDepositTx`) | `UNAVAILABLE`. The message names the problem. The trade is not changed, and the caller can repeat the request. |
+| Temporary: no peer is reachable, or no peer serves compact block filters, and the request must send a transaction (`PublishDepositTx`, `PublishWarningTx`) | `UNAVAILABLE`. The message names the problem. The trade is not changed, and the caller can repeat the request. |
 | Internal | `INTERNAL` |
 
 ## Events and responses

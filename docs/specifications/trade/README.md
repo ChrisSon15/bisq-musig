@@ -92,6 +92,7 @@ confirmed. The text of the files contains the rule of the column "Rule in the sp
 | O12 | Sanity limits of the engine for the deposit fee rate and the prepared fee rate | Not specified. | [fees.md](fees.md) |
 | O13 | Which request carries the trade parameters (amounts, fee rates, trade fee receiver)? The first version of this specification named the request that creates the trade (step 1). | Step 2 (`GetNonceShares`), as in the existing messages. No message changes. Nothing in step 1 depends on the parameters. | [parameters.md](parameters.md), [setup-and-deposit.md](setup-and-deposit.md) |
 | O14 | Two unmodified clients with different lock times in their configuration (D19): the partial signatures do not fit, and the engine cannot tell this from a modified client. | The setup is terminated (D17). Nothing is signed, so no funds are at risk. The reason names the trader's own lock times. | [parameters.md](parameters.md), [trade-states.md](trade-states.md) |
+| O16 | Which state changes follow from the chain, and do they go back after a reorganisation? | The state that follows from confirmed transactions is derived from the chain every time, and it goes back when the transaction is removed. Changes that requests or the engine's own steps cause stay. A derived state can follow a state that the table of state changes does not connect with it. | [trade-states.md](trade-states.md) |
 
 Points that were open and are decided:
 
@@ -103,11 +104,9 @@ Points that were open and are decided:
 
 ## Differences to the state model in the code
 
-`trade-states.md` contains three things that `protocol/src/state.rs` does not have:
-
-- the closure type `DepositAborted` (`Abandoned` exists in the code);
-- the state change from `SellerReadyToRelease` to `BuyersWarning` for the seller. Without it the
-  seller's engine has no state for a buyer who publishes his warning transaction after the
-  seller released;
-- the terminated mark. The engine has it as a field of the trade, with the reason. It is not
-  stored on disk yet, like the rest of the trade.
+- `protocol/src/state.rs` holds the table of the state changes that requests cause. The state
+  changes that follow from the chain are not in this table: the engine derives them from the
+  confirmed transactions (`TradeModel::observe_chain`), as `trade-states.md` describes. This
+  covers the change from `SellerReadyToRelease` to `BuyersWarning` for the seller.
+- The terminated mark is a field of the trade, with the reason. It is not stored on disk yet,
+  like the rest of the trade.

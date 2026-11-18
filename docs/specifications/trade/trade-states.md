@@ -37,7 +37,7 @@ Closure types:
 | `BuyersRedirect`, `SellersRedirect` | The named trader published the redirect transaction after the warning transaction of the peer. |
 | `BuyersClaim`, `SellersClaim` | The named trader claimed the escrow of his own warning transaction. |
 | `BuyersPenaltyTx`, `SellersPenaltyTx` | The named trader took the escrow of the peer's warning transaction with the penalty transaction. |
-| `DepositAborted` | The trader spent his own deposit input after the deposit timeout ([setup-and-deposit.md](setup-and-deposit.md)). |
+| `DepositAborted` | The deposit transaction can never confirm, because a confirmed transaction spends one of its inputs: the deposit abort of a trader after the deposit timeout, or another spend of a coin ([setup-and-deposit.md](setup-and-deposit.md)). |
 | `Abandoned` | The trade ended in `Init`. No funds were bound. |
 
 ## Allowed state changes
@@ -78,8 +78,37 @@ Notes:
   published his warning transaction after the close and the trader did not react in time.
 - A trade never leaves a closed state, except for the changes in the last two rows.
 
-A chain reorganisation can undo the event that caused a state change. The rules for this are in
-[chain-observation.md](chain-observation.md).
+## State changes that follow from the chain
+
+A state change has one of two causes: a request of the caller, or a confirmed transaction. The
+engine treats them differently.
+
+- A request changes the state as the table above allows, and the change stays. The same holds for
+  the two steps that the engine takes on its own in place of a request: the forced close of the
+  seller at the release safety margin, and the close of the buyer when he has read the seller's
+  key share from a confirmed transaction ([closing.md](closing.md)).
+- The state that follows from confirmed transactions is derived from the chain every time the
+  engine looks at it: the warning states for the trader who did not ask for the warning, the
+  closure types of redirect, claim and penalty, `Custom` for the trader who did not finalise,
+  `Forced` for the seller whose swap transaction confirmed without his request, and
+  `DepositAborted`.
+
+Consequences:
+
+- When a reorganisation removes the transaction, the derived state goes back to the state that
+  the requests caused. The trade continues from there ([chain-observation.md](chain-observation.md)).
+- A derived state can follow a state that the table does not connect with it, because the chain
+  decides what happened and not the intention of the trader:
+  - a trader who decided to publish his warning transaction is in the warning state of the peer
+    when the peer's warning transaction confirms instead;
+  - a seller who closed by force, or a trader who finalised a custom payout, is in the warning
+    state of the peer when the peer's warning transaction confirms before his own transaction.
+    His own transaction can then never confirm.
+- The requests see the derived state. For example, a trader cannot start the payment after the
+  warning transaction of the peer confirmed.
+
+This section states rules that the project owner has not confirmed. It is open point O16 in
+[README.md](README.md).
 
 ## Order of checks for a request
 
