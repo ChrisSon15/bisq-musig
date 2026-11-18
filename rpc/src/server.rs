@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::marker::Send;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -79,6 +79,18 @@ pub struct MusigImpl {
     events: broadcast::Sender<TradeEvent>,
     /// Wakes the task that watches the trades, after a request has changed a trade.
     wake_watcher: Arc<Notify>,
+    /// The IDs of the trades whose outputs are watched on the chain in this run of the program.
+    watched: Arc<Mutex<HashSet<String>>>,
+    /// The task that watches the trades. It ends with the service.
+    watcher: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for MusigImpl {
+    fn drop(&mut self) {
+        if let Some(watcher) = &self.watcher {
+            watcher.abort();
+        }
+    }
 }
 
 /// The number of trade events that a slow subscriber can fall behind before it loses events.
@@ -97,6 +109,8 @@ impl MusigImpl {
             chain: None,
             events: broadcast::channel(EVENT_CHANNEL_CAPACITY).0,
             wake_watcher: Arc::new(Notify::new()),
+            watched: Arc::new(Mutex::new(HashSet::new())),
+            watcher: None,
         }
     }
 
@@ -107,13 +121,15 @@ impl MusigImpl {
     /// If it is called outside of a Tokio runtime.
     #[must_use]
     pub fn with_chain(mut self, chain: Arc<dyn ChainAccess>) -> Self {
-        tokio::spawn(watch_trades(
+        let watcher = tokio::spawn(watch_trades(
             Arc::clone(&self.trades),
             Arc::clone(&self.wallet),
             Arc::clone(&chain),
             self.events.clone(),
             Arc::clone(&self.wake_watcher),
+            Arc::clone(&self.watched),
         ));
+        self.watcher = Some(watcher.abort_handle());
         self.chain = Some(chain);
         self
     }
@@ -143,14 +159,15 @@ impl MusigImpl {
         Ok(chain)
     }
 
-    /// Watches the outputs of a trade whose deposit transaction the trader has signed.
-    fn watch_trade(&self, trade_model: &TradeModel) -> Result<(), HandlerError> {
-        if let Some(chain) = &self.chain {
-            for (outpoint, script) in trade_model.outputs_to_watch()? {
-                chain.watch_output(outpoint, script);
-            }
+    /// The status of every trade request while the stored trades could not be loaded.
+    fn check_trade_store(&self) -> Result<()> {
+        match self.trades.unusable() {
+            Some(reason) => Err(Status::data_loss(format!(
+                "the trades of the wallet could not be loaded, so no trade request is served: \
+                 {reason}"
+            ))),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// Runs `operation` with the wallet of the trader, or returns an error if no wallet is open.
@@ -188,8 +205,12 @@ impl MusigImpl {
         F: FnOnce(Req, &mut TradeModel, &mut dyn ProtocolWalletApi) -> Result<Res, HandlerError>
             + Send,
     {
+        if let Some(chain) = &self.chain {
+            wait_until_evaluated(&**chain).await;
+        }
         self.with_wallet(|wallet| {
             handle_request(request, move |request| {
+                self.check_trade_store()?;
                 let trade_model =
                     self.trades
                         .get_trade_model(request.trade_id())
@@ -204,9 +225,15 @@ impl MusigImpl {
                 // The engine checks the chain conditions of a request against the facts that it
                 // was told last, so it is told the current facts first.
                 if let Some(chain) = &self.chain {
+                    ensure_watched(&**chain, &self.watched, &trade_model, wallet);
                     observe_chain(&**chain, &mut trade_model, wallet, &self.events);
                 }
                 let result = handler(request, &mut trade_model, wallet);
+                if let Some(chain) = &self.chain {
+                    // From the moment the trader has signed the deposit transaction, the peer
+                    // can publish it.
+                    ensure_watched(&**chain, &self.watched, &trade_model, wallet);
+                }
                 if trade_model.state() != state_before {
                     let event =
                         trade_event(&trade_model, self.chain.as_deref(), TradeEventType::State);
@@ -223,6 +250,9 @@ impl MusigImpl {
                         "Could not release the reserved coins of a terminated trade."
                     );
                 }
+                // The new state is on disk before the response leaves the service, also when
+                // the request was refused: a refusal can have terminated the trade.
+                store_trade(&trade_model, wallet)?;
                 result
             })
         })
@@ -239,6 +269,7 @@ impl musig_server::Musig for MusigImpl {
     ) -> Result<Response<PubKeySharesResponse>> {
         self.with_wallet(|wallet| {
             handle_request(request, |request| {
+                self.check_trade_store()?;
                 if self.trades.contains_trade(&request.trade_id) {
                     return Err(ProtocolErrorKind::DuplicateTradeId(request.trade_id).into());
                 }
@@ -256,6 +287,9 @@ impl musig_server::Musig for MusigImpl {
                         .and_then(|chain| chain.tip_height())
                         .unwrap_or(0),
                 };
+                // The ID of a trade is stored from its first request on, so that it is never used
+                // for a second trade, also after a restart.
+                store_trade(&trade_model, wallet)?;
                 self.trades.add_trade_model(trade_model)?;
 
                 Ok(response)
@@ -357,8 +391,6 @@ impl musig_server::Musig for MusigImpl {
             let peers_partial_signatures: PeerData<ExchangedSigs<ByVal>> =
                 peers_partial_signatures.try_proto_into().peer_data();
             trade_model.receive_partial_signatures(wallet, peers_partial_signatures)?;
-            // From now on the peer can publish the deposit transaction.
-            self.watch_trade(trade_model)?;
             let deposit_psbt = trade_model.deposit_psbt()?;
 
             Ok(DepositPsbt {
@@ -385,9 +417,6 @@ impl musig_server::Musig for MusigImpl {
             let peers_deposit_psbt: PeerData<Psbt> =
                 peers_deposit_psbt.deposit_psbt.try_proto_into().peer_data();
             let deposit_tx = trade_model.receive_deposit_psbt(wallet, peers_deposit_psbt)?;
-            for (outpoint, script) in trade_model.outputs_to_watch()? {
-                chain.watch_output(outpoint, script);
-            }
             // The task that watches the trades sends the transaction, and sends it again until
             // it is confirmed or the deposit timeout has passed. This does not depend on the
             // stream of this response.
@@ -417,9 +446,6 @@ impl musig_server::Musig for MusigImpl {
                 return Err(ProtocolErrorKind::NotAllowedInState(TradeState::Init).into());
             }
             let deposit_txid = trade_model.deposit_txid()?;
-            for (outpoint, script) in trade_model.outputs_to_watch()? {
-                chain.watch_output(outpoint, script);
-            }
 
             Ok(
                 tx_confirmation_status_stream(chain, request.trade_id, deposit_txid, None)
@@ -608,10 +634,177 @@ const SEND_RETRY_DELAY: Duration = Duration::from_secs(5);
 /// The longest time between two looks at the trades, also without an event of the chain.
 const WATCH_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Stores the record of a trade in the wallet. The record must be on disk before a signature, a
+/// key share or a transaction of the trade leaves the service.
+fn store_trade(trade_model: &TradeModel, wallet: &mut dyn ProtocolWalletApi) -> Result<()> {
+    let stored = trade_model
+        .to_record()
+        .map_err(|error| error.to_string())
+        .and_then(|record| {
+            wallet
+                .store_trade_record(trade_model.trade_id(), &record)
+                .map_err(|error| error.to_string())
+        });
+    stored.map_err(|error| {
+        Status::internal(format!(
+            "the trade {} could not be stored, so nothing of this request is handed out: {error}",
+            trade_model.trade_id()
+        ))
+    })
+}
+
+/// Watches the outputs of a trade on the chain, once per trade in a run of the program, from the
+/// moment the trader has signed the deposit transaction.
+///
+/// The outputs are watched from the block at which the trader signed the deposit. For a trade
+/// that was loaded after a restart, this makes the chain client evaluate the blocks that were
+/// mined while the program did not run.
+fn ensure_watched(
+    chain: &dyn ChainAccess,
+    watched: &Mutex<HashSet<String>>,
+    trade_model: &TradeModel,
+    wallet: &dyn ProtocolWalletApi,
+) {
+    // Before the chain is known, the chain client cannot be told where to start.
+    if chain.tip_height().is_none() {
+        return;
+    }
+    let Ok(outputs) = trade_model.outputs_to_watch() else {
+        return;
+    };
+    if !watched
+        .lock()
+        .unwrap()
+        .insert(trade_model.trade_id().to_owned())
+    {
+        return;
+    }
+    let start = trade_model
+        .deposit_signing_height()
+        .and_then(|height| wallet.known_block_at_or_below(height));
+    match start {
+        Some(start) => chain.watch_outputs_from(outputs, start),
+        None => {
+            for (outpoint, script) in outputs {
+                chain.watch_output(outpoint, script);
+            }
+        }
+    }
+}
+
+/// Loads the trades of a wallet into the trade store, when the wallet is opened. This is the
+/// restart of the trades:
+///
+/// 1. Every record of the wallet is loaded. If one record cannot be loaded, no trade is loaded and
+///    the store is marked as unusable: the trade service then refuses every trade request.
+/// 2. A trade whose deposit transaction the trader has not signed is abandoned, and its coins are
+///    released. Its nonces are lost, so its setup cannot continue.
+/// 3. The reservations of the wallet are made to agree with the trades: a coin that no trade
+///    reserves is released, and a coin that a trade reserves is reserved again.
+///
+/// The task that watches the trades then watches their outputs from the block of each deposit
+/// signature, and performs the reactions for what it finds.
+pub fn restore_trades(wallet: &mut dyn ProtocolWalletApi, trades: &dyn TradeModelStore) {
+    let records = match wallet.trade_records() {
+        Ok(records) => records,
+        Err(error) => {
+            error!(%error, "The trade records of the wallet cannot be read.");
+            trades.set_unusable(error.to_string());
+            return;
+        }
+    };
+    let mut loaded = Vec::with_capacity(records.len());
+    let mut failures = Vec::new();
+    for (trade_id, record) in records {
+        match TradeModel::from_record(&record, wallet) {
+            Ok(trade_model) if trade_model.trade_id() == trade_id => loaded.push(trade_model),
+            Ok(trade_model) => failures.push(format!(
+                "trade {trade_id}: the record belongs to the trade {}",
+                trade_model.trade_id()
+            )),
+            Err(error) => failures.push(format!("trade {trade_id}: {error}")),
+        }
+    }
+    if !failures.is_empty() {
+        let reason = failures.join("; ");
+        error!(
+            reason,
+            "The trades of the wallet cannot be loaded. No trade is served."
+        );
+        trades.set_unusable(reason);
+        return;
+    }
+    let mut reserved = HashSet::new();
+    for mut trade_model in loaded {
+        let trade_id = trade_model.trade_id().to_owned();
+        match trade_model.abandon_after_restart(wallet) {
+            Ok(true) => {
+                info!(
+                    trade_id,
+                    "Abandoned a trade whose setup was interrupted by a restart."
+                );
+                if let Err(error) = store_trade(&trade_model, wallet) {
+                    error!(trade_id, %error, "Trade not stored.");
+                }
+            }
+            Ok(false) => {}
+            Err(error) => error!(trade_id, %error, "Could not abandon an interrupted setup."),
+        }
+        reserved.extend(trade_model.reserved_coins().iter().copied());
+        info!(trade_id, state = %trade_model.state(), "Loaded a trade.");
+        if let Err(error) = trades.add_trade_model(trade_model) {
+            error!(trade_id, %error, "Could not load a trade.");
+        }
+    }
+    // A stop of the program between the reservation of a coin and the storing of its trade, or
+    // the other way round, leaves the two apart.
+    for coin in wallet.list_locked_utxos() {
+        if !reserved.contains(&coin) {
+            info!(%coin, "Releasing a reserved coin that no trade reserves.");
+            if let Err(error) = wallet.unlock_utxo(coin) {
+                error!(%coin, %error, "Could not release a coin.");
+            }
+        }
+    }
+    for coin in reserved {
+        if wallet.is_utxo_locked(coin) {
+            continue;
+        }
+        if let Err(error) = wallet.lock_utxo(coin) {
+            error!(%coin, %error, "Could not reserve the coin of a trade again.");
+        }
+    }
+}
+
+/// How long a request waits for the chain client to evaluate the newest block.
+const CHAIN_EVALUATION_WAIT: Duration = Duration::from_secs(3);
+
+/// Waits until the chain client has evaluated all blocks that it knows, for a short time.
+///
+/// The header of a new block is known a moment before the block is evaluated. In that moment
+/// the confirmation events of the deposit already count the block, but the engine cannot be told
+/// the facts of the chain yet. A caller that sends a request at once after such an event would
+/// meet an engine that does not know about the confirmation. A longer evaluation, as after a
+/// restart, is not waited for: the request is then answered with the facts that the engine has.
+async fn wait_until_evaluated(chain: &dyn ChainAccess) {
+    let deadline = tokio::time::Instant::now() + CHAIN_EVALUATION_WAIT;
+    while chain.tip_height().is_some()
+        && chain.synced_height() != chain.tip_height()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Reads the facts about the chain for one trade. `None` if the chain is not known yet, or if
 /// the trader has not signed the deposit transaction, so that there is nothing to observe.
 fn chain_facts(chain: &dyn ChainAccess, trade_model: &TradeModel) -> Option<ChainFacts> {
     let tip_height = chain.tip_height()?;
+    // While the chain client evaluates earlier blocks, for example for a trade that was loaded
+    // after a restart, it does not know yet what happened in them.
+    if chain.synced_height() != Some(tip_height) {
+        return None;
+    }
     let deposit_txid = trade_model.deposit_txid().ok()?;
     let outputs = trade_model.outputs_to_watch().ok()?;
     Some(ChainFacts::collect(
@@ -730,6 +923,7 @@ async fn watch_trades(
     chain: Arc<dyn ChainAccess>,
     events: broadcast::Sender<TradeEvent>,
     wake: Arc<Notify>,
+    watched: Arc<Mutex<HashSet<String>>>,
 ) {
     let mut chain_events = chain.subscribe();
     // The height of the chain at which a transaction was sent last.
@@ -751,7 +945,18 @@ async fn watch_trades(
                     if trade_model.is_final() {
                         continue;
                     }
+                    ensure_watched(&*chain, &watched, &trade_model, wallet);
+                    let stored = trade_model.to_record().ok();
                     observe_chain(&*chain, &mut trade_model, wallet, &events);
+                    // What the engine decided at this look at the chain is on disk before a
+                    // transaction that follows from it leaves the service.
+                    if trade_model.to_record().ok() != stored {
+                        if let Err(status) = store_trade(&trade_model, wallet) {
+                            let trade_id = trade_model.trade_id();
+                            error!(trade_id, %status, "Trade not stored.");
+                            continue;
+                        }
+                    }
                     for tx in trade_model.transactions_to_send(engine_fee_rate()) {
                         let event =
                             trade_event(&trade_model, Some(&*chain), TradeEventType::TxSent);

@@ -456,6 +456,12 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
             BMPWallet::new(self.wallet_dir.as_path().into(), &password, self.network)?
         };
 
+        let mut wallet = wallet;
+        // The trades of the wallet are loaded before any request can reach them: the wallet is
+        // still locked, and a trade request needs the open wallet.
+        if let Some(trades) = &self.trade_store {
+            crate::server::restore_trades(&mut wallet, &**trades);
+        }
         self.tx_confidence_map
             .lock()
             .unwrap()
@@ -1188,6 +1194,12 @@ mod tests {
 
         fn trade_models(&self) -> Vec<Arc<Mutex<TradeModel>>> {
             Vec::new()
+        }
+
+        fn set_unusable(&self, _reason: String) {}
+
+        fn unusable(&self) -> Option<String> {
+            None
         }
 
         fn trade_reserving(&self, coin: &OutPoint) -> Option<String> {

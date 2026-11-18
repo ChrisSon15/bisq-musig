@@ -50,15 +50,28 @@ pub trait TradeModelStore: Send + Sync {
     /// All trades of the store.
     fn trade_models(&self) -> Vec<Arc<Mutex<TradeModel>>>;
 
+    /// Marks the store as unusable, because the stored trades could not be loaded. No trade is
+    /// served from then on: a store with a part of its trades would accept the ID of a trade
+    /// that it does not know, and it would not watch the trades that it lost.
+    fn set_unusable(&self, reason: String);
+
+    /// The reason why the store is unusable, if it is.
+    fn unusable(&self) -> Option<String>;
+
     /// The ID of the trade that has reserved the coin `coin` of the wallet for its deposit, if
     /// there is one. A coin of such a trade must be released through the trade
     /// ([`TradeModel::abandon`]), never directly in the wallet.
     fn trade_reserving(&self, coin: &OutPoint) -> Option<String>;
 }
 
-/// A trade store that keeps the trades in memory. They are lost when the process ends.
+/// A trade store that keeps the trades in memory. The durable form of a trade is its record
+/// ([`TradeModel::to_record`]), which the caller of the engine stores in the wallet and loads
+/// again after a restart.
 #[derive(Default)]
-pub struct MemoryTradeStore(Mutex<BTreeMap<String, Arc<Mutex<TradeModel>>>>);
+pub struct MemoryTradeStore(
+    Mutex<BTreeMap<String, Arc<Mutex<TradeModel>>>>,
+    Mutex<Option<String>>,
+);
 
 impl TradeModelStore for MemoryTradeStore {
     fn contains_trade(&self, trade_id: &str) -> bool {
@@ -94,6 +107,14 @@ impl TradeModelStore for MemoryTradeStore {
 
     fn trade_models(&self) -> Vec<Arc<Mutex<TradeModel>>> {
         self.0.lock().unwrap().values().cloned().collect()
+    }
+
+    fn set_unusable(&self, reason: String) {
+        *self.1.lock().unwrap() = Some(reason);
+    }
+
+    fn unusable(&self) -> Option<String> {
+        self.1.lock().unwrap().clone()
     }
 }
 
@@ -448,6 +469,12 @@ impl TradeModel {
 
     pub const fn am_buyer(&self) -> bool {
         self.keys.am_buyer
+    }
+
+    /// The height of the chain tip of the wallet when the trader signed the deposit transaction.
+    /// No transaction of the trade is confirmed at or below this height.
+    pub const fn deposit_signing_height(&self) -> Option<u32> {
+        self.deposit_signing_height
     }
 
     /// The state of the trade: the state that the requests gave it, or the later state that

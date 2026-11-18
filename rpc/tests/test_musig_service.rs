@@ -48,7 +48,7 @@ use rpc::pb::musigrpc::{
     SubscribeTxConfirmationStatusRequest, SwapTxSignatureRequest, SwapTxSignatureResponse,
     TradeEvent, TradeEventType, TradeStateKind, TradeTxKind, TxConfirmationStatus,
 };
-use rpc::server::{MusigImpl, MusigServer, TradeWalletProvider, WalletOperation};
+use rpc::server::{MusigImpl, MusigServer, TradeWalletProvider, WalletOperation, restore_trades};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tonic::transport::server::TcpIncoming;
@@ -288,6 +288,12 @@ impl ChainAccess for FakeChain {
         }
     }
 
+    fn watch_outputs_from(&self, outputs: Vec<(OutPoint, ScriptBuf)>, _start: (u32, BlockHash)) {
+        for (outpoint, script) in outputs {
+            self.watch_output(outpoint, script);
+        }
+    }
+
     fn tip_height(&self) -> Option<u32> {
         Some(self.state.lock().unwrap().height)
     }
@@ -351,6 +357,24 @@ impl ChainAccess for FakeChain {
     }
 }
 
+/// A running `musigrpc.Musig` service for one trader, with what the tests need to look into it
+/// and to start it again.
+struct RunningService {
+    client: MusigClient<Channel>,
+    trades: Arc<MemoryTradeStore>,
+    /// The task of the server. When it is aborted, the service and its watcher end.
+    server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+}
+
+fn mock_wallet(is_buyer: bool) -> Arc<MockWalletProvider> {
+    let wallet: Box<dyn ProtocolWalletApi + Send> = if is_buyer {
+        Box::new(mock_buyer_trade_wallet())
+    } else {
+        Box::new(mock_seller_trade_wallet())
+    };
+    Arc::new(MockWalletProvider(tokio::sync::Mutex::new(wallet)))
+}
+
 /// Starts a `musigrpc.Musig` service for one trader on a free loopback port. Returns a connected
 /// client, the trade store of the service, from which the tests read the state of a trade, and
 /// the chain of the service.
@@ -367,15 +391,21 @@ async fn start_service_with_chain(
     is_buyer: bool,
     chain: Option<Arc<FakeChain>>,
 ) -> (MusigClient<Channel>, Arc<MemoryTradeStore>) {
-    let wallet: Box<dyn ProtocolWalletApi + Send> = if is_buyer {
-        Box::new(mock_buyer_trade_wallet())
-    } else {
-        Box::new(mock_seller_trade_wallet())
-    };
+    let service = start_service_with_wallet(mock_wallet(is_buyer), chain).await;
+    (service.client, service.trades)
+}
+
+/// Starts a service on a wallet. The trades whose records the wallet holds are loaded first, as
+/// at the start of `musigd` when the wallet is opened.
+async fn start_service_with_wallet(
+    wallet: Arc<MockWalletProvider>,
+    chain: Option<Arc<FakeChain>>,
+) -> RunningService {
     let trades = Arc::new(MemoryTradeStore::default());
+    restore_trades(&mut **wallet.0.lock().await, &*trades);
     let mut service = MusigImpl::new(
         Arc::clone(&trades) as _,
-        Arc::new(MockWalletProvider(tokio::sync::Mutex::new(wallet))),
+        wallet,
         EngineConfig::new(WARNING_LOCK_TIME, CLAIM_LOCK_TIME, 144, 6).expect("valid configuration"),
     );
     if let Some(chain) = chain {
@@ -386,7 +416,7 @@ async fn start_service_with_chain(
         .await
         .expect("free loopback port");
     let addr = listener.local_addr().expect("listener has a local address");
-    tokio::spawn(
+    let server = tokio::spawn(
         Server::builder()
             .add_service(MusigServer::new(service))
             .serve_with_incoming(TcpIncoming::from(listener)),
@@ -394,7 +424,11 @@ async fn start_service_with_chain(
     let client = MusigClient::connect(format!("http://{addr}"))
         .await
         .expect("service accepts connections");
-    (client, trades)
+    RunningService {
+        client,
+        trades,
+        server,
+    }
 }
 
 /// Returns a number that no other test of this process uses, to build unique trade IDs.
@@ -426,6 +460,10 @@ struct Party {
     client: MusigClient<Channel>,
     trades: Arc<MemoryTradeStore>,
     chain: Arc<FakeChain>,
+    /// The wallet of the trader. It holds the records of his trades and outlives a restart of
+    /// the service.
+    wallet: Arc<MockWalletProvider>,
+    server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
     trade_id: String,
     role: Role,
     key_shares: Option<PubKeySharesResponse>,
@@ -439,11 +477,16 @@ struct Party {
 impl Party {
     async fn new(trade_id: String, role: Role) -> Self {
         let is_buyer = matches!(role, Role::BuyerAsMaker | Role::BuyerAsTaker);
-        let (client, trades, chain) = start_service(is_buyer).await;
+        let chain = FakeChain::new();
+        let wallet = mock_wallet(is_buyer);
+        let service =
+            start_service_with_wallet(Arc::clone(&wallet), Some(Arc::clone(&chain))).await;
         Self {
-            client,
-            trades,
+            client: service.client,
+            trades: service.trades,
             chain,
+            wallet,
+            server: service.server,
             trade_id,
             role,
             key_shares: None,
@@ -460,6 +503,29 @@ impl Party {
     }
 
     /// The state of this party's trade, read from the trade store of the service.
+    /// Stops the service of this trader. Its wallet and its chain stay.
+    async fn stop(&mut self) {
+        self.server.abort();
+        // The service and its watcher are gone when the task has ended.
+        let _ = (&mut self.server).await;
+    }
+
+    /// Starts a new service for this trader, as after a start of `musigd`: with an empty trade
+    /// store, which is loaded from the records in the wallet.
+    async fn start(&mut self) {
+        let service =
+            start_service_with_wallet(Arc::clone(&self.wallet), Some(Arc::clone(&self.chain)))
+                .await;
+        self.client = service.client;
+        self.trades = service.trades;
+        self.server = service.server;
+    }
+
+    async fn restart(&mut self) {
+        self.stop().await;
+        self.start().await;
+    }
+
     fn state(&self) -> TradeState {
         let trade_model = self
             .trades
@@ -2176,6 +2242,224 @@ async fn d21_problem_with_the_peers_is_an_event_of_the_trade() {
     trade.buyer.chain.set_peer_problem(None);
     let event = trade_event_of_type(&mut events, TradeEventType::ChainProblemOver).await;
     assert_eq!(event.message, None);
+}
+
+impl Trade {
+    /// Both traders stop their service and start a new one.
+    async fn restart(&mut self) {
+        self.buyer.restart().await;
+        self.seller.restart().await;
+    }
+}
+
+/// H2, H3: both services restart after every step of a trade that closes cooperatively. The
+/// trade ends as without a restart. A request that is repeated after a restart gives the same
+/// response.
+#[tokio::test]
+async fn h2_restart_after_every_step_of_a_cooperative_close() {
+    for trade_type in TRADE_TYPES {
+        let mut trade = Trade::at(trade_type, Stage::DepositSigned).await;
+        trade.restart().await;
+        trade.assert_states(TradeState::Deposit, TradeState::Deposit);
+        // The watch list is set up again after the restart.
+        for party in [&trade.buyer, &trade.seller] {
+            assert!(!party.chain.watched_outputs().is_empty());
+        }
+
+        trade.buyer_starts_payment().await;
+        let message_e = trade.payment_started.clone().expect("message E");
+        trade.restart().await;
+        trade.assert_states(TradeState::BuyerReadyToRelease, TradeState::Deposit);
+        // H3: the response of the buyer's service was lost, and the caller repeats the request.
+        trade.buyer_starts_payment().await;
+        assert_eq!(trade.payment_started, Some(message_e));
+
+        trade.seller_receives_payment_start().await;
+        trade.restart().await;
+        trade.release_payout().await;
+        let message_f = trade.sellers_key_share();
+        trade.restart().await;
+        trade.assert_states(
+            TradeState::BuyerReadyToRelease,
+            TradeState::SellerReadyToRelease,
+        );
+        trade.release_payout().await;
+        assert_eq!(trade.sellers_key_share(), message_f);
+
+        trade.buyer_closes_cooperatively().await;
+        let message_g = trade.buyers_key_share();
+        trade.restart().await;
+        trade.buyer_closes_cooperatively().await;
+        assert_eq!(trade.buyers_key_share(), message_g);
+        trade.seller_closes_cooperatively().await;
+        trade.restart().await;
+        let closed = TradeState::TradeClosed(ClosureType::Cooperative);
+        trade.assert_states(closed, closed);
+    }
+}
+
+/// H1, H8, K2: a restart during the setup. The nonces of the setup are lost, so the trade is
+/// abandoned and its coins are released. Its ID stays used.
+#[tokio::test]
+async fn h1_restart_during_the_setup_abandons_the_trade() {
+    let mut trade = Trade::at(TradeType::TakerIsBuyer, Stage::SignaturesExchanged).await;
+    for party in [&trade.buyer, &trade.seller] {
+        assert!(!party.wallet.0.lock().await.list_locked_utxos().is_empty());
+    }
+    trade.restart().await;
+    let abandoned = TradeState::TradeClosed(ClosureType::Abandoned);
+    trade.assert_states(abandoned, abandoned);
+    for party in [&trade.buyer, &trade.seller] {
+        assert_eq!(party.wallet.0.lock().await.list_locked_utxos(), vec![]);
+    }
+    // The setup cannot continue.
+    let signatures = trade
+        .seller
+        .partial_signatures
+        .clone()
+        .expect("message C/D");
+    let result = trade.buyer.sign_deposit_tx(&signatures).await;
+    assert_refused(result, Code::FailedPrecondition, "not allowed in state");
+    // The ID is not accepted for another trade.
+    let result = trade
+        .buyer
+        .client
+        .init_trade(PubKeySharesRequest {
+            trade_id: trade.buyer.trade_id.clone(),
+            my_role: Role::BuyerAsTaker.into(),
+        })
+        .await;
+    assert_refused(result, Code::AlreadyExists, "already exists");
+    // The abandoned trade is stored as abandoned: another restart changes nothing.
+    trade.restart().await;
+    trade.assert_states(abandoned, abandoned);
+}
+
+/// H5: the swap transaction is confirmed while the buyer's service does not run. After its
+/// start the buyer's service finds the transaction, reads the key share and closes the trade.
+#[tokio::test]
+async fn h5_swap_tx_confirmed_while_the_service_did_not_run() {
+    let mut trade = Trade::at(TradeType::TakerIsBuyer, Stage::SellerReleased).await;
+    let sellers_chain = Arc::clone(&trade.seller.chain);
+    let sent_before = sellers_chain.sent().len();
+    trade.buyer.stop().await;
+    trade.seller_closes_by_force().await;
+    let swap_tx = sent_tx(&sellers_chain, sent_before + 1).await;
+    trade.mine(std::slice::from_ref(&swap_tx));
+    trade.mine(&[]);
+
+    trade.buyer.start().await;
+    let closed = TradeState::TradeClosed(ClosureType::Forced);
+    for _ in 0..200 {
+        if trade.buyer.state() == closed {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(trade.buyer.state(), closed);
+    // The close is stored: it is there after another restart, before the service has looked at
+    // the chain again.
+    trade.buyer.restart().await;
+    assert_eq!(trade.buyer.state(), closed);
+}
+
+/// H5 for the dispute path: the peer's warning transaction is confirmed while the service does
+/// not run. After its start the service answers with the redirect transaction.
+#[tokio::test]
+async fn h5_warning_confirmed_while_the_service_did_not_run() {
+    let mut trade = Trade::at(TradeType::TakerIsBuyer, Stage::DepositSigned).await;
+    for _ in 3..WARNING_LOCK_TIME {
+        trade.mine(&[]);
+    }
+    let buyers_chain = Arc::clone(&trade.buyer.chain);
+    let sellers_chain = Arc::clone(&trade.seller.chain);
+    let (buyers_sent, sellers_sent) = (buyers_chain.sent().len(), sellers_chain.sent().len());
+    trade.seller.stop().await;
+    trade
+        .buyer
+        .publish_warning_tx()
+        .await
+        .expect("the warning lock time has passed");
+    let warning_tx = sent_tx(&buyers_chain, buyers_sent + 1).await;
+    trade.mine(std::slice::from_ref(&warning_tx));
+    // The buyer's decision is stored.
+    trade.buyer.restart().await;
+    assert_eq!(trade.buyer.state(), TradeState::BuyersWarning);
+
+    trade.seller.start().await;
+    let redirect_tx = sent_tx(&sellers_chain, sellers_sent + 1).await;
+    let ids = trade.contractual_tx_ids();
+    assert_eq!(
+        redirect_tx.compute_txid(),
+        txid(&ids.sellers_redirect_tx_id)
+    );
+    assert_eq!(trade.seller.state(), TradeState::BuyersWarning);
+}
+
+/// H6: a record that cannot be loaded. No trade is loaded, and the service refuses every trade
+/// request with a status that names the trade and the reason.
+#[tokio::test]
+async fn h6_damaged_record_stops_the_trade_service() {
+    let mut trade = Trade::at(TradeType::TakerIsBuyer, Stage::DepositSigned).await;
+    let trade_id = trade.buyer.trade_id.clone();
+    trade.buyer.stop().await;
+    {
+        let mut wallet = trade.buyer.wallet.0.lock().await;
+        let mut records = wallet.trade_records().expect("records");
+        let (_, record) = records.pop().expect("one trade");
+        wallet
+            .store_trade_record(&trade_id, &record[..record.len() / 2])
+            .expect("stored");
+        // A second trade with a valid record is not loaded either.
+        wallet
+            .store_trade_record("other-trade", &record)
+            .expect("stored");
+    }
+    trade.buyer.start().await;
+    assert!(trade.buyer.trades.get_trade_model(&trade_id).is_none());
+    assert!(trade.buyer.trades.get_trade_model("other-trade").is_none());
+
+    let message = format!("trade {trade_id}");
+    let result = trade.buyer.subscribe_trade_events().await;
+    assert_refused(result, Code::DataLoss, &message);
+    let result = trade
+        .buyer
+        .client
+        .init_trade(PubKeySharesRequest {
+            trade_id: "new-trade".to_owned(),
+            my_role: Role::BuyerAsTaker.into(),
+        })
+        .await;
+    assert_refused(result, Code::DataLoss, "could not be loaded");
+}
+
+/// H8: after a restart the reservations in the wallet agree with the trades. A coin that no
+/// trade reserves is released, and the coin of a trade is reserved again.
+#[tokio::test]
+async fn h8_reservations_agree_with_the_trades_after_a_restart() {
+    let mut trade = Trade::at(TradeType::TakerIsBuyer, Stage::DepositSigned).await;
+    let trade_id = trade.seller.trade_id.clone();
+    let reserved = {
+        let stored = trade.seller.trades.get_trade_model(&trade_id).unwrap();
+        let reserved = stored.lock().unwrap().reserved_coins().to_vec();
+        reserved
+    };
+    assert!(!reserved.is_empty());
+    let stray: OutPoint = "658654575bbbeb46e965bd9eb37fd3be550a7e0fa2d64bc5f218763155602300:7"
+        .parse()
+        .unwrap();
+    trade.seller.stop().await;
+    {
+        let mut wallet = trade.seller.wallet.0.lock().await;
+        wallet.unlock_utxo(reserved[0]).expect("unlocked");
+        wallet.lock_utxo(stray).expect("locked");
+    }
+    trade.seller.start().await;
+    let mut locked = trade.seller.wallet.0.lock().await.list_locked_utxos();
+    locked.sort();
+    let mut expected = reserved;
+    expected.sort();
+    assert_eq!(locked, expected);
 }
 
 #[tokio::test]

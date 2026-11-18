@@ -205,8 +205,9 @@ const WAIT: Duration = Duration::from_secs(90);
 
 /// One trader: a `musigd` process with its wallet directory, and clients of its two services.
 struct Daemon {
-    _process: MusigdProcess,
-    _wallet_dir: tempfile::TempDir,
+    /// `None` while the daemon is stopped.
+    process: Option<MusigdProcess>,
+    wallet_dir: tempfile::TempDir,
     wallet: WalletClient<Channel>,
     musig: MusigClient<Channel>,
 }
@@ -216,24 +217,51 @@ impl Daemon {
     /// port of the node: no option for the RPC interface of a node exists.
     async fn start(env: &TestEnv) -> Self {
         let wallet_dir = tempfile::tempdir().expect("temporary directory");
+        let (process, wallet, musig) = Self::launch(env, wallet_dir.path()).await;
+        Self {
+            process: Some(process),
+            wallet_dir,
+            wallet,
+            musig,
+        }
+    }
+
+    /// Starts a `musigd` process on a wallet directory and opens the wallet, which creates it if
+    /// the directory is empty.
+    async fn launch(
+        env: &TestEnv,
+        wallet_dir: &std::path::Path,
+    ) -> (MusigdProcess, WalletClient<Channel>, MusigClient<Channel>) {
         let port = free_port();
         let peer = env.p2p_socket_addr().expect("peer address");
+        // For the search for an error: with the directory `MUSIGD_TEST_LOG_DIR` in the
+        // environment, every daemon writes its log to a file there, named after its port.
+        let log_dir = std::env::var_os("MUSIGD_TEST_LOG_DIR");
+        let log_level = if log_dir.is_some() { "debug" } else { "off" };
+        let log_file = |port: u16, stream: &str| match &log_dir {
+            Some(dir) => {
+                let path = std::path::Path::new(dir).join(format!("musigd-{port}.{stream}"));
+                Stdio::from(std::fs::File::create(path).expect("log file"))
+            }
+            None => Stdio::null(),
+        };
         let process = Command::new(env!("CARGO_BIN_EXE_musigd"))
             .arg("--port")
             .arg(port.to_string())
             .arg("--wallet-dir")
-            .arg(wallet_dir.path())
+            .arg(wallet_dir)
             .arg("--wallet-peer")
             .arg(peer.to_string())
             .arg("--wallet-poll-secs")
             .arg("1")
             .env("BISQ_MUSIG_WARNING_LOCK_TIME", "20")
             .env("BISQ_MUSIG_CLAIM_LOCK_TIME", "10")
-            .env("RUST_LOG", "off")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .env("RUST_LOG", log_level)
+            .stdout(log_file(port, "out"))
+            .stderr(log_file(port, "err"))
             .spawn()
             .expect("musigd starts");
+        let process = MusigdProcess(process);
         let channel = connect(port).await;
         let mut wallet = WalletClient::new(channel.clone());
         wallet
@@ -241,13 +269,23 @@ impl Daemon {
                 password: PASSWORD.to_owned(),
             })
             .await
-            .expect("the wallet is created");
-        Self {
-            _process: MusigdProcess(process),
-            _wallet_dir: wallet_dir,
-            wallet,
-            musig: MusigClient::new(channel),
-        }
+            .expect("the wallet is opened");
+        (process, wallet, MusigClient::new(channel))
+    }
+
+    /// Ends the `musigd` process. The wallet directory stays.
+    fn stop(&mut self) {
+        self.process = None;
+    }
+
+    /// Starts a new `musigd` process on the wallet directory of this trader and opens the
+    /// wallet, as bisq2 does at its start.
+    async fn restart(&mut self, env: &TestEnv) {
+        self.stop();
+        let (process, wallet, musig) = Self::launch(env, self.wallet_dir.path()).await;
+        self.process = Some(process);
+        self.wallet = wallet;
+        self.musig = musig;
     }
 
     async fn new_address(&mut self) -> Address {
@@ -605,22 +643,20 @@ async fn mine_until_event(
     anyhow::bail!("no event: {what}")
 }
 
-/// C1, C2, C4 (D7) through the real daemon: the seller releases, and the buyer does not answer.
-/// The seller's `musigd` publishes the swap transaction on its own before the buyer's warning
-/// transaction becomes valid. The buyer's `musigd` reads the seller's key share from the
-/// confirmed transaction, closes the trade and imports the payout. No request asks for any of
-/// this, and both wallets show the result.
-#[tokio::test(flavor = "multi_thread")]
-async fn c4_forced_close_of_two_daemons() -> anyhow::Result<()> {
-    let mut env = TestEnv::new()?;
-    env.mine_blocks(101)?;
-    let (mut buyer, mut seller) = funded_daemons(&mut env).await?;
-    let trade_id = "trade-1".to_owned();
-    let sellers_deposit_psbt = set_up_trade(&mut buyer, &mut seller, &env, &trade_id).await?;
+/// Sets up a trade, publishes the deposit transaction, mines blocks until it has 3
+/// confirmations, and exchanges the messages E and F: the seller has released. The buyer does
+/// not send message G.
+async fn confirm_deposit_and_release(
+    env: &mut TestEnv,
+    buyer: &mut Daemon,
+    seller: &mut Daemon,
+    trade_id: &str,
+) -> anyhow::Result<()> {
+    let sellers_deposit_psbt = set_up_trade(buyer, seller, env, trade_id).await?;
     let mut deposit_events = buyer
         .musig
         .publish_deposit_tx(PublishDepositTxRequest {
-            trade_id: trade_id.clone(),
+            trade_id: trade_id.to_owned(),
             peers_deposit_psbt: Some(sellers_deposit_psbt),
         })
         .await?
@@ -640,32 +676,17 @@ async fn c4_forced_close_of_two_daemons() -> anyhow::Result<()> {
     }
     assert!(confirmed, "the deposit transaction has 3 confirmations");
 
-    let subscribe = SubscribeTradeEventsRequest {
-        trade_id: trade_id.clone(),
-    };
-    let mut buyers_events = buyer
-        .musig
-        .subscribe_trade_events(subscribe.clone())
-        .await?
-        .into_inner();
-    let mut sellers_events = seller
-        .musig
-        .subscribe_trade_events(subscribe)
-        .await?
-        .into_inner();
-
-    // Messages E and F. The buyer never sends message G.
     let message_e = buyer
         .musig
         .get_partial_signatures(PartialSignaturesRequest {
-            trade_id: trade_id.clone(),
+            trade_id: trade_id.to_owned(),
             buyer_ready_to_release: true,
             ..PartialSignaturesRequest::default()
         })
         .await?
         .into_inner();
     let swap_request = |signature: Vec<u8>, seller_ready_to_release| SwapTxSignatureRequest {
-        trade_id: trade_id.clone(),
+        trade_id: trade_id.to_owned(),
         swap_tx_input_peers_partial_signature: signature,
         seller_ready_to_release,
     };
@@ -680,6 +701,49 @@ async fn c4_forced_close_of_two_daemons() -> anyhow::Result<()> {
         .musig
         .sign_swap_tx(swap_request(Vec::new(), true))
         .await?;
+    Ok(())
+}
+
+/// The event stream of a trade.
+async fn trade_events(
+    daemon: &mut Daemon,
+    trade_id: &str,
+) -> anyhow::Result<Streaming<TradeEvent>> {
+    let request = SubscribeTradeEventsRequest {
+        trade_id: trade_id.to_owned(),
+    };
+    Ok(daemon
+        .musig
+        .subscribe_trade_events(request)
+        .await?
+        .into_inner())
+}
+
+/// The first event of a new event stream of a trade: its current state.
+async fn trade_state(daemon: &mut Daemon, trade_id: &str) -> anyhow::Result<TradeEvent> {
+    let mut events = trade_events(daemon, trade_id).await?;
+    let first = tokio::time::timeout(WAIT, events.next())
+        .await?
+        .expect("the stream starts with the state")?;
+    assert_eq!(first.r#type(), TradeEventType::State);
+    Ok(first)
+}
+
+/// C1, C2, C4 (D7) through the real daemon: the seller releases, and the buyer does not answer.
+/// The seller's `musigd` publishes the swap transaction on its own before the buyer's warning
+/// transaction becomes valid. The buyer's `musigd` reads the seller's key share from the
+/// confirmed transaction, closes the trade and imports the payout. No request asks for any of
+/// this, and both wallets show the result.
+#[tokio::test(flavor = "multi_thread")]
+async fn c4_forced_close_of_two_daemons() -> anyhow::Result<()> {
+    let mut env = TestEnv::new()?;
+    env.mine_blocks(101)?;
+    let (mut buyer, mut seller) = funded_daemons(&mut env).await?;
+    let trade_id = "trade-1".to_owned();
+    confirm_deposit_and_release(&mut env, &mut buyer, &mut seller, &trade_id).await?;
+
+    let mut buyers_events = trade_events(&mut buyer, &trade_id).await?;
+    let mut sellers_events = trade_events(&mut seller, &trade_id).await?;
 
     // The warning lock time is 20 blocks and the release safety margin 6 blocks. At 14
     // confirmations of the deposit the seller's daemon sends the swap transaction.
@@ -700,6 +764,87 @@ async fn c4_forced_close_of_two_daemons() -> anyhow::Result<()> {
 
     // The buyer's wallet holds the payout of the trade, and the seller's wallet received his
     // deposit through the swap transaction.
+    let fee_limit = 10_000;
+    buyer
+        .wait_for_balance("buyer's payout", |balance| {
+            (FUNDING + TRADE_AMOUNT - fee_limit..=FUNDING + TRADE_AMOUNT).contains(&balance)
+        })
+        .await;
+    seller
+        .wait_for_balance("seller's deposit", |balance| {
+            (FUNDING - TRADE_AMOUNT - fee_limit..=FUNDING - TRADE_AMOUNT).contains(&balance)
+        })
+        .await;
+    Ok(())
+}
+
+/// H2, H3, H5 through the real daemon: both `musigd` processes are stopped and started again
+/// after the seller released. Their trades are loaded from the wallet databases, in the states
+/// in which they were stopped. Then the buyer's `musigd` is stopped again, and the seller's
+/// swap transaction is confirmed while it does not run. After its start the buyer's `musigd`
+/// evaluates the blocks that it missed, reads the key share from the swap transaction, closes
+/// the trade and imports the payout. The result is the result of a run without a stop.
+#[tokio::test(flavor = "multi_thread")]
+async fn h2_h5_restart_of_two_daemons_during_a_forced_close() -> anyhow::Result<()> {
+    let mut env = TestEnv::new()?;
+    env.mine_blocks(101)?;
+    let (mut buyer, mut seller) = funded_daemons(&mut env).await?;
+    let trade_id = "trade-1".to_owned();
+    confirm_deposit_and_release(&mut env, &mut buyer, &mut seller, &trade_id).await?;
+
+    buyer.restart(&env).await;
+    seller.restart(&env).await;
+    let buyers_state = trade_state(&mut buyer, &trade_id).await?;
+    assert_eq!(buyers_state.state(), TradeStateKind::BuyerReadyToRelease);
+    let sellers_state = trade_state(&mut seller, &trade_id).await?;
+    assert_eq!(sellers_state.state(), TradeStateKind::SellerReadyToRelease);
+    // H3: the seller's caller repeats the release after the restart and gets the key share
+    // again.
+    let repeated = seller
+        .musig
+        .sign_swap_tx(SwapTxSignatureRequest {
+            trade_id: trade_id.clone(),
+            swap_tx_input_peers_partial_signature: Vec::new(),
+            seller_ready_to_release: true,
+        })
+        .await?
+        .into_inner();
+    assert!(repeated.peer_output_prv_key_share.is_some());
+    // K2: the ID of the trade is known after the restart.
+    let duplicate = buyer
+        .musig
+        .init_trade(PubKeySharesRequest {
+            trade_id: trade_id.clone(),
+            my_role: Role::BuyerAsTaker.into(),
+        })
+        .await
+        .expect_err("the trade ID is used");
+    assert_eq!(duplicate.code(), Code::AlreadyExists);
+
+    // The buyer's daemon does not run while the seller's daemon closes by force.
+    buyer.stop();
+    let mut sellers_events = trade_events(&mut seller, &trade_id).await?;
+    mine_until_event(&mut env, &mut sellers_events, "swap sent", |event| {
+        event.r#type() == TradeEventType::TxSent && event.tx_kind() == TradeTxKind::SwapTx
+    })
+    .await?;
+    // The swap transaction is confirmed, with some blocks on top of it.
+    env.mine_blocks(4)?;
+
+    buyer.restart(&env).await;
+    let mut buyers_events = trade_events(&mut buyer, &trade_id).await?;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let closed = loop {
+        let event = tokio::time::timeout_at(deadline, buyers_events.next())
+            .await
+            .expect("the buyer's daemon finds the swap transaction in time")
+            .expect("the stream is open")?;
+        if event.r#type() == TradeEventType::State && event.state() == TradeStateKind::TradeClosed {
+            break event;
+        }
+    };
+    assert_eq!(closed.closure_type(), ClosureKind::Forced);
+
     let fee_limit = 10_000;
     buyer
         .wait_for_balance("buyer's payout", |balance| {

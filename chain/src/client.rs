@@ -402,6 +402,13 @@ pub trait ChainAccess: Send + Sync {
     /// Watches an output that is known to the caller, with its script.
     fn watch_output(&self, outpoint: OutPoint, script: ScriptBuf);
 
+    /// Watches outputs with their scripts for all blocks above the block `start`, which the
+    /// caller knows to be a block of the chain with the most work. Blocks that were evaluated
+    /// already are evaluated again for these outputs, and the chain does not count as synced
+    /// until that is done ([`Self::synced_height`]). A trade that was stored before a restart is
+    /// watched in this way from the block at which its deposit transaction was signed.
+    fn watch_outputs_from(&self, outputs: Vec<(OutPoint, ScriptBuf)>, start: (u32, BlockHash));
+
     /// The height of the last block of the chain with the most work, if the chain is known.
     fn tip_height(&self) -> Option<u32>;
 
@@ -837,6 +844,14 @@ impl ChainAccess for ChainClient {
 
     fn watch_output(&self, outpoint: OutPoint, script: ScriptBuf) {
         Self::watch_output(self, outpoint, script);
+    }
+
+    fn watch_outputs_from(&self, outputs: Vec<(OutPoint, ScriptBuf)>, start: (u32, BlockHash)) {
+        let (height, hash) = start;
+        // The client follows the chain from this block on, if it started at a later one.
+        self.lower_base(HashCheckpoint::new(height, hash));
+        let (outpoints, scripts): (Vec<_>, Vec<_>) = outputs.into_iter().unzip();
+        self.watch_from(scripts, outpoints, height);
     }
 
     fn tip_height(&self) -> Option<u32> {
