@@ -6,8 +6,9 @@ Status: plan only, no code was changed. Revision 2, written 2026-11-17 against `
 Revision 3 (same day) includes the answers to the open questions of revision 2. The questions and
 answers are kept in section 12 for a later review.
 
-WP1 was carried out on 2026-11-18 (branches `wp1-first-steps`, `wp1-move-trade-model`,
-`wp1-finish`). Its result is described in section 8 under WP1. The file and line references of
+WP1 and most of WP2 were carried out on 2026-11-18 (branches `wp1-first-steps`,
+`wp1-move-trade-model`, `wp1-finish`, `wp2-wallet-integration`). The results are described in
+section 8 under WP1 and WP2. The file and line references of
 the plan point to the code after WP1. The other text of the plan still describes the state of
 revision 3; sections 2 and 4.3 and the findings name what WP1 changed.
 
@@ -235,7 +236,7 @@ with a running test.
 | F2 | `InitTrade` with an existing trade id replaces the stored trade. | Was `rpc/src/protocol.rs:34`. Fixed in WP1: `add_trade_model` rejects a stored trade id (`protocol/src/trade_model.rs:55`). | A repeated or hostile local call destroys the key shares of a running trade. With D10 a repeated trade id would also produce the same key shares again (N6). Confirmed. |
 | F3 | No transaction is broadcast and no confirmation is observed. | `rpc/src/server.rs:146`, `:280`, `:299`, `:356`, `:417`, `:434` | The service cannot run a real trade. Confirmed. |
 | F4 | The dispute outcomes cannot be reached. | The `todo!()` was at `rpc/src/protocol.rs:795`. Replaced by an error in WP1 (`protocol/src/trade_model.rs:1783`). No RPC publishes a warning. | Half of the state machine is unused. A `todo!()` panic also poisons the trade mutex, so later calls for this trade panic too (`rpc/src/server.rs:121`). Confirmed. |
-| F5 | The payout key is checked but not imported into the wallet at close. | TODO at `protocol/src/trade_model.rs:1765` | After a cooperative close the user cannot spend the payout. Confirmed. |
+| F5 | The payout key is checked but not imported into the wallet at close. | TODO at `protocol/src/trade_model.rs:1765` | After a cooperative close the user cannot spend the payout. Confirmed. Fixed in WP2: `import_my_payout_key`. |
 | F6 | The seller can release near or after the buyer's warning lock time. | Comment at `protocol/src/trade_model.rs:758-762` | The buyer's warning transaction can replace the swap transaction. The seller then has no penalty transaction and can only redirect. Confirmed as a design gap. |
 | F7 | Private key shares are written to the log at debug and trace level. | `rpc/build.rs:37`, `:53`, `:56` serialise them as base64; `rpc/src/server.rs:591-623` logs requests and responses | Secrets on disk when verbose logging is on. `BMPProtocol` also logged a private key; it was removed in WP1. Confirmed. |
 | F8 | No authentication or TLS on the gRPC port. | `rpc/src/bin/musigd.rs:80-132` | Any local process can call `SignSwapTx` or `CloseTrade` for a known trade id, or use the wallet service. Confirmed. D11 accepts this risk; see section 7.2, N7. |
@@ -247,14 +248,14 @@ with a running test.
 
 | # | Finding | Evidence | Impact |
 |---|---|---|---|
-| F12 | Addresses and internal keys are issued again after 50 unused ones. | `wallet/src/bmp_wallet.rs:194-227`, used by `new_address` and `new_internal_key` at `:792-801` | A trade uses 4 to 5 wallet keys that normally never receive funds. After about 10 trades, keys and addresses of earlier trades are reused in new trades. The rotation position is not persisted. Confirmed. |
-| F13 | Coins selected for a deposit are not reserved. | `create_psbt` at `wallet/src/bmp_wallet.rs:803`; the lock API exists but the protocol does not call it | Two trades, or a trade and a payment, can select the same coin. Confirmed. Upstream issues #59 and #185. |
-| F14 | The wallet cannot record a transaction that it did not create itself. | No such method; only `send_to_address` records its transaction | The wallet learns about the deposit only when a block is scanned. Confirmed (survey). |
+| F12 | Addresses and internal keys are issued again after 50 unused ones. | `wallet/src/bmp_wallet.rs:194-227`, used by `new_address` and `new_internal_key` at `:792-801` | A trade uses 4 to 5 wallet keys that normally never receive funds. After about 10 trades, keys and addresses of earlier trades are reused in new trades. The rotation position is not persisted. Confirmed. Fixed in WP2 for keys of trades: `BMPWallet::new_trade_address`. |
+| F13 | Coins selected for a deposit are not reserved. | `create_psbt` at `wallet/src/bmp_wallet.rs:803`; the lock API exists but the protocol does not call it | Two trades, or a trade and a payment, can select the same coin. Confirmed. Upstream issues #59 and #185. Fixed in WP2: the engine locks the deposit inputs and releases them with `abandon`. |
+| F14 | The wallet cannot record a transaction that it did not create itself. | No such method; only `send_to_address` records its transaction | The wallet learns about the deposit only when a block is scanned. Confirmed (survey). Fixed in WP2: `ProtocolWalletApi::record_transaction`. |
 | F15 | Every transaction spends all unlocked imported coins. | `wallet/src/coin_selection.rs:22-51` | This moves trade payouts early, which protects against a late warning transaction. It also links trades on chain and ignores coins that the caller selected by hand. D8 keeps this rule. Confirmed. |
-| F16 | `BMPWallet::sign` panics when a PSBT input has no `witness_utxo`. | `wallet/src/bmp_wallet.rs:1008` | A PSBT from the peer can stop the process. `psbt.rs` checks this for the deposit, so the risk is in other callers. Confirmed. |
-| F17 | Database files of imported keys are not encrypted. | `wallet/src/bmp_wallet.rs:677` opens the file without `PRAGMA key`; compare `:727-729` | Descriptors with the peer's keys and the transaction history are stored in plain SQLite. The secret keys are in the encrypted main database. Confirmed. |
+| F16 | `BMPWallet::sign` panics when a PSBT input has no `witness_utxo`. | `wallet/src/bmp_wallet.rs:1008` | A PSBT from the peer can stop the process. `psbt.rs` checks this for the deposit, so the risk is in other callers. Confirmed. Fixed in WP2. |
+| F17 | Database files of imported keys are not encrypted. | `wallet/src/bmp_wallet.rs:677` opens the file without `PRAGMA key`; compare `:727-729` | Descriptors with the peer's keys and the transaction history are stored in plain SQLite. The secret keys are in the encrypted main database. Confirmed. Fixed in WP2: the files have a key of their own, stored in the main database. |
 | F18 | The sync loop ends after the first error. | `rpc/src/bmp_wallet_service.rs:289`, `:307` | No more wallet updates until restart. Upstream issue #190. Confirmed. |
-| F19 | A new imported key makes the next sync start at the genesis block. | `load_imported_wallet` creates the sub-wallet with `Wallet::create_single` and sets no checkpoint (`wallet/src/bmp_wallet.rs:688-690`). Every sync uses `ScanType::Sync` (`wallet/src/chain_data_source.rs:37`). `bdk_kyoto` 0.17.0 starts the filter scan at the lowest checkpoint of all wallets (`build_with_wallets` in its `builder.rs`). The constant `RECOVERY_HEIGHT` is defined but not used. | On mainnet every closed trade would start a filter download from height 0. With D2 there is no other chain backend, so this must be fixed in WP2: the sub-wallet must start at the height of the deposit. Confirmed by reading the code; not reproduced with a test. Upstream issue #202 is related. |
+| F19 | A new imported key makes the next sync start at the genesis block. | `load_imported_wallet` creates the sub-wallet with `Wallet::create_single` and sets no checkpoint (`wallet/src/bmp_wallet.rs:688-690`). Every sync uses `ScanType::Sync` (`wallet/src/chain_data_source.rs:37`). `bdk_kyoto` 0.17.0 starts the filter scan at the lowest checkpoint of all wallets (`build_with_wallets` in its `builder.rs`). The constant `RECOVERY_HEIGHT` is defined but not used. | On mainnet every closed trade would start a filter download from height 0. With D2 there is no other chain backend, so this must be fixed in WP2: the sub-wallet must start at the height of the deposit. Confirmed by reading the code; not reproduced with a test. Upstream issue #202 is related. Fixed in WP2: `import_private_key_since`; reproduced and tested with a filter sync (test I7). |
 | F20 | No fee bumping: no CPFP for anchors, no replace-by-fee. | No code; upstream issue #187 | A pre-signed transaction with a low fee cannot be accelerated. |
 | F21 | No code watches a transaction id or an outpoint. | No code; upstream issue #61 | Required for every reaction of the protocol. |
 | F22 | `CBFScanner::from_hostnames` panics on malformed input. | `chain/src/lib.rs:113`, `:116` | Start-up crash on a configuration error. Upstream issue #193. Confirmed. |
@@ -433,6 +434,29 @@ Status on 2026-11-18: done, with these differences to the list above.
 
 Done when: a trade on regtest reserves, spends and releases real coins, both wallets can spend
 their payout after the close, and the same seed gives the same key shares for the same trade id.
+
+Status on 2026-11-18 (branch `wp2-wallet-integration`): the three conditions hold and are tested
+(`protocol/tests/trade_model_integration_tests.rs`, `wallet/src/key_shares.rs`). The rules are
+specified in `docs/specifications/wallet/`. Done: shared wallet (in WP1), key shares from the
+seed (D10), reservation and release of the deposit coins with the new request `AbandonTrade`
+(F13), record of the deposit transaction (F14), fresh keys for trades (F12), import of the payout
+key with a start height (F5, F19), drain with signing, recording and the request `Close` (D8),
+no panic in `sign` (F16), encrypted files of imported keys (F17), lock methods of the mock
+wallet.
+
+Not done:
+
+- Fee bumping (F20): no child transaction for an anchor, no replace-by-fee. The users of these
+  functions are the reactions of WP4, and sending a parent with its child needs the package
+  submission of WP3. Tests C5, E9, E10, E15, F5.
+- Sending the stored drain transaction again at the next start, and replacing it (N5, test M4,
+  M8). This needs the rebroadcast of pull request #235 and WP3.
+- Coins that stay reserved when `musigd` stops during a setup (test H1 after a restart, H8).
+  This needs the trade store of WP5.
+- The swap transaction and the custom payout transaction are not recorded in the wallet, because
+  the service does not send them yet (WP3).
+- A restore of the wallet from its seed words that finds funds behind the keys of trades (open
+  point W1 of the wallet specification).
 
 ### WP3 Chain access for the engine (estimate: 4 to 6 weeks; issues #61, #188, #190, #196)
 

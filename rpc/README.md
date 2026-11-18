@@ -10,7 +10,13 @@ them by `build.rs` (into `src/pb`), the Java code by Maven. The server hosts the
 | `wallet.Wallet`  | `bmp_wallet.proto` | Bisq2-facing wallet API backed by a persistent `BMPWallet`; derived from bisq2's own `wallet.proto` (see below) |
 
 `musigd` serves `Musig` always, and `wallet.Wallet` when started with `--wallet-dir`. The trade service uses the wallet
-of the wallet service: a trade can be started only when `musigd` runs with `--wallet-dir` and the wallet is open.
+of the wallet service: every request of a trade needs `musigd` to run with `--wallet-dir` and the wallet to be open.
+
+The engine takes the key shares, keys, addresses and coins of a trade from this wallet. It reserves the coins of the
+deposit, and `AbandonTrade` releases them for a trade whose deposit is not signed yet. At the close of a trade the key
+of the payout is imported into the wallet. `Close` of `wallet.Wallet` moves the payouts of closed trades to the seed
+wallet; bisq2 calls it when the user ends the program. The rules are in
+[docs/specifications/wallet](../docs/specifications/wallet/README.md).
 
 The lock times of the trades are configuration values of `musigd`, not fields of a request. `musigd` reads them from
 the environment when it starts (an option of the same meaning has priority):

@@ -15,8 +15,9 @@ The risk ends for both traders as soon as one payout is spent by a confirmed tra
 
 1. **The payout is imported into the wallet at close.** The engine gives the wallet the secret key
    of the payout and the script of the output. The wallet shows the payout as part of the balance
-   and can spend it. The wallet starts to scan for this key at the height of the deposit, not at
-   the first block of the chain.
+   and can spend it. The wallet starts to scan for this key above the height of the chain tip
+   that it knew when the trader signed the deposit transaction, not at the first block of the
+   chain ([../wallet/imported-keys.md](../wallet/imported-keys.md)).
 2. **Imported coins are spent first.** Every transaction that the wallet builds spends all
    imported coins that are not reserved for an open trade. This rule cannot be switched off.
 3. **The engine watches closed trades.** While `musigd` runs and both payouts of a closed trade

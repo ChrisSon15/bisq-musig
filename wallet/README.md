@@ -34,8 +34,14 @@ addresses at `m/86'/coin_type'/0'/1/*`.
 The path `m/86'/coin_type'/0'/2'` is reserved for the key shares of the trade protocol. The wallet
 must never use it for an address. The rule for deriving the key shares, with test vectors, is
 specified in
-[docs/specifications/trade/key-derivation.md](../docs/specifications/trade/key-derivation.md). The
-derivation is not implemented yet.
+[docs/specifications/trade/key-derivation.md](../docs/specifications/trade/key-derivation.md). It
+is implemented in `src/key_shares.rs`.
+
+## Functions for trades
+
+What the wallet does for the trade engine is specified in
+[docs/specifications/wallet](../docs/specifications/wallet/README.md): keys and addresses of
+trades, reservation of coins, recording of transactions, imported keys of payouts and the drain.
 
 # Running tests
 

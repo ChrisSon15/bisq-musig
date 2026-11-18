@@ -102,7 +102,7 @@ Points that were open and are decided:
 
 `trade-states.md` contains three things that `protocol/src/state.rs` does not have:
 
-- the closure types `Abandoned` and `DepositAborted`;
+- the closure type `DepositAborted` (`Abandoned` exists in the code);
 - the state change from `SellerReadyToRelease` to `BuyersWarning` for the seller. Without it the
   seller's engine has no state for a buyer who publishes his warning transaction after the
   seller released;

@@ -50,6 +50,7 @@ trade before the request.
 | `CloseTrade` without data | Seller | `SellerReadyToRelease` | Publishes the swap transaction. | [closing.md](closing.md) |
 | `SignCustomPayoutTx` | Both | `Deposit`, `BuyerReadyToRelease` | Signs a custom payout. | [closing.md](closing.md) |
 | `CustomCloseTrade` | Both | `CustomPayoutSigned` | Takes the peer's custom payout PSBT. Finalises and publishes. | [closing.md](closing.md) |
+| `AbandonTrade` | Both | `Init` | Ends the trade and releases the reserved coins. Refused when the trader has signed the deposit transaction. | [setup-and-deposit.md](setup-and-deposit.md) |
 
 `CloseTrade` with a swap transaction, by which the buyer passes the swap transaction to his
 engine, exists for tests. In operation the buyer's engine finds the transaction on the chain.
@@ -59,9 +60,8 @@ Requests that the interface needs in addition:
 | Request | Role | Meaning | Defined in |
 |---|---|---|---|
 | Publish the warning transaction | Both | Starts the dispute path | [dispute.md](dispute.md) |
-| Abandon the trade | Both | Ends a trade in `Init` | [setup-and-deposit.md](setup-and-deposit.md) |
 | Events of a trade | Both | One stream per trade: state changes, the terminated mark, transactions sent and confirmed, deadlines as block heights, actions that the user must take, losses | [chain-observation.md](chain-observation.md) |
-| Close of the wallet service | - | Drains the imported coins when the user ends the program | [post-trade-protection.md](post-trade-protection.md) |
+| Close of the wallet service (exists as `Close` of `wallet.Wallet`) | - | Drains the imported coins when the user ends the program | [post-trade-protection.md](post-trade-protection.md) |
 
 Changes of existing messages that this specification requires:
 
@@ -78,10 +78,12 @@ Changes of existing messages that this specification requires:
 The trade service uses the wallet of the wallet service of the same `musigd` process. It has no
 wallet of its own.
 
-- A request that needs the wallet is refused while no wallet is open. The trade is not changed,
-  and the request can be sent again when the wallet is open.
-- These requests need the wallet: `InitTrade`, `GetNonceShares`, `SignDepositTx`,
-  `SignCustomPayoutTx`, `CustomCloseTrade`.
+- Every request of the trade service needs the open wallet. While no wallet is open, a request is
+  refused. The trade is not changed, and the request can be sent again when the wallet is open.
+- The engine uses the wallet for the key shares, the keys and addresses of a trade, the coins of
+  the deposit and their reservation, the signatures of the wallet, the record of the deposit
+  transaction, and the import of the payout key
+  ([../wallet/README.md](../wallet/README.md)).
 - A `musigd` process that was started without a wallet directory cannot start a trade.
 
 Rationale: the deposit is paid from the coins of the user, and every key and address of a trade
