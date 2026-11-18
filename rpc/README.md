@@ -58,10 +58,14 @@ RPC, which carries the wallet password. Before that, `IsWalletReady` tells a cli
 wallet database exists in the directory (`exists`) and whether it has been opened (`open`), so it can tell whether
 `OpenOrCreateWallet` would open its wallet or create a new, empty one. The wallet syncs over Compact Block Filters
 from the peers given with `--wallet-peer <host:port>` (repeatable), re-syncing every `--wallet-poll-secs` seconds;
-with no peer it does not sync, but all non-chain operations still work. `--wallet-network` selects the network (default `regtest`). Transactions are
-broadcast via a Bitcoin Core RPC connection, by default to `http://localhost:18443` (`--bitcoin-rpc-url`),
-authenticated with `--bitcoin-rpc-user` / `--bitcoin-rpc-pass` if given. A `bitcoind` regtest instance may be started
-up as follows:
+with no peer it does not sync, but all non-chain operations still work. `--wallet-network` selects the network (default `regtest`).
+
+All access to the chain goes through these peers, over the Bitcoin peer-to-peer network: the wallet sync, the
+observation of the transactions of a trade, and the sending of transactions. One long-running connection serves the
+wallet and the trade service. `musigd` connects only to the given peers and has no connection to the RPC interface of
+a node. A peer must serve compact block filters. While no peer is reachable, `musigd` keeps trying to connect, the
+wallet does not sync, and the trade service refuses the requests that need the chain. A `bitcoind` regtest instance
+that can serve as the peer may be started up as follows:
 
 ```sh
 bitcoind -regtest -prune=0 -txindex=1 -blockfilterindex=1 -peerblockfilters=1 -server \
@@ -101,8 +105,7 @@ cargo run --bin musigd
 or, to also serve the Bisq2-facing wallet:
 
 ```sh
-cargo run --bin musigd -- --wallet-dir /tmp/bmp-wallet --wallet-peer 127.0.0.1:18444 \
-  --bitcoin-rpc-user bitcoin --bitcoin-rpc-pass bitcoin
+cargo run --bin musigd -- --wallet-dir /tmp/bmp-wallet --wallet-peer 127.0.0.1:18444
 ```
 
 The following Java clients are run from this directory (`rpc`):
