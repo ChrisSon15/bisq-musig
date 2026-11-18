@@ -14,7 +14,7 @@ use tokio::time::{self, Duration};
 use tonic::{Request, Response, Result, Status};
 use tracing::{Span, debug, error, info, instrument, trace};
 
-use crate::pb::convert::{CheckInSignedRange as _, TryProtoInto};
+use crate::pb::convert::{CheckInSignedRange as _, TryProtoInto as _};
 pub use crate::pb::musigrpc::musig_server::MusigServer;
 use crate::pb::musigrpc::{
     CloseTradeRequest, CloseTradeResponse, CustomCloseTradeRequest, CustomCloseTradeResponse,
@@ -24,7 +24,9 @@ use crate::pb::musigrpc::{
     SubscribeTxConfirmationStatusRequest, SwapTxSignatureRequest, SwapTxSignatureResponse,
     TxConfirmationStatus, musig_server,
 };
-use crate::protocol::{ExchangedKeys, TRADE_MODELS, TradeModel, TradeModelStore as _};
+use crate::protocol::{
+    ExchangedKeys, ProtocolErrorKind, TRADE_MODELS, TradeModel, TradeModelStore as _,
+};
 
 #[derive(Debug, Default)]
 pub struct MusigImpl {}
@@ -97,7 +99,8 @@ impl musig_server::Musig for MusigImpl {
                     .ok_or_else(|| Status::not_found("missing request.peers_nonce_shares"))?;
                 trade_model.set_peer_half_deposit_psbt((&peer_nonce_shares.half_deposit_psbt[..]).try_proto_into()?);
                 trade_model.compute_unsigned_deposit_tx()?;
-                trade_model.set_redirection_receivers(request.redirection_receivers.into_iter().map(TryProtoInto::try_proto_into))?;
+                trade_model.set_redirection_receivers(request.redirection_receivers.into_iter()
+                    .map(|receiver| receiver.try_proto_into().map_err(HandlerError::from)))?;
                 trade_model.check_redirect_tx_params()?;
                 let (addresses, nonce_shares) = peer_nonce_shares.try_proto_into()?;
                 trade_model.set_peer_addresses(addresses)?;
@@ -164,7 +167,7 @@ impl musig_server::Musig for MusigImpl {
     async fn sign_swap_tx(&self, request: Request<SwapTxSignatureRequest>) -> Result<Response<SwapTxSignatureResponse>> {
         handle_musig_request(request, move |request, trade_model| {
             if trade_model.am_buyer() {
-                return Err(Status::failed_precondition("operation only available for seller"));
+                return Err(Status::failed_precondition("operation only available for seller").into());
             }
             if request.seller_ready_to_release {
                 trade_model.compute_signed_swap_tx()?;
@@ -351,12 +354,46 @@ impl_musig_req!(CloseTradeRequest);
 impl_musig_req!(CustomPayoutPsbtRequest);
 impl_musig_req!(CustomCloseTradeRequest);
 
+/// The error of a `musigrpc.Musig` handler: a status that the handler created itself, or an error
+/// of the trade engine. The trade engine does not know gRPC, so its errors are converted to a
+/// status here, when the response is sent.
+enum HandlerError {
+    Status(Status),
+    Protocol(ProtocolErrorKind),
+}
+
+impl From<Status> for HandlerError {
+    fn from(value: Status) -> Self {
+        Self::Status(value)
+    }
+}
+
+impl From<ProtocolErrorKind> for HandlerError {
+    fn from(value: ProtocolErrorKind) -> Self {
+        Self::Protocol(value)
+    }
+}
+
+impl From<HandlerError> for Status {
+    fn from(value: HandlerError) -> Self {
+        match value {
+            HandlerError::Status(status) => status,
+            HandlerError::Protocol(e @ ProtocolErrorKind::DuplicateTradeId(_)) => {
+                Self::already_exists(e.to_string())
+            }
+            HandlerError::Protocol(e) => Self::internal(e.to_string()),
+        }
+    }
+}
+
 // TODO: These wrapper fns don't work with async handlers, and should eventually be changed to do so:
 
 fn handle_musig_request<Req, Res, F>(request: Request<Req>, handler: F) -> Result<Response<Res>>
-    where Req: MusigRequest,
-          Res: Serialize,
-          F: FnOnce(Req, &mut TradeModel) -> Result<Res> {
+where
+    Req: MusigRequest,
+    Res: Serialize,
+    F: FnOnce(Req, &mut TradeModel) -> Result<Res, HandlerError>,
+{
     handle_request(request, move |request| {
         let trade_model = TRADE_MODELS.get_trade_model(request.trade_id())
             .ok_or_else(|| Status::not_found(format!("missing trade with id: {}", request.trade_id())))?;
@@ -367,13 +404,16 @@ fn handle_musig_request<Req, Res, F>(request: Request<Req>, handler: F) -> Resul
 }
 
 fn handle_request<Req, Res, F>(request: Request<Req>, handler: F) -> Result<Response<Res>>
-    where Req: Serialize,
-          Res: Serialize,
-          F: FnOnce(Req) -> Result<Res> {
+where
+    Req: Serialize,
+    Res: Serialize,
+    F: FnOnce(Req) -> Result<Res, HandlerError>,
+{
     let message = LazyJson(request.get_ref());
     debug!(%message, "Got a request.");
 
     let response = handler(request.into_inner())
+        .map_err(Status::from)
         .inspect_err(|e| error!("Error response: {e}"))?;
 
     let message = LazyJson(&response);

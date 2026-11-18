@@ -12,9 +12,7 @@ use tonic::{Result, Status};
 use crate::pb::musigrpc::{
     self, NonceSharesMessage, PartialSignaturesMessage, ReceiverAddressAndAmount,
 };
-use crate::protocol::{
-    ContractualTxids, ExchangedAddresses, ExchangedNonces, ExchangedSigs, ProtocolErrorKind, Role,
-};
+use crate::protocol::{ContractualTxids, ExchangedAddresses, ExchangedNonces, ExchangedSigs, Role};
 use crate::storage::{ByRef, ByVal};
 
 /// Serializers that stand in for a secret's value.
@@ -251,15 +249,6 @@ impl From<ExchangedSigs<'_, ByRef>> for PartialSignaturesMessage {
             value.swap_tx_input_sighash.map(|s| s.as_byte_array().into()),
             contractual_tx_ids:
             value.contractual_txids.map(ContractualTxids::into),
-        }
-    }
-}
-
-impl From<ProtocolErrorKind> for Status {
-    fn from(value: ProtocolErrorKind) -> Self {
-        match value {
-            ProtocolErrorKind::DuplicateTradeId(_) => Self::already_exists(value.to_string()),
-            _ => Self::internal(value.to_string()),
         }
     }
 }
