@@ -246,32 +246,6 @@ impl TestEnv {
         self.dirs.alloc(tmp).path()
     }
 
-    /// Create a new test environment with ZMQ enabled on bitcoind.
-    ///
-    /// The ZMQ socket addresses are available via
-    /// [`zmq_pub_raw_tx_socket`](Self::zmq_pub_raw_tx_socket) and
-    /// [`zmq_pub_raw_block_socket`](Self::zmq_pub_raw_block_socket).
-    pub fn enable_zmq() -> Result<Self> {
-        let mut config = Config::default();
-        config.bitcoind.enable_zmq = true;
-        Self::new_with_conf(config)
-    }
-
-    /// ZMQ socket for raw transaction notifications (set when created via
-    /// [`enable_zmq`](Self::enable_zmq)).
-    pub fn zmq_pub_raw_tx_socket(&self) -> Option<String> {
-        self.bitcoind
-            .params
-            .zmq_pub_raw_tx_socket
-            .map(|socket| format!("tcp://{socket}"))
-    }
-
-    /// ZMQ socket for raw block notifications (set when created via
-    /// [`enable_zmq`](Self::enable_zmq)).
-    pub const fn zmq_pub_raw_block_socket(&self) -> Option<SocketAddrV4> {
-        self.bitcoind.params.zmq_pub_raw_block_socket
-    }
-
     /// create environment with automatic downloads
     pub fn new_with_conf(config: Config) -> Result<Self> {
         let guard = if config.runmultithreaded {
@@ -948,34 +922,6 @@ mod tests {
         env.start_explorer_in_container()?;
         env.mine_block()?;
         // put a breakpoint on the Ok statement so you inspect the blockchain before it is dropped
-        Ok(())
-    }
-
-    #[test]
-    fn test_enable_zmq() -> Result<()> {
-        let mut env = TestEnv::enable_zmq()?;
-
-        // Verify ZMQ sockets were assigned
-        let tx_socket = env.zmq_pub_raw_tx_socket().expect("zmq rawtx socket");
-        let block_socket = env.zmq_pub_raw_block_socket().expect("zmq rawblock socket");
-        tracing::info!("ZMQ rawtx={tx_socket}, rawblock={block_socket}");
-
-        // Verify the environment is fully functional with ZMQ enabled
-        assert!(env.block_count().is_ok());
-        env.mine_block()?;
-
-        // Verify ZMQ is configured by querying bitcoind
-        let rpc = env.bitcoin_core_rpc_client()?;
-        let notifications: serde_json::Value = rpc.call("getzmqnotifications", &[])?;
-        let types: Vec<&str> = notifications
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|n| n["type"].as_str().unwrap())
-            .collect();
-        assert!(types.contains(&"pubrawtx"));
-        assert!(types.contains(&"pubrawblock"));
-
         Ok(())
     }
 

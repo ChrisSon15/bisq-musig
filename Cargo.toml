@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["chain", "protocol", "rpc", "wallet", "testenv", "bmp_tracing", "mem"]
+members = ["chain", "protocol", "rpc", "wallet", "testenv", "bmp_tracing"]
 
 [workspace.dependencies]
 anyhow = "1.0.104"

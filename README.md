@@ -29,7 +29,6 @@ The code is organised as a Cargo workspace:
 | `chain`                         | Small traits (`ChainApi`, `ChainScanner`) that decouple the wallets from a specific chain backend                         |
 | [`rpc`](rpc/README.md)          | gRPC server (`musigd`) and Java test clients                                                                              |
 | [`testenv`](testenv/README.md)  | Spins up `bitcoind` + `electrs` on regtest for the integration tests                                                      |
-| `mem`                           | ZMQ helper for streaming unconfirmed transactions                                                                         |
 | `bmp_tracing`                   | Shared tracing/logging initialisation                                                                                     |
 
 ## docs

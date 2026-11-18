@@ -134,7 +134,6 @@ The main environment manager that handles both bitcoind and electrs instances.
 
 - `TestEnv::new()` - Creates environment with automatic downloads
 - `TestEnv::new_with_conf(config)` - Creates environment with custom configuration
-- `TestEnv::enable_zmq()` - Creates environment with ZMQ notifications enabled on bitcoind
 - `TestEnvBuilder` - Builder for a fixed RPC password and/or persistent data directory
 
 #### Client Access
@@ -147,7 +146,6 @@ The main environment manager that handles both bitcoind and electrs instances.
 - `esplora_url()` - Get Esplora REST URL (if available)
 - `bitcoin_rpc_port()` / `bitcoin_rpc_password()` - RPC connection details (user is `bitcoin`)
 - `p2p_socket_addr()` - bitcoind's P2P address, e.g. for Compact Block Filter syncing
-- `zmq_pub_raw_tx_socket()` / `zmq_pub_raw_block_socket()` - ZMQ endpoints (with `enable_zmq()`)
 
 `TestEnv` itself also implements `ChainScanner`.
 
