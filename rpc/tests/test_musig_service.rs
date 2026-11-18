@@ -28,7 +28,8 @@ use bdk_wallet::bitcoin::{
     Address, Amount, BlockHash, Network, OutPoint, Psbt, ScriptBuf, Sequence, TapSighashType,
     Transaction, TxIn, TxOut, Txid, XOnlyPublicKey, absolute, consensus, taproot,
 };
-use chain::client::{BroadcastFuture, ChainAccess, ChainEvent, ConfirmedTx};
+use chain::ChainApiError;
+use chain::client::{BroadcastFuture, ChainAccess, ChainEvent, ConfirmedTx, PeerProblem};
 use futures_util::StreamExt as _;
 use musig2::secp::{Point, Scalar};
 use protocol::mocks::{mock_buyer_trade_wallet, mock_seller_trade_wallet};
@@ -185,6 +186,8 @@ struct FakeChainState {
     sent: Vec<Transaction>,
     confirmed: HashMap<Txid, ConfirmedTx>,
     watched_outputs: Vec<OutPoint>,
+    /// A problem with the peers that the chain reports. While it lasts, a broadcast fails.
+    peer_problem: Option<PeerProblem>,
 }
 
 impl FakeChain {
@@ -197,6 +200,7 @@ impl FakeChain {
                 sent: Vec::new(),
                 confirmed: HashMap::new(),
                 watched_outputs: Vec::new(),
+                peer_problem: None,
             }),
             events: broadcast::channel(64).0,
         })
@@ -210,6 +214,14 @@ impl FakeChain {
         self.state.lock().unwrap().watched_outputs.clone()
     }
 
+    /// Starts or ends a problem with the peers.
+    fn set_peer_problem(&self, problem: Option<PeerProblem>) {
+        self.state.lock().unwrap().peer_problem = problem;
+        // The service looks at the chain again after every event.
+        let height = self.state.lock().unwrap().height;
+        let _ = self.events.send(ChainEvent::Synced { height });
+    }
+
     /// Adds a block with the transactions `txs` to the chain.
     fn mine(&self, txs: &[Transaction]) {
         let height = {
@@ -221,6 +233,7 @@ impl FakeChain {
                     tx: Arc::new(tx.clone()),
                     height,
                     block_hash: BlockHash::all_zeros(),
+                    block_time: 0,
                 };
                 state.confirmed.insert(tx.compute_txid(), confirmed);
             }
@@ -281,13 +294,21 @@ impl ChainAccess for FakeChain {
             .cloned()
     }
 
+    fn peer_problem(&self) -> Option<PeerProblem> {
+        self.state.lock().unwrap().peer_problem
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<ChainEvent> {
         self.events.subscribe()
     }
 
     fn broadcast(&self, tx: Transaction) -> BroadcastFuture {
         let txid = tx.compute_txid();
-        self.state.lock().unwrap().sent.push(tx);
+        let mut state = self.state.lock().unwrap();
+        if let Some(problem) = state.peer_problem {
+            return Box::pin(async move { Err(ChainApiError::backend(problem)) });
+        }
+        state.sent.push(tx);
         Box::pin(async move { Ok(txid) })
     }
 }
