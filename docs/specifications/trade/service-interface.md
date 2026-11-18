@@ -163,6 +163,31 @@ Every error tells the caller which of these cases applies:
 A request never leaves the caller without a statement about the state of the trade: after every
 error the state is the state before the request, except that the trade can be terminated.
 
+### The case in the metadata of an error
+
+Every error status of the trade service names its case in its metadata. The caller does not have
+to read the text of the message, and it does not depend on the status code, which several cases
+share.
+
+| Metadata key | Value |
+|---|---|
+| `musig-error-case` | The case, from the table below |
+| `musig-error-retry` | Whether the same request can succeed when it is sent again later, without another request in between: `later`, `never` or `unknown` |
+
+| Value of `musig-error-case` | Case of the table above | `musig-error-retry` |
+|---|---|---|
+| `refused` | Refused: a precondition of the trade does not hold (role, state, order), or data of the caller is invalid | `never` |
+| `refused-for-now` | Refused: a condition of the chain does not hold yet (confirmations, a lock time, a margin) | `later` |
+| `terminated` | Terminated | `never` |
+| `unknown-trade` | Unknown trade | `never` |
+| `trade-id-used` | Known trade ID | `never` |
+| `temporary` | Temporary: no wallet is open, no access to the chain, no peer is reachable, or the trade could not be stored | `later` |
+| `trades-not-loaded` | The trades of the wallet could not be loaded ([persistence-and-recovery.md](persistence-and-recovery.md)) | `never` |
+| `internal` | Internal | `unknown` |
+
+`never` means: not with the same request in the same state of the trade. A request that was
+refused for the state can succeed after another request has changed the state.
+
 The assignment of these cases to gRPC status codes and error details is open point O11 in
 [README.md](README.md). Until it is decided, the service uses these status codes, and the message
 of the status describes the reason:

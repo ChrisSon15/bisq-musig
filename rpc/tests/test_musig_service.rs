@@ -51,7 +51,9 @@ use rpc::pb::musigrpc::{
     TradeDeadline, TradeDeadlineKind, TradeEvent, TradeEventType, TradeStateKind, TradeTxKind,
     TradeUserAction, TxConfirmationStatus,
 };
-use rpc::server::{MusigImpl, MusigServer, TradeWalletProvider, WalletOperation, restore_trades};
+use rpc::server::{
+    ErrorCase, MusigImpl, MusigServer, TradeWalletProvider, WalletOperation, restore_trades,
+};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tonic::transport::server::TcpIncoming;
@@ -2680,6 +2682,8 @@ async fn h6_damaged_record_stops_the_trade_service() {
         })
         .await;
     assert_refused(result, Code::DataLoss, "could not be loaded");
+    let result = trade.buyer.start_payment().await;
+    assert_error_case(result, ErrorCase::TradesNotLoaded);
 }
 
 /// H4: the trade cannot be stored. The request fails, and no key share and no signature of it
@@ -3855,6 +3859,96 @@ async fn k1_every_call_in_every_stage() {
         "unexpected results:\n{}",
         differences.join("\n")
     );
+}
+
+/// The case and the retry advice that the metadata of an error status name.
+fn error_case<T>(result: Result<T, Status>) -> (String, String) {
+    let Err(status) = result else {
+        panic!("the request must fail")
+    };
+    let value = |key: &str| {
+        status
+            .metadata()
+            .get(key)
+            .unwrap_or_else(|| panic!("the status has no metadata {key}: {status}"))
+            .to_str()
+            .expect("text")
+            .to_owned()
+    };
+    (value(ErrorCase::KEY), value(ErrorCase::RETRY_KEY))
+}
+
+#[track_caller]
+fn assert_error_case<T>(result: Result<T, Status>, case: ErrorCase) {
+    let expected = (case.name().to_owned(), case.retry().to_owned());
+    assert_eq!(error_case(result), expected);
+}
+
+/// O11: every error of the trade service names its case in the metadata of the status, with
+/// the advice whether the same request can succeed later. The caller does not have to read the
+/// message, and does not depend on the status code, which several cases share.
+#[tokio::test]
+async fn every_error_names_its_case() {
+    // No trade with this ID.
+    let mut stranger = Party::new(
+        format!("no-trade-{}", next_trade_number()),
+        Role::BuyerAsTaker,
+    )
+    .await;
+    let result = stranger.start_payment().await;
+    assert_error_case(result, ErrorCase::UnknownTrade);
+
+    // The ID of an existing trade, and data of the caller that is invalid.
+    let mut trade = Trade::at(TradeType::TakerIsBuyer, Stage::SignaturesExchanged).await;
+    let result = trade.buyer.init_trade().await;
+    assert_error_case(result, ErrorCase::TradeIdUsed);
+    let request = PubKeySharesRequest {
+        trade_id: format!("unknown-role-{}", next_trade_number()),
+        my_role: 4,
+    };
+    assert_error_case(
+        trade.buyer.client.init_trade(request).await,
+        ErrorCase::Refused,
+    );
+
+    // A request in a state that does not allow it.
+    let result = trade.buyer.start_payment().await;
+    assert_eq!(
+        result.as_ref().unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+    assert_error_case(result, ErrorCase::Refused);
+
+    // A condition of the chain that does not hold yet: the same status code, another case.
+    let mut trade = Trade::at(TradeType::TakerIsBuyer, Stage::DepositSigned).await;
+    let result = trade.buyer.publish_warning_tx().await;
+    assert_eq!(
+        result.as_ref().unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+    assert_error_case(result, ErrorCase::RefusedForNow);
+
+    // No peer is reachable, and a wallet that cannot store the trade.
+    trade
+        .buyer
+        .chain
+        .set_peer_problem(Some(PeerProblem::NoPeerReachable));
+    let result = trade.buyer.publish_warning_tx().await;
+    assert_error_case(result, ErrorCase::Temporary);
+    trade.buyer.chain.set_peer_problem(None);
+    trade.seller.store_fails.store(true, Ordering::Relaxed);
+    let result = trade.seller.abandon_trade().await;
+    assert_eq!(result.as_ref().unwrap_err().code(), Code::Internal);
+    assert_error_case(result, ErrorCase::Temporary);
+    trade.seller.store_fails.store(false, Ordering::Relaxed);
+
+    // Data of the peer that an unmodified client never produces.
+    let mut trade = Trade::at(TradeType::TakerIsBuyer, Stage::BuyerStartedPayment).await;
+    let result = trade.seller.sign_swap_tx(&random_scalar()).await;
+    assert_error_case(result, ErrorCase::Terminated);
+    // Every later request for the trade gets the same answer.
+    let result = trade.seller.release_payout().await;
+    assert_error_case(result, ErrorCase::Terminated);
 }
 
 /// K1 for `InitTrade`: an unknown role is rejected and no trade is stored.

@@ -878,6 +878,35 @@ Not done:
   confirmation handling, the `Close` RPC in bisq2's `wallet.proto` and its call when the user
   ends the program.
 
+Status on 2026-11-18 (branch `wp7-interface`, on top of `wp6-fees`), for the part of WP7 that
+lies in this repository:
+
+Done:
+
+- Protobuf: the changes of WP4 to WP6 are in `rpc.proto` and `bmp_wallet.proto` (claim fields
+  removed, `AbandonTrade`, `PublishWarningTx`, `SubscribeTradeEvents` with its event message,
+  `Close` and `ReleaseUtxo` of the wallet service). All later changes only add requests, fields
+  and enum values.
+- Error cases: every error status of the trade service names its case and a retry advice in its
+  metadata (`musig-error-case`, `musig-error-retry`): refused, refused for now, terminated,
+  unknown trade, trade ID used, temporary, trades not loaded, internal. This separates "repeat
+  later" from "never" and from "unknown", independent of the status code. The status codes
+  themselves are unchanged (open point O11).
+- Wallet events: `SubscribeWalletEvents` of the wallet service reports the state, a new last
+  block, new and changed transactions, removed transactions and a changed balance
+  (`docs/specifications/wallet/events.md`). The transport is a gRPC stream (open point W5).
+- `musigd` configuration: network, peers and wallet directory are options; lock times, deposit
+  timeout, release safety margin and forced close margin are options and environment variables
+  (D19, D23); the wallet password arrives by request and never on the command line; the listen
+  address is fixed to the loopback address (D11). This existed before WP7 and was checked.
+
+Not done:
+
+- The errors of the wallet service carry no case in their metadata. They use status codes only.
+- The source of the engine fee rate is not configurable (N1).
+- The Java work in bisq2. The Java test client of this repository compiles against the changed
+  protobuf files; it was not run, and it does not use the new requests.
+
 ### WP8 CI, review and release (estimate: 1 to 2 weeks plus external review)
 
 - CI for the whole workspace on every change; formatting check with nightly rustfmt; dependency

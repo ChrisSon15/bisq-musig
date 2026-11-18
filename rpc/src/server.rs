@@ -26,6 +26,7 @@ use protocol::trade_model::{
 use serde::Serialize;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{Notify, broadcast};
+use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Result, Status};
 use tracing::{Span, debug, error, info, instrument, trace, warn};
 use wallet::protocol_wallet_api::ProtocolWalletApi;
@@ -44,6 +45,97 @@ use crate::pb::musigrpc::{
     SwapTxSignatureResponse, TradeDeadline, TradeDeadlineKind, TradeEvent, TradeEventType,
     TradeStateKind, TradeTxKind, TradeUserAction, TxConfirmationStatus, musig_server,
 };
+
+/// What an error of the trade service means for the caller. Every error status carries its case
+/// in its metadata, so that the caller does not have to read the text of the message, and does
+/// not depend on the gRPC status code, which several cases share.
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "the cases are the cases of the specification, a closed set"
+)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ErrorCase {
+    /// A precondition of the request does not hold (role, state, order), or data of the caller
+    /// is invalid. The trade continues. The same request does not succeed in the same state.
+    Refused,
+    /// A condition of the chain does not hold yet: too few confirmations, a lock time, a margin.
+    /// The trade continues. The same request can succeed after further blocks.
+    RefusedForNow,
+    /// The peer sent data that an unmodified client never produces, now or earlier. The trade
+    /// is terminated.
+    Terminated,
+    /// No trade with this ID exists.
+    UnknownTrade,
+    /// A trade with this ID exists or existed. A new trade needs another ID.
+    TradeIdUsed,
+    /// The service cannot process the request for a reason outside of the trade: no wallet is
+    /// open, no peer of the network is reachable, or the trade could not be stored. The trade
+    /// is as before. The same request can succeed later.
+    Temporary,
+    /// The trades of the wallet could not be loaded. No request of a trade is served.
+    TradesNotLoaded,
+    /// A defect of the service. Whether a repetition helps is not known.
+    Internal,
+}
+
+impl ErrorCase {
+    /// The metadata key of the case of an error.
+    pub const KEY: &'static str = "musig-error-case";
+    /// The metadata key that says whether the same request can succeed later: `later`, `never`
+    /// or `unknown`.
+    pub const RETRY_KEY: &'static str = "musig-error-retry";
+
+    /// The value of the case in the metadata.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Refused => "refused",
+            Self::RefusedForNow => "refused-for-now",
+            Self::Terminated => "terminated",
+            Self::UnknownTrade => "unknown-trade",
+            Self::TradeIdUsed => "trade-id-used",
+            Self::Temporary => "temporary",
+            Self::TradesNotLoaded => "trades-not-loaded",
+            Self::Internal => "internal",
+        }
+    }
+
+    /// Whether the same request can succeed when it is sent again later, without another
+    /// request in between.
+    pub const fn retry(self) -> &'static str {
+        match self {
+            Self::RefusedForNow | Self::Temporary => "later",
+            Self::Refused
+            | Self::Terminated
+            | Self::UnknownTrade
+            | Self::TradeIdUsed
+            | Self::TradesNotLoaded => "never",
+            Self::Internal => "unknown",
+        }
+    }
+
+    /// Marks a status with this case.
+    fn of(self, mut status: Status) -> Status {
+        let metadata = status.metadata_mut();
+        metadata.insert(Self::KEY, MetadataValue::from_static(self.name()));
+        metadata.insert(Self::RETRY_KEY, MetadataValue::from_static(self.retry()));
+        status
+    }
+
+    /// The case of a status that was created without one: an error of the conversion of a
+    /// request, which concerns the data of the caller.
+    fn of_unmarked(status: Status) -> Status {
+        if status.metadata().contains_key(Self::KEY) {
+            return status;
+        }
+        let case = match status.code() {
+            tonic::Code::InvalidArgument | tonic::Code::OutOfRange | tonic::Code::NotFound => {
+                Self::Refused
+            }
+            _ => Self::Internal,
+        };
+        case.of(status)
+    }
+}
 
 /// An operation of the trade service that needs the wallet of the trader.
 pub type WalletOperation<'a> = dyn for<'w> FnMut(&'w mut (dyn ProtocolWalletApi + 'w)) + Send + 'a;
@@ -140,9 +232,9 @@ impl MusigImpl {
     /// The access to the chain, or the status for a request that needs it.
     fn chain(&self) -> Result<Arc<dyn ChainAccess>> {
         self.chain.clone().ok_or_else(|| {
-            Status::failed_precondition(
+            ErrorCase::Temporary.of(Status::failed_precondition(
                 "the trade service has no access to the chain; start musigd with a peer",
-            )
+            ))
         })
     }
 
@@ -155,9 +247,9 @@ impl MusigImpl {
     fn chain_for_sending(&self) -> Result<Arc<dyn ChainAccess>> {
         let chain = self.chain()?;
         if let Some(problem) = chain.peer_problem() {
-            return Err(Status::unavailable(format!(
+            return Err(ErrorCase::Temporary.of(Status::unavailable(format!(
                 "nothing can be sent at the moment: {problem}"
-            )));
+            ))));
         }
         Ok(chain)
     }
@@ -165,10 +257,10 @@ impl MusigImpl {
     /// The status of every trade request while the stored trades could not be loaded.
     fn check_trade_store(&self) -> Result<()> {
         match self.trades.unusable() {
-            Some(reason) => Err(Status::data_loss(format!(
+            Some(reason) => Err(ErrorCase::TradesNotLoaded.of(Status::data_loss(format!(
                 "the trades of the wallet could not be loaded, so no trade request is served: \
                  {reason}"
-            ))),
+            )))),
             None => Ok(()),
         }
     }
@@ -188,9 +280,9 @@ impl MusigImpl {
             })
             .await;
         result.unwrap_or_else(|| {
-            Err(Status::failed_precondition(
+            Err(ErrorCase::Temporary.of(Status::failed_precondition(
                 "no wallet is open; the trade service needs the wallet",
-            ))
+            )))
         })
     }
 
@@ -218,10 +310,10 @@ impl MusigImpl {
                     self.trades
                         .get_trade_model(request.trade_id())
                         .ok_or_else(|| {
-                            Status::not_found(format!(
+                            ErrorCase::UnknownTrade.of(Status::not_found(format!(
                                 "missing trade with id: {}",
                                 request.trade_id()
-                            ))
+                            )))
                         })?;
                 let mut trade_model = trade_model.lock().unwrap();
                 // The engine checks the chain conditions of a request against the facts that it
@@ -660,10 +752,12 @@ fn store_trade(trade_model: &TradeModel, wallet: &mut dyn ProtocolWalletApi) -> 
                 .map_err(|error| error.to_string())
         });
     stored.map_err(|error| {
-        Status::internal(format!(
+        // The reason lies outside of the trade, for example a full disk, and the request can
+        // be repeated.
+        ErrorCase::Temporary.of(Status::internal(format!(
             "the trade {} could not be stored, so nothing of this request is handed out: {error}",
             trade_model.trade_id()
-        ))
+        )))
     })
 }
 
@@ -1315,17 +1409,26 @@ impl From<HandlerError> for Status {
     fn from(value: HandlerError) -> Self {
         // TODO: The status codes are not decided yet (open point O11 of the specification).
         match value {
-            HandlerError::Status(status) => status,
+            HandlerError::Status(status) => ErrorCase::of_unmarked(status),
             HandlerError::Protocol(e) => match e {
-                ProtocolErrorKind::DuplicateTradeId(_) => Self::already_exists(e.to_string()),
-                ProtocolErrorKind::TradeTerminated(_) => Self::aborted(e.to_string()),
+                ProtocolErrorKind::DuplicateTradeId(_) => {
+                    ErrorCase::TradeIdUsed.of(Self::already_exists(e.to_string()))
+                }
+                ProtocolErrorKind::TradeTerminated(_) => {
+                    ErrorCase::Terminated.of(Self::aborted(e.to_string()))
+                }
                 ProtocolErrorKind::TradeParams(_)
                 | ProtocolErrorKind::InsufficientRedirectionFunds { .. }
                 | ProtocolErrorKind::ExcessRedirectionFunds { .. } => {
-                    Self::invalid_argument(e.to_string())
+                    ErrorCase::Refused.of(Self::invalid_argument(e.to_string()))
                 }
-                e if e.is_refusal() => Self::failed_precondition(e.to_string()),
-                e => Self::internal(e.to_string()),
+                ProtocolErrorKind::ChainCondition(_) => {
+                    ErrorCase::RefusedForNow.of(Self::failed_precondition(e.to_string()))
+                }
+                e if e.is_refusal() => {
+                    ErrorCase::Refused.of(Self::failed_precondition(e.to_string()))
+                }
+                e => ErrorCase::Internal.of(Self::internal(e.to_string())),
             },
         }
     }
