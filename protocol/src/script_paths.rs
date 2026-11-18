@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use bdk_wallet::bitcoin::opcodes::all::{OP_CHECKSIG, OP_CHECKSIGVERIFY, OP_CSV};
-use bdk_wallet::bitcoin::taproot::TaprootBuilder;
+use bdk_wallet::bitcoin::secp256k1::Secp256k1;
+use bdk_wallet::bitcoin::taproot::{ControlBlock, LeafVersion, TaprootBuilder};
 use bdk_wallet::bitcoin::{ScriptBuf, TapNodeHash, XOnlyPublicKey, relative, script};
 use bdk_wallet::miniscript::descriptor::TapTree;
 use bdk_wallet::miniscript::{DefiniteDescriptorKey, Descriptor, Miniscript, Tap};
@@ -38,6 +39,30 @@ pub fn deposit_payout_tap_tree(
     seller_pub_key: &XOnlyPublicKey,
 ) -> Result<TapTree<XOnlyPublicKey>> {
     single_path_tap_tree(&multisig_script(buyer_pub_key, seller_pub_key))
+}
+
+/// The script leaf of the escrow output of a warning transaction and its control block, for a
+/// spend of the escrow through the script path: the claim.
+///
+/// `internal_key` is the internal key of the escrow output, `claim_pub_key` the claim key of the
+/// trader who can publish the warning transaction.
+pub fn warning_escrow_claim_leaf(
+    internal_key: &XOnlyPublicKey,
+    claim_pub_key: &XOnlyPublicKey,
+    claim_lock_time: relative::LockTime,
+) -> Result<(ScriptBuf, ControlBlock)> {
+    let script = claim_script(claim_pub_key, claim_lock_time);
+    // Check for repeated keys, zero locktime or any other issues when decoding to miniscript:
+    Miniscript::<XOnlyPublicKey, Tap>::parse(&script)?;
+    let spend_info = TaprootBuilder::with_capacity(1)
+        .add_leaf(0, script.clone())
+        .expect("hardcoded TapTree build sequence should be valid")
+        .finalize(&Secp256k1::verification_only(), *internal_key)
+        .expect("hardcoded TapTree build sequence should be complete");
+    let control_block = spend_info
+        .control_block(&(script.clone(), LeafVersion::TapScript))
+        .expect("the tree contains the leaf");
+    Ok((script, control_block))
 }
 
 /// The tap tree of a Warning Tx escrow output; see [`deposit_payout_tap_tree`].

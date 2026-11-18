@@ -19,12 +19,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             base64("halfDepositPsbt"), base64("swapTxInputNonceShare"),
             base64("buyersWarningTxBuyerInputNonceShare"), base64("buyersWarningTxSellerInputNonceShare"),
             base64("sellersWarningTxBuyerInputNonceShare"), base64("sellersWarningTxSellerInputNonceShare"),
-            base64("buyersRedirectTxInputNonceShare"), base64("sellersRedirectTxInputNonceShare"),
-            base64("buyersClaimTxInputNonceShare"), base64("sellersClaimTxInputNonceShare")
+            base64("buyersRedirectTxInputNonceShare"), base64("sellersRedirectTxInputNonceShare")
         ])
         .serde_serialized_type("PartialSignaturesMessage", &[
             base64("peersWarningTxBuyerInputPartialSignature"), base64("peersWarningTxSellerInputPartialSignature"),
-            base64("peersRedirectTxInputPartialSignature"), base64("peersClaimTxInputPartialSignature"),
+            base64("peersRedirectTxInputPartialSignature"),
             opt_base64("swapTxInputPartialSignature"), opt_base64("swapTxInputSighash")
         ])
         .serde_serialized_type("DepositPsbt", &[

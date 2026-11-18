@@ -10,9 +10,12 @@ use std::fmt::Display;
 use std::sync::{Arc, Mutex};
 
 use bdk_wallet::bitcoin::address::{NetworkChecked, NetworkUnchecked, NetworkValidation};
+use bdk_wallet::bitcoin::hashes::Hash as _;
+use bdk_wallet::bitcoin::key::{Keypair, Secp256k1};
+use bdk_wallet::bitcoin::secp256k1::{Message, SecretKey};
 use bdk_wallet::bitcoin::{
-    Address, Amount, FeeRate, Network, OutPoint, Psbt, ScriptBuf, TapSighash, Transaction, Txid,
-    XOnlyPublicKey,
+    Address, Amount, FeeRate, Network, OutPoint, Psbt, ScriptBuf, TapSighash, TapSighashType,
+    Transaction, Txid, XOnlyPublicKey, taproot,
 };
 use musig2::secp::{MaybeScalar, Point, Scalar};
 use musig2::{PartialSignature, PubNonce};
@@ -27,8 +30,8 @@ use crate::script_paths;
 use crate::state::{ClosureType, TradeState};
 use crate::storage::{ByRef, ByVal, Storage};
 use crate::transaction::{
-    ClaimTxBuilder, CustomPayoutTxBuilder, DepositTxBuilder, PenaltyTxBuilder, RedirectTxBuilder,
-    SwapTxBuilder, TransactionExt as _, WarningTxBuilder,
+    CustomPayoutTxBuilder, DepositTxBuilder, PenaltyTxBuilder, RedirectTxBuilder, SwapTxBuilder,
+    TransactionExt as _, WarningTxBuilder, build_claim_tx,
 };
 
 /// Holds the trades of one trader.
@@ -143,7 +146,7 @@ struct Received {
 struct ReceivedNonceShares {
     half_deposit_psbt: Psbt,
     addresses: [Address<NetworkUnchecked>; 3],
-    nonce_shares: [PubNonce; 9],
+    nonce_shares: [PubNonce; 7],
     redirection_receivers: Vec<Receiver<NetworkUnchecked>>,
 }
 
@@ -167,8 +170,6 @@ impl ReceivedNonceShares {
                 nonce_shares.sellers_warning_tx_seller_input,
                 nonce_shares.buyers_redirect_tx_input,
                 nonce_shares.sellers_redirect_tx_input,
-                nonce_shares.buyers_claim_tx_input,
-                nonce_shares.sellers_claim_tx_input,
             ],
             redirection_receivers,
         }
@@ -188,7 +189,6 @@ struct ReceivedPartialSignatures {
     warning_tx_buyer: PartialSignature,
     warning_tx_seller: PartialSignature,
     redirect_tx: PartialSignature,
-    claim_tx: PartialSignature,
     /// Only the buyer uses the seller's data for the swap transaction during the setup.
     swap_tx: Option<(PartialSignature, TapSighash)>,
 }
@@ -202,11 +202,14 @@ struct Keys {
     peers_multisig_script_key: Option<XOnlyPublicKey>,
 }
 
+/// The pre-signed transactions of one trader for the dispute path, and the address of his wallet
+/// that receives his output of a custom payout, of his penalty transaction and of his claim
+/// transaction.
 #[derive(Clone, Default)]
 struct ArbitrationTxs {
     warning: WarningTx,
     redirect: RedirectTx,
-    claim: ClaimTx,
+    payout_address: Option<Address>,
 }
 
 #[derive(Clone, Default)]
@@ -231,12 +234,6 @@ struct WarningTx {
 #[derive(Clone, Default)]
 struct RedirectTx {
     builder: RedirectTxBuilder,
-    input_sig_ctx: SigCtx,
-}
-
-#[derive(Clone, Default)]
-struct ClaimTx {
-    builder: ClaimTxBuilder,
     input_sig_ctx: SigCtx,
 }
 
@@ -271,15 +268,12 @@ pub struct ExchangedNonces<'a, S: Storage> {
     pub sellers_warning_tx_seller_input: S::Store<'a, PubNonce>,
     pub buyers_redirect_tx_input: S::Store<'a, PubNonce>,
     pub sellers_redirect_tx_input: S::Store<'a, PubNonce>,
-    pub buyers_claim_tx_input: S::Store<'a, PubNonce>,
-    pub sellers_claim_tx_input: S::Store<'a, PubNonce>,
 }
 
 pub struct ExchangedSigs<'a, S: Storage> {
     pub peers_warning_tx_buyer_input_partial_signature: S::Store<'a, PartialSignature>,
     pub peers_warning_tx_seller_input_partial_signature: S::Store<'a, PartialSignature>,
     pub peers_redirect_tx_input_partial_signature: S::Store<'a, PartialSignature>,
-    pub peers_claim_tx_input_partial_signature: S::Store<'a, PartialSignature>,
     pub swap_tx_input_partial_signature: Option<S::Store<'a, PartialSignature>>,
     pub swap_tx_input_sighash: Option<S::Store<'a, TapSighash>>,
     pub contractual_txids: Option<ContractualTxids>,
@@ -716,7 +710,6 @@ impl TradeModel {
             warning_tx_seller: peers_partial_signatures
                 .peers_warning_tx_seller_input_partial_signature,
             redirect_tx: peers_partial_signatures.peers_redirect_tx_input_partial_signature,
-            claim_tx: peers_partial_signatures.peers_claim_tx_input_partial_signature,
             swap_tx: swap_tx_input,
         })
     }
@@ -1108,7 +1101,7 @@ impl TradeModel {
         Ok(ExchangedAddresses {
             warning_tx_fee_bump: my_txs.warning.builder.anchor_address()?,
             redirect_tx_fee_bump: my_txs.redirect.builder.anchor_address()?,
-            claim_tx_payout: my_txs.claim.builder.payout_address()?,
+            claim_tx_payout: my_txs.payout_address()?,
         })
     }
 
@@ -1145,8 +1138,6 @@ impl TradeModel {
                 .my_nonce_share()?,
             buyers_redirect_tx_input: self.buyer_txs.redirect.input_sig_ctx.my_nonce_share()?,
             sellers_redirect_tx_input: self.seller_txs.redirect.input_sig_ctx.my_nonce_share()?,
-            buyers_claim_tx_input: self.buyer_txs.claim.input_sig_ctx.my_nonce_share()?,
-            sellers_claim_tx_input: self.seller_txs.claim.input_sig_ctx.my_nonce_share()?,
         })
     }
 
@@ -1172,10 +1163,6 @@ impl TradeModel {
                 .my_partial_sig()?,
             peers_redirect_tx_input_partial_signature: peer_txs
                 .redirect
-                .input_sig_ctx
-                .my_partial_sig()?,
-            peers_claim_tx_input_partial_signature: peer_txs
-                .claim
                 .input_sig_ctx
                 .my_partial_sig()?,
             swap_tx_input_partial_signature: self
@@ -1264,11 +1251,56 @@ impl TradeModel {
         Ok(self.my_txs().redirect.builder.signed_tx()?)
     }
 
-    /// The trader's own claim transaction with all signatures. It spends the escrow of his own
-    /// warning transaction. No operation publishes it yet.
-    pub fn my_signed_claim_tx(&self) -> Result<&Transaction> {
+    /// Builds and signs the trader's claim transaction for the fee rate `fee_rate`. It spends the
+    /// escrow output of his own warning transaction through the script leaf of the escrow, with
+    /// the claim lock time as sequence number, and pays to the trader's payout address.
+    ///
+    /// The trader signs alone, with his claim key: his own key share of his own payout. This key
+    /// share never leaves the engine. A node accepts the transaction when the warning
+    /// transaction has as many confirmations as the claim lock time.
+    pub fn my_claim_tx(&self, fee_rate: FeeRate) -> Result<Transaction> {
         access!(self, _ if self.state >= Deposit)?;
-        Ok(self.my_txs().claim.builder.signed_tx()?)
+        let config = self
+            .received
+            .config
+            .ok_or(ProtocolErrorKind::OutOfOrder("the trade is not set up"))?;
+        let claim_key_share = self.keys.my_payout_ctx().my_key_share()?;
+        // The escrow of the trader's warning has the aggregated key of the payout of the peer
+        // as its internal key.
+        let internal_key = self
+            .keys
+            .peers_payout_ctx()
+            .aggregated_key()?
+            .pub_key()
+            .to_public_key()
+            .into();
+        let (script, control_block) = script_paths::warning_escrow_claim_leaf(
+            &internal_key,
+            &claim_key_share.pub_key().to_public_key().into(),
+            config.claim_lock_time(),
+        )?;
+        let secret_key = SecretKey::from_slice(&claim_key_share.prv_key()?.serialize())
+            .expect("a scalar is a valid secret key");
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_secret_key(&secp, &secret_key);
+        let my_txs = self.my_txs();
+        Ok(build_claim_tx(
+            &my_txs.warning.builder.escrow()?,
+            my_txs.payout_address()?,
+            config.claim_lock_time(),
+            fee_rate,
+            &script,
+            &control_block,
+            |sighash| {
+                // The key of the script is the x-only form of the public key share. The signing
+                // function negates the secret key when the public key has an odd Y coordinate.
+                let message = Message::from_digest(sighash.to_byte_array());
+                Ok(taproot::Signature {
+                    signature: secp.sign_schnorr(&message, &keypair),
+                    sighash_type: TapSighashType::Default,
+                })
+            },
+        )?)
     }
 }
 
@@ -1368,8 +1400,6 @@ impl TradeModel {
             txs.warning
                 .builder
                 .set_fee_rate(params.prepared_tx_fee_rate);
-            txs.claim.builder.set_lock_time(config.claim_lock_time());
-            txs.claim.builder.set_fee_rate(params.prepared_tx_fee_rate);
         }
         self.swap_tx
             .builder
@@ -1481,18 +1511,10 @@ impl TradeModel {
             .clone(),
         );
 
-        self.buyer_txs
-            .claim
-            .input_sig_ctx
-            .set_tweaked_key_ctx(buyers_warning_escrow_tweaked_key_ctx.clone());
         self.seller_txs
             .redirect
             .input_sig_ctx
             .set_tweaked_key_ctx(buyers_warning_escrow_tweaked_key_ctx);
-        self.seller_txs
-            .claim
-            .input_sig_ctx
-            .set_tweaked_key_ctx(sellers_warning_escrow_tweaked_key_ctx.clone());
         self.buyer_txs
             .redirect
             .input_sig_ctx
@@ -1515,11 +1537,8 @@ impl TradeModel {
             .redirect
             .builder
             .set_anchor_address(wallet.new_address()?);
-        my_txs
-            .claim
-            .builder
-            .set_payout_address(wallet.new_address()?);
-        let payout_address = my_txs.claim.builder.payout_address()?.clone();
+        let payout_address = wallet.new_address()?;
+        my_txs.payout_address = Some(payout_address.clone());
         self.penalty_tx.builder.set_payout_address(payout_address);
         Ok(())
     }
@@ -1609,10 +1628,7 @@ impl TradeModel {
             .redirect
             .builder
             .set_anchor_address(addresses.redirect_tx_fee_bump);
-        peer_txs
-            .claim
-            .builder
-            .set_payout_address(addresses.claim_tx_payout);
+        peer_txs.payout_address = Some(addresses.claim_tx_payout);
     }
 
     fn compute_unsigned_prepared_txs(&mut self) -> Result<()> {
@@ -1628,9 +1644,9 @@ impl TradeModel {
         self.seller_txs
             .compute_unsigned_warning_tx(&self.deposit_tx)?;
         self.buyer_txs
-            .compute_unsigned_redirect_and_claim_txs(&self.seller_txs)?;
+            .compute_unsigned_redirect_tx(&self.seller_txs)?;
         self.seller_txs
-            .compute_unsigned_redirect_and_claim_txs(&self.buyer_txs)?;
+            .compute_unsigned_redirect_tx(&self.buyer_txs)?;
         Ok(())
     }
 
@@ -1644,7 +1660,7 @@ impl TradeModel {
         })
     }
 
-    const fn all_sig_ctxs_mut(&mut self) -> [&mut SigCtx; 9] {
+    const fn all_sig_ctxs_mut(&mut self) -> [&mut SigCtx; 7] {
         [
             &mut self.swap_tx.input_sig_ctx,
             &mut self.buyer_txs.warning.buyer_input_sig_ctx,
@@ -1653,8 +1669,6 @@ impl TradeModel {
             &mut self.seller_txs.warning.seller_input_sig_ctx,
             &mut self.buyer_txs.redirect.input_sig_ctx,
             &mut self.seller_txs.redirect.input_sig_ctx,
-            &mut self.buyer_txs.claim.input_sig_ctx,
-            &mut self.seller_txs.claim.input_sig_ctx,
         ]
     }
 
@@ -1666,7 +1680,7 @@ impl TradeModel {
         &mut self,
         peers_nonce_shares: &[PubNonce],
     ) -> Result<Option<String>> {
-        const SIGNATURES: [&str; 9] = [
+        const SIGNATURES: [&str; 7] = [
             "swap transaction",
             "buyer's warning transaction (buyer input)",
             "buyer's warning transaction (seller input)",
@@ -1674,8 +1688,6 @@ impl TradeModel {
             "seller's warning transaction (seller input)",
             "buyer's redirect transaction",
             "seller's redirect transaction",
-            "buyer's claim transaction",
-            "seller's claim transaction",
         ];
         let sig_ctxs = self.all_sig_ctxs_mut();
         let mut my_nonce_shares = Vec::with_capacity(sig_ctxs.len());
@@ -1701,7 +1713,7 @@ impl TradeModel {
         Ok(None)
     }
 
-    fn set_peer_nonce_shares(&mut self, nonce_shares: &[PubNonce; 9]) {
+    fn set_peer_nonce_shares(&mut self, nonce_shares: &[PubNonce; 7]) {
         for (sig_ctx, nonce_share) in self.all_sig_ctxs_mut().into_iter().zip(nonce_shares) {
             sig_ctx.set_peers_nonce_share(nonce_share.clone());
         }
@@ -1725,9 +1737,6 @@ impl TradeModel {
             txs.redirect
                 .input_sig_ctx
                 .sign_partial(txs.redirect.builder.input_sighash()?)?;
-            txs.claim
-                .input_sig_ctx
-                .sign_partial(txs.claim.builder.input_sighash()?)?;
         }
         if !self.am_buyer() {
             // Unlike the other multisig sighashes, only the seller is able to independently compute
@@ -1758,10 +1767,6 @@ impl TradeModel {
             .redirect
             .input_sig_ctx
             .set_peers_partial_sig(sigs.redirect_tx);
-        my_txs
-            .claim
-            .input_sig_ctx
-            .set_peers_partial_sig(sigs.claim_tx);
         if let Some((signature, _)) = sigs.swap_tx {
             self.swap_tx.input_sig_ctx.set_peers_partial_sig(signature);
         }
@@ -1782,7 +1787,6 @@ impl TradeModel {
             .redirect
             .input_sig_ctx
             .aggregate_partial_signatures()?;
-        my_txs.claim.input_sig_ctx.aggregate_partial_signatures()?;
         if am_buyer {
             // This forms a validated adaptor signature on the swap tx for the buyer, ensuring that
             // the seller's private key share is revealed if the swap tx is published. The seller
@@ -1822,11 +1826,6 @@ impl TradeModel {
                     .compute_taproot_signature(Zero)?,
             )
             .compute_signed_tx()?;
-        my_txs
-            .claim
-            .builder
-            .set_input_signature(my_txs.claim.input_sig_ctx.compute_taproot_signature(Zero)?)
-            .compute_signed_tx()?;
         Ok(())
     }
 
@@ -1835,7 +1834,7 @@ impl TradeModel {
         let my_txs = self.my_txs();
         my_txs.warning.builder.signed_tx()?;
         my_txs.redirect.builder.signed_tx()?;
-        my_txs.claim.builder.signed_tx()?;
+        my_txs.payout_address()?;
         if self.am_buyer() {
             self.swap_tx.input_sig_ctx.aggregated_sig()?;
         } else {
@@ -1951,8 +1950,8 @@ impl TradeModel {
             .builder
             .set_buyer_input(self.deposit_tx.builder.buyer_payout()?.clone())
             .set_seller_input(self.deposit_tx.builder.seller_payout()?.clone())
-            .set_buyer_payout_address(self.buyer_txs.claim.builder.payout_address()?.clone())
-            .set_seller_payout_address(self.seller_txs.claim.builder.payout_address()?.clone())
+            .set_buyer_payout_address(self.buyer_txs.payout_address()?.clone())
+            .set_seller_payout_address(self.seller_txs.payout_address()?.clone())
             .compute_unsigned_tx()?;
         Ok(())
     }
@@ -1981,16 +1980,20 @@ impl ArbitrationTxs {
         Ok(())
     }
 
-    fn compute_unsigned_redirect_and_claim_txs(&mut self, peer: &Self) -> Result<()> {
+    fn compute_unsigned_redirect_tx(&mut self, peer: &Self) -> Result<()> {
         self.redirect
             .builder
             .set_input(peer.warning.builder.escrow()?.clone())
             .compute_unsigned_tx()?;
-        self.claim
-            .builder
-            .set_input(self.warning.builder.escrow()?.clone())
-            .compute_unsigned_tx()?;
         Ok(())
+    }
+
+    fn payout_address(&self) -> Result<&Address> {
+        self.payout_address
+            .as_ref()
+            .ok_or(ProtocolErrorKind::OutOfOrder(
+                "the payout address is missing",
+            ))
     }
 }
 
@@ -2162,9 +2165,6 @@ impl ProtocolErrorKind {
 /// Unit tests of the trade engine without the gRPC service. Two trade models, one per trader,
 /// exchange their data directly. The test IDs (G1, G4, ...) refer to section 9.4 of
 /// `concept/CompletionPlan.md`, the D and F numbers to its decisions and findings.
-///
-/// The claim nonces and the claim signatures are passed on like all other fields, but no test
-/// changes or checks them, because decision D3 of the plan removes them.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2296,8 +2296,6 @@ mod tests {
             sellers_warning_tx_seller_input: nonces.sellers_warning_tx_seller_input.clone(),
             buyers_redirect_tx_input: nonces.buyers_redirect_tx_input.clone(),
             sellers_redirect_tx_input: nonces.sellers_redirect_tx_input.clone(),
-            buyers_claim_tx_input: nonces.buyers_claim_tx_input.clone(),
-            sellers_claim_tx_input: nonces.sellers_claim_tx_input.clone(),
         };
         (half_deposit_psbt, addresses, nonces)
     }
@@ -2324,7 +2322,6 @@ mod tests {
                 .peers_warning_tx_seller_input_partial_signature,
             peers_redirect_tx_input_partial_signature: *sigs
                 .peers_redirect_tx_input_partial_signature,
-            peers_claim_tx_input_partial_signature: *sigs.peers_claim_tx_input_partial_signature,
             swap_tx_input_partial_signature: sigs.swap_tx_input_partial_signature.copied(),
             swap_tx_input_sighash: sigs.swap_tx_input_sighash.copied(),
             contractual_txids: None,
@@ -2339,7 +2336,6 @@ mod tests {
                 .peers_warning_tx_seller_input_partial_signature,
             peers_redirect_tx_input_partial_signature: sigs
                 .peers_redirect_tx_input_partial_signature,
-            peers_claim_tx_input_partial_signature: sigs.peers_claim_tx_input_partial_signature,
             swap_tx_input_partial_signature: sigs.swap_tx_input_partial_signature,
             swap_tx_input_sighash: sigs.swap_tx_input_sighash,
             contractual_txids: None,
@@ -2461,8 +2457,18 @@ mod tests {
             // The lock times of warning and claim transaction come from the configuration.
             let warning_tx = me.model.my_signed_warning_tx().expect("signed");
             assert!(warning_tx.input.iter().all(|i| i.sequence.0 == 20));
-            let claim_tx = me.model.my_signed_claim_tx().expect("signed");
+            // D3: the claim is built when it is needed, with the fee rate of that moment, and
+            // spends the escrow of the trader's own warning through the script path.
+            let claim_tx = me
+                .model
+                .my_claim_tx(FeeRate::from_sat_per_kwu(2_500))
+                .expect("built and signed");
             assert_eq!(claim_tx.input[0].sequence.0, 10);
+            assert_eq!(
+                claim_tx.input[0].previous_output,
+                OutPoint::new(warning_tx.compute_txid(), 0)
+            );
+            assert_eq!(claim_tx.input[0].witness.len(), 3, "script path spend");
         }
     }
 
@@ -2651,19 +2657,17 @@ mod tests {
                 nonces.sellers_warning_tx_buyer_input,
                 nonces.sellers_warning_tx_seller_input,
                 nonces.buyers_redirect_tx_input,
-                nonces.sellers_redirect_tx_input,
-                nonces.buyers_claim_tx_input,
                 last,
             ]
         };
         let peers = sent_nonce_shares(&peer).2;
         let own = sent_nonce_shares(&me).2.buyers_warning_tx_seller_input;
-        let repeated = peers.sellers_redirect_tx_input;
+        let repeated = peers.buyers_redirect_tx_input;
 
         // Without a repeated nonce share there is no reason.
         let valid = nonce_shares(
             peers.buyers_warning_tx_buyer_input.clone(),
-            peers.sellers_claim_tx_input,
+            peers.sellers_redirect_tx_input.clone(),
         );
         assert_eq!(
             me.model
@@ -2673,7 +2677,7 @@ mod tests {
         );
 
         // One of our own nonce shares.
-        let with_own = nonce_shares(own.clone(), repeated.clone());
+        let with_own = nonce_shares(own.clone(), peers.sellers_redirect_tx_input);
         assert_eq!(
             me.model
                 .find_repeated_nonce_share(&with_own)
@@ -2692,8 +2696,8 @@ mod tests {
                 .find_repeated_nonce_share(&with_repeated)
                 .expect("nonces exist"),
             Some(format!(
-                "the peer's nonce share for the seller's claim transaction equals the peer's \
-                 nonce share for the seller's redirect transaction (nonce share {repeated})"
+                "the peer's nonce share for the seller's redirect transaction equals the peer's \
+                 nonce share for the buyer's redirect transaction (nonce share {repeated})"
             ))
         );
     }

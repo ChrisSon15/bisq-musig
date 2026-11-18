@@ -149,10 +149,6 @@ impl<'a> TryProtoInto<ReceivedAddressesNoncesPair<'a>> for NonceSharesMessage {
             self.buyers_redirect_tx_input_nonce_share.try_proto_into()?,
             sellers_redirect_tx_input:
             self.sellers_redirect_tx_input_nonce_share.try_proto_into()?,
-            buyers_claim_tx_input:
-            self.buyers_claim_tx_input_nonce_share.try_proto_into()?,
-            sellers_claim_tx_input:
-            self.sellers_claim_tx_input_nonce_share.try_proto_into()?,
         }))
     }
 }
@@ -166,8 +162,6 @@ impl<'a> TryProtoInto<ExchangedSigs<'a, ByVal>> for PartialSignaturesMessage {
             self.peers_warning_tx_seller_input_partial_signature.try_proto_into()?,
             peers_redirect_tx_input_partial_signature:
             self.peers_redirect_tx_input_partial_signature.try_proto_into()?,
-            peers_claim_tx_input_partial_signature:
-            self.peers_claim_tx_input_partial_signature.try_proto_into()?,
             swap_tx_input_partial_signature:
             self.swap_tx_input_partial_signature.try_proto_into()?,
             swap_tx_input_sighash:
@@ -214,10 +208,6 @@ impl From<SentAddressesNoncesPair<'_>> for NonceSharesMessage {
             nonces.buyers_redirect_tx_input.serialize().into(),
             sellers_redirect_tx_input_nonce_share:
             nonces.sellers_redirect_tx_input.serialize().into(),
-            buyers_claim_tx_input_nonce_share:
-            nonces.buyers_claim_tx_input.serialize().into(),
-            sellers_claim_tx_input_nonce_share:
-            nonces.sellers_claim_tx_input.serialize().into(),
         }
     }
 }
@@ -243,8 +233,6 @@ impl From<ExchangedSigs<'_, ByRef>> for PartialSignaturesMessage {
             value.peers_warning_tx_seller_input_partial_signature.serialize().into(),
             peers_redirect_tx_input_partial_signature:
             value.peers_redirect_tx_input_partial_signature.serialize().into(),
-            peers_claim_tx_input_partial_signature:
-            value.peers_claim_tx_input_partial_signature.serialize().into(),
             swap_tx_input_partial_signature:
             value.swap_tx_input_partial_signature.map(|s| s.serialize().into()),
             swap_tx_input_sighash:

@@ -4,11 +4,11 @@ use bdk_wallet::bitcoin::amount::CheckedSum as _;
 use bdk_wallet::bitcoin::policy::MAX_STANDARD_TX_WEIGHT;
 use bdk_wallet::bitcoin::psbt::ExtractTxError;
 use bdk_wallet::bitcoin::sighash::{Prevouts, SighashCache};
-use bdk_wallet::bitcoin::taproot::{Signature, TAPROOT_ANNEX_PREFIX};
+use bdk_wallet::bitcoin::taproot::{ControlBlock, LeafVersion, Signature, TAPROOT_ANNEX_PREFIX};
 use bdk_wallet::bitcoin::transaction::Version;
 use bdk_wallet::bitcoin::{
-    Address, Amount, FeeRate, OutPoint, Psbt, Sequence, TapSighash, TapSighashType, Transaction,
-    TxIn, TxOut, Txid, Weight, Witness, absolute, relative,
+    Address, Amount, FeeRate, OutPoint, Psbt, ScriptBuf, Sequence, TapLeafHash, TapSighash,
+    TapSighashType, Transaction, TxIn, TxOut, Txid, Weight, Witness, absolute, relative,
 };
 use bdk_wallet::miniscript::DefiniteDescriptorKey;
 use bdk_wallet::miniscript::psbt::PsbtInputExt as _;
@@ -478,7 +478,6 @@ pub struct ForwardingTxBuilder {
 }
 
 pub type SwapTxBuilder = ForwardingTxBuilder;
-pub type ClaimTxBuilder = ForwardingTxBuilder;
 pub type PenaltyTxBuilder = ForwardingTxBuilder;
 
 impl ForwardingTxBuilder {
@@ -526,6 +525,65 @@ impl ForwardingTxBuilder {
 
 impl WithFixedInputs<1> for ForwardingTxBuilder {
     fn inputs(&self) -> Result<[&TxOutput; 1]> { Ok([self.input()?]) }
+}
+
+/// Builds a claim transaction: it spends the escrow output of the trader's own warning
+/// transaction through the script leaf of the escrow, after the claim lock time, and pays the
+/// rest after the fee to `payout_address`.
+///
+/// The claim transaction is not pre-signed. The trader builds it alone when he needs it, with the
+/// fee rate of that moment, and signs it with his claim key. `sign` gets the signature hash of
+/// the input and returns the signature of the claim key.
+pub fn build_claim_tx(
+    escrow: &TxOutput,
+    payout_address: &Address,
+    claim_lock_time: LockTime,
+    fee_rate: FeeRate,
+    claim_script: &ScriptBuf,
+    control_block: &ControlBlock,
+    sign: impl FnOnce(TapSighash) -> Result<Signature>,
+) -> Result<Transaction> {
+    let witness = |signature: &[u8]| {
+        let mut witness = Witness::new();
+        witness.push(signature);
+        witness.push(claim_script.as_bytes());
+        witness.push(control_block.serialize());
+        witness
+    };
+    let mut tx = Transaction {
+        version: Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: escrow.outpoint,
+            sequence: claim_lock_time.to_sequence(),
+            // A placeholder of the size of the final witness, to compute the weight.
+            witness: witness(&[0; 64]),
+            ..TxIn::default()
+        }],
+        output: vec![TxOut {
+            value: escrow.prevout.value,
+            script_pubkey: payout_address.script_pubkey(),
+        }],
+    };
+    let fee = fee_rate
+        .checked_mul_by_weight(tx.weight())
+        .ok_or(TransactionErrorKind::Overflow)?;
+    tx.output[0].value = escrow
+        .prevout
+        .value
+        .checked_sub(fee)
+        .ok_or(TransactionErrorKind::Overflow)?;
+    tx.check_no_dust_outputs()?;
+
+    let sighash = SighashCache::new(&tx).taproot_script_spend_signature_hash(
+        0,
+        &Prevouts::All(&[&escrow.prevout]),
+        TapLeafHash::from_script(claim_script, LeafVersion::TapScript),
+        TapSighashType::Default,
+    )?;
+    let signature = sign(sighash)?;
+    tx.input[0].witness = witness(&signature.to_vec());
+    Ok(tx)
 }
 
 type Descriptor = bdk_wallet::miniscript::Descriptor<DefiniteDescriptorKey>;
@@ -687,6 +745,7 @@ impl From<ExtractTxError> for TransactionErrorKind {
 mod tests {
     use std::sync::Arc;
 
+    use bdk_wallet::bitcoin::hashes::Hash as _;
     use bdk_wallet::bitcoin::hex::test_hex_unwrap as hex;
     use bdk_wallet::bitcoin::{Network, consensus};
     use const_format::str_index;
@@ -741,17 +800,10 @@ mod tests {
         164ae0b400000000";
 
     //noinspection SpellCheckingInspection
-    const SIGNED_SELLERS_CLAIM_TX: &str = "\
-        02000000000101f703021407bbdc217f56b8256dd620e0252cc83eb9eacba7370b96091ccc20c6000000000002000000\
-        01e65e8909000000002251204d19b6cd267c57f719f2f3f01c2ce230505e053a0d20884f4aa9115ebff3338d0140b1ec\
-        0464f04ced9ce0d5715f3740b24fd4226f72c2d990b2bbdad29898e15051082ffc3f3626170a992e7a5a8b48fffd58e4\
-        e5520b2c45d5b09a6f07c4c2a2dc00000000";
-
     const SWAP_TX_SIGNATURE: &str = str_index!(SIGNED_SWAP_TX, 188..316);
     const SELLERS_WARNING_TX_BUYER_INPUT_SIGNATURE: &str = str_index!(SIGNED_SELLERS_WARNING_TX, 356..484);
     const SELLERS_WARNING_TX_SELLER_INPUT_SIGNATURE: &str = str_index!(SIGNED_SELLERS_WARNING_TX, 488..616);
     const BUYERS_REDIRECT_TX_SIGNATURE: &str = str_index!(SIGNED_BUYERS_REDIRECT_TX, 360..488);
-    const SELLERS_CLAIM_TX_SIGNATURE: &str = str_index!(SIGNED_SELLERS_CLAIM_TX, 188..316);
 
     //noinspection SpellCheckingInspection
     #[test]
@@ -760,16 +812,14 @@ mod tests {
         let swap_tx = tx(SIGNED_SWAP_TX);
         let warning_tx = tx(SIGNED_SELLERS_WARNING_TX);
         let redirect_tx = tx(SIGNED_BUYERS_REDIRECT_TX);
-        let claim_tx = tx(SIGNED_SELLERS_CLAIM_TX);
 
-        let [deposit_txid, swap_txid, warning_txid, redirect_txid, claim_txid] =
-            [&deposit_tx, &swap_tx, &warning_tx, &redirect_tx, &claim_tx].map(Transaction::compute_txid);
+        let [deposit_txid, swap_txid, warning_txid, redirect_txid] =
+            [&deposit_tx, &swap_tx, &warning_tx, &redirect_tx].map(Transaction::compute_txid);
 
         assert_eq!("44090980ad341fb556368dbc6f32cfd5c50c61724ce7ae0a362d26c19f87a923", deposit_txid.to_string());
         assert_eq!("41e2045e54060bfe2e094e76a7ce4fbd7185384d34afcb77353cd359b465c93d", swap_txid.to_string());
         assert_eq!("c620cc1c09960b37a7cbeab93ec82c25e020d66d25b8567f21dcbb07140203f7", warning_txid.to_string());
         assert_eq!("ecdb3995689d8e23e4c467692ab400af66eb9f5a35b99753ee3bfdaa10b0b1d6", redirect_txid.to_string());
-        assert_eq!("81be3cf683c4a65979bbbe35264c8d0e4cd6fe33e80d094463f13ecf4d5eb2df", claim_txid.to_string());
     }
 
     #[test]
@@ -809,13 +859,81 @@ mod tests {
         Ok(())
     }
 
+    /// D3: the claim transaction spends the escrow through its script leaf. The witness holds a
+    /// valid signature of the claim key, the script and the control block of the leaf; the
+    /// sequence number is the claim lock time; and the fee is the fee rate times the weight.
+    //noinspection SpellCheckingInspection
     #[test]
-    fn test_claim_tx_builder() -> Result<()> {
-        let builder = filled_claim_tx_builder(
-            &filled_warning_tx_builder(&filled_deposit_tx_builder(false)?)?)?;
-        let signed_tx = builder.signed_tx()?;
+    fn test_build_claim_tx() -> Result<()> {
+        use bdk_wallet::bitcoin::key::{Keypair, Secp256k1, TapTweak as _};
+        use bdk_wallet::bitcoin::secp256k1::Message;
 
-        assert_eq!(&tx(SIGNED_SELLERS_CLAIM_TX), signed_tx);
+        use crate::script_paths::warning_escrow_claim_leaf;
+
+        let secp = Secp256k1::new();
+        // A claim key with an odd Y coordinate would need a negated secret key for the x-only
+        // key of the script. The signing function of the library handles both cases.
+        let claim_keypair = Keypair::from_seckey_slice(&secp, &[7; 32]).unwrap();
+        let (claim_pub_key, _) = claim_keypair.x_only_public_key();
+        let (internal_key, _) = Keypair::from_seckey_slice(&secp, &[9; 32])
+            .unwrap()
+            .x_only_public_key();
+        let lock_time = LockTime::from_height(720);
+        let (script, control_block) =
+            warning_escrow_claim_leaf(&internal_key, &claim_pub_key, lock_time)?;
+        let merkle_root = TapLeafHash::from_script(&script, LeafVersion::TapScript).into();
+        let (output_key, _) = internal_key.tap_tweak(&secp, Some(merkle_root));
+        let escrow = TxOutput::new(
+            OutPoint::new(Txid::from_slice(&[3; 32]).unwrap(), 0),
+            TxOut {
+                value: Amount::from_sat(160_000_000),
+                script_pubkey: ScriptBuf::new_p2tr_tweaked(output_key),
+            },
+        );
+        let payout_address = "bcrt1pf5vmdnfx03tlwx0j70cpct8zxpg9upf6p5sgsn624yg4a0lnxwxsegnwnx"
+            .parse::<Address<_>>()?.require_network(Network::Regtest)?;
+        let fee_rate = FeeRate::from_sat_per_kwu(2_500);
+
+        let mut signed_sighash = None;
+        let claim_tx = build_claim_tx(
+            &escrow, &payout_address, lock_time, fee_rate, &script, &control_block,
+            |sighash| {
+                signed_sighash = Some(sighash);
+                let message = Message::from_digest(sighash.to_byte_array());
+                Ok(Signature {
+                    signature: secp.sign_schnorr_no_aux_rand(&message, &claim_keypair),
+                    sighash_type: TapSighashType::Default,
+                })
+            },
+        )?;
+
+        assert_eq!(claim_tx.input.len(), 1);
+        assert_eq!(claim_tx.input[0].previous_output, escrow.outpoint);
+        assert_eq!(claim_tx.input[0].sequence, Sequence::from_height(720));
+        assert_eq!(claim_tx.output.len(), 1);
+        assert_eq!(claim_tx.output[0].script_pubkey, payout_address.script_pubkey());
+        let fee = escrow.prevout.value - claim_tx.output[0].value;
+        assert_eq!(Some(fee), fee_rate.checked_mul_by_weight(claim_tx.weight()));
+
+        let witness = claim_tx.input[0].witness.to_vec();
+        assert_eq!(witness.len(), 3);
+        assert_eq!(witness[1], script.to_bytes());
+        assert_eq!(witness[2], control_block.serialize());
+        assert!(control_block.verify_taproot_commitment(&secp, output_key.to_x_only_public_key(), &script));
+        // The signature is valid for the signature hash of the final transaction.
+        let sighash = SighashCache::new(&claim_tx).taproot_script_spend_signature_hash(
+            0,
+            &Prevouts::All(&[&escrow.prevout]),
+            TapLeafHash::from_script(&script, LeafVersion::TapScript),
+            TapSighashType::Default,
+        )?;
+        assert_eq!(signed_sighash, Some(sighash));
+        let signature = Signature::from_slice(&witness[0])?;
+        secp.verify_schnorr(
+            &signature.signature,
+            &Message::from_digest(sighash.to_byte_array()),
+            &claim_pub_key,
+        ).expect("valid signature of the claim key");
         Ok(())
     }
 
@@ -946,23 +1064,6 @@ mod tests {
             .set_lock_time(LockTime::ZERO)
             .compute_unsigned_tx()?
             .set_input_signature(sig(BUYERS_REDIRECT_TX_SIGNATURE))
-            .compute_signed_tx()?;
-        Ok(builder)
-    }
-
-    //noinspection SpellCheckingInspection
-    fn filled_claim_tx_builder(warning_tx_builder: &WarningTxBuilder) -> Result<ClaimTxBuilder> {
-        let payout_address = "bcrt1pf5vmdnfx03tlwx0j70cpct8zxpg9upf6p5sgsn624yg4a0lnxwxsegnwnx"
-            .parse::<Address<_>>()?.require_network(Network::Regtest)?;
-
-        let mut builder = ClaimTxBuilder::default();
-        builder
-            .set_input(warning_tx_builder.escrow()?)
-            .set_payout_address(payout_address)
-            .set_lock_time(LockTime::from_height(2))
-            .set_fee_rate(FeeRate::from_sat_per_kwu(2252)) // gives 1000-sat absolute fee
-            .compute_unsigned_tx()?
-            .set_input_signature(sig(SELLERS_CLAIM_TX_SIGNATURE))
             .compute_signed_tx()?;
         Ok(builder)
     }

@@ -243,8 +243,6 @@ impl Trader {
             sellers_warning_tx_seller_input: nonces.sellers_warning_tx_seller_input.clone(),
             buyers_redirect_tx_input: nonces.buyers_redirect_tx_input.clone(),
             sellers_redirect_tx_input: nonces.sellers_redirect_tx_input.clone(),
-            buyers_claim_tx_input: nonces.buyers_claim_tx_input.clone(),
-            sellers_claim_tx_input: nonces.sellers_claim_tx_input.clone(),
         };
         self.model
             .receive_nonce_shares(
@@ -266,7 +264,6 @@ impl Trader {
                 .peers_warning_tx_seller_input_partial_signature,
             peers_redirect_tx_input_partial_signature: *sigs
                 .peers_redirect_tx_input_partial_signature,
-            peers_claim_tx_input_partial_signature: *sigs.peers_claim_tx_input_partial_signature,
             swap_tx_input_partial_signature: sigs.swap_tx_input_partial_signature.copied(),
             swap_tx_input_sighash: sigs.swap_tx_input_sighash.copied(),
             contractual_txids: None,
@@ -947,15 +944,31 @@ fn e2_e14_redirect_after_peers_warning() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// E3 and E4 with the pre-signed claim transaction: the node rejects the claim before the claim
-/// lock time has passed, and accepts it afterwards. Decision D3 replaces the pre-signed claim by
-/// a claim through the script path; this test then changes.
+/// E3 and E4 for both roles, with the claim through the script path (D3): the trader builds and
+/// signs the claim alone, with his claim key. The node rejects the claim before the claim lock
+/// time has passed, and accepts it afterwards.
 #[test]
 fn e3_e4_claim_before_and_after_lock_time() -> anyhow::Result<()> {
+    for buyer_claims in [true, false] {
+        claim_before_and_after_lock_time(buyer_claims)?;
+    }
+    Ok(())
+}
+
+fn claim_before_and_after_lock_time(buyer_claims: bool) -> anyhow::Result<()> {
     let mut trade = Trade::with_confirmed_deposit()?;
     trade.mine_until_warning_is_valid()?;
-    let warning_tx = trade.buyer.model.my_signed_warning_tx()?.clone();
-    let claim_tx = trade.buyer.model.my_signed_claim_tx()?.clone();
+    let claimer = if buyer_claims {
+        &trade.buyer
+    } else {
+        &trade.seller
+    };
+    let warning_tx = claimer.model.my_signed_warning_tx()?.clone();
+    let claim_tx = claimer.model.my_claim_tx(FEE_RATE)?;
+    assert_eq!(claim_tx.input[0].witness.len(), 3, "script path spend");
+    let claim_fee = FEE_RATE
+        .checked_mul_by_weight(claim_tx.weight())
+        .expect("small fee");
     trade.broadcast_and_confirm(&warning_tx)?;
 
     // One block before the lock time ends, the node still rejects the claim.
@@ -969,8 +982,23 @@ fn e3_e4_claim_before_and_after_lock_time() -> anyhow::Result<()> {
     trade.broadcast_and_confirm(&claim_tx)?;
     assert_eq!(
         trade.unspent_output(OutPoint::new(claim_tx.compute_txid(), 0)),
-        Some((escrow_amount() - fee(FORWARDING_TX_WEIGHT), 1)),
+        Some((escrow_amount() - claim_fee, 1)),
         "the publisher of the warning transaction gets all funds minus the fees"
+    );
+    // The claim pays to an address of the wallet of the trader who published the warning.
+    trade.sync_wallets();
+    let claimer = if buyer_claims {
+        &trade.buyer
+    } else {
+        &trade.seller
+    };
+    assert!(
+        claimer
+            .wallet
+            .list_transactions()
+            .iter()
+            .any(|tx| tx.tx_id == claim_tx.compute_txid()),
+        "the wallet of the trader knows the claim transaction"
     );
     Ok(())
 }

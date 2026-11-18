@@ -76,6 +76,8 @@ message NonceSharesRequest {
 message NonceSharesMessage {
   string warningTxFeeBumpAddress = 1;
   string redirectTxFeeBumpAddress = 2;
+  // The address of the trader's wallet that receives his output of a custom payout, of his penalty transaction and
+  // of his claim transaction.
   string claimTxPayoutAddress = 3;
   bytes halfDepositPsbt = 4;
   uint64 redirectionAmountMsat = 5; // (millisatoshis)
@@ -86,8 +88,9 @@ message NonceSharesMessage {
   bytes sellersWarningTxSellerInputNonceShare = 10;
   bytes buyersRedirectTxInputNonceShare = 11;
   bytes sellersRedirectTxInputNonceShare = 12;
-  bytes buyersClaimTxInputNonceShare = 13;
-  bytes sellersClaimTxInputNonceShare = 14;
+  // The claim transaction is not pre-signed. A trader builds and signs it alone when he needs it.
+  reserved 13, 14;
+  reserved "buyersClaimTxInputNonceShare", "sellersClaimTxInputNonceShare";
 }
 
 message PartialSignaturesRequest {
@@ -101,7 +104,8 @@ message PartialSignaturesMessage {
   bytes peersWarningTxBuyerInputPartialSignature = 1;
   bytes peersWarningTxSellerInputPartialSignature = 2;
   bytes peersRedirectTxInputPartialSignature = 3;
-  bytes peersClaimTxInputPartialSignature = 4;
+  reserved 4;
+  reserved "peersClaimTxInputPartialSignature";
   optional bytes swapTxInputPartialSignature = 5;
   optional bytes swapTxInputSighash = 6;
   optional ContractualTxIds contractualTxIds = 7;
