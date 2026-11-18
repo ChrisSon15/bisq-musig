@@ -65,6 +65,14 @@ A child transaction and its parent are sent together as one package, so that a p
 fee is below the minimum of a node is still accepted. This specification assumes that the nodes
 of the peer-to-peer network accept such a package of one parent and one child.
 
+The assumption holds for the minimum fee that a node raises while its mempool is full. It does
+not hold for the fixed minimum relay fee of a node: a parent below this fee is not accepted in a
+package either. A transaction that is signed in advance must therefore have a fee rate of at least
+the fixed minimum relay fee of the nodes, which is 1 sat/vB by default in Bitcoin Core 29.0.
+
+Both statements are tested with Bitcoin Core 29.0 only (the two tests J7 of
+`chain/tests/chain_client.rs`). Other nodes can behave differently.
+
 Rules for the schedule:
 
 - The first fee rate of a child or of a replaceable transaction is the engine fee rate.

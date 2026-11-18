@@ -440,6 +440,34 @@ async fn j10_peer_without_block_filters_is_reported() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A transaction that spends the first output of `parent`, which pays to the wallet of the node,
+/// to a new address of the node. `parent` does not need to be known to the node.
+fn signed_child(
+    env: &TestEnv,
+    rpc: &RpcClient,
+    parent: &Transaction,
+    amount: Amount,
+) -> anyhow::Result<Transaction> {
+    let parent_txid = parent.compute_txid();
+    let input = CreateRawTransactionInput {
+        txid: parent_txid,
+        vout: 0,
+        sequence: None,
+    };
+    let outputs = std::iter::once((env.new_address()?.to_string(), amount)).collect();
+    let unsigned = rpc.create_raw_transaction(&[input], &outputs, None, None)?;
+    let parent_output = SignRawTransactionInput {
+        txid: parent_txid,
+        vout: 0,
+        script_pub_key: parent.output[0].script_pubkey.clone(),
+        redeem_script: None,
+        amount: Some(parent.output[0].value),
+    };
+    let signed = rpc.sign_raw_transaction_with_wallet(&unsigned, Some(&[parent_output]), None)?;
+    assert!(signed.complete);
+    Ok(signed.transaction()?)
+}
+
 /// Fills the mempool of the node with large transactions that pay 20 sat/vB, until the node
 /// has removed some of them again and has raised its minimum fee for new transactions.
 fn fill_mempool(env: &TestEnv, rpc: &RpcClient) -> anyhow::Result<()> {
@@ -520,25 +548,7 @@ async fn j7_package_of_low_fee_parent_and_child_is_accepted() -> anyhow::Result<
     // relay fee of the node of 1 sat/vB.
     let parent = signed_spend(&env, &rpc, coin, Amount::from_sat(999_700));
     let parent_txid = parent.compute_txid();
-    // The child spends the output of the parent and pays 20 000 sat.
-    let input = CreateRawTransactionInput {
-        txid: parent_txid,
-        vout: 0,
-        sequence: None,
-    };
-    let outputs =
-        std::iter::once((env.new_address()?.to_string(), Amount::from_sat(979_700))).collect();
-    let unsigned = rpc.create_raw_transaction(&[input], &outputs, None, None)?;
-    let parent_output = SignRawTransactionInput {
-        txid: parent_txid,
-        vout: 0,
-        script_pub_key: parent.output[0].script_pubkey.clone(),
-        redeem_script: None,
-        amount: Some(parent.output[0].value),
-    };
-    let signed = rpc.sign_raw_transaction_with_wallet(&unsigned, Some(&[parent_output]), None)?;
-    assert!(signed.complete);
-    let child = signed.transaction()?;
+    let child = signed_child(&env, &rpc, &parent, Amount::from_sat(979_700))?;
 
     fill_mempool(&env, &rpc)?;
     let error = env
@@ -555,6 +565,44 @@ async fn j7_package_of_low_fee_parent_and_child_is_accepted() -> anyhow::Result<
     })
     .await;
     client.shutdown()?;
+    Ok(())
+}
+
+/// The limit of J7, as a statement about the node that `docs/specifications/trade/fees.md` relies
+/// on: a parent below the fixed minimum relay fee of the node is not accepted in a package
+/// either. The package is given to the node through its RPC interface, because only this
+/// interface returns the reason.
+#[test]
+fn j7_parent_below_the_fixed_minimum_relay_fee_is_rejected_in_a_package() -> anyhow::Result<()> {
+    let mut config = Config::default();
+    // 10 sat/vB instead of 1 sat/vB.
+    config.bitcoind.args.push("-minrelaytxfee=0.0001");
+    let mut env = test_env_with(config)?;
+    let rpc = env.bitcoin_core_rpc_client()?;
+    let address = env.new_address()?;
+    let funding_txid = env.fund_address(&address, Amount::from_sat(1_000_000))?;
+    env.mine_block()?;
+    let coin = output_to(&rpc, funding_txid, &address);
+
+    // The parent pays less than 3 sat/vB, the child pays 20 000 sat for both.
+    let parent = signed_spend(&env, &rpc, coin, Amount::from_sat(999_700));
+    let child = signed_child(&env, &rpc, &parent, Amount::from_sat(979_700))?;
+    let package = [&parent, &child].map(bdk_wallet::bitcoin::consensus::encode::serialize_hex);
+    let result: serde_json::Value = rpc.call("submitpackage", &[serde_json::json!(package)])?;
+    let errors = result["tx-results"]
+        .as_object()
+        .expect("results per transaction")
+        .values()
+        .filter_map(|result| result["error"].as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("min relay fee not met")),
+        "{result}"
+    );
+    assert!(rpc.get_mempool_entry(&parent.compute_txid()).is_err());
+    assert!(rpc.get_mempool_entry(&child.compute_txid()).is_err());
     Ok(())
 }
 

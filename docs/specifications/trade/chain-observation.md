@@ -10,6 +10,8 @@ every chain event of a trade.
 - The engine sends transactions only to peers of that network.
 - The engine does not use the RPC interface of a Bitcoin node, an Electrum server or a block
   explorer.
+- The wallet uses the same access to the chain as the engine: one connection to the peers serves
+  both. Every rule of this section holds for the wallet as well.
 
 Rationale: every server that answers questions about addresses or transactions learns which
 trades belong to the user. A compact block filter client asks for filters of all blocks and
@@ -28,10 +30,28 @@ Consequences that the rest of this specification depends on:
 The engine needs at least one reachable peer that serves compact block filters. The peers are a
 start option of `musigd`. The network of the peers must be the network of the wallet.
 
-- While no peer is reachable, the engine keeps trying. It reports this condition. No step that
-  needs the chain proceeds, and no state changes.
+- The engine connects only to these peers. It does not look for other peers, also not when none
+  of these peers is reachable. This is open point O15 in [README.md](README.md).
+- While no peer is reachable, the engine keeps trying to connect, with pauses that grow up to
+  half a minute. It reports this condition. No step that needs the chain proceeds, and no state
+  changes.
 - If no connected peer serves filters, the engine reports a clear error and behaves in the same
   way.
+- A condition counts as a problem when it has lasted for some seconds. The engine has no peer for
+  a moment at every start and at every new connection.
+- While a problem lasts, a request of the caller that needs the chain is refused, and the caller
+  can repeat it ([service-interface.md](service-interface.md)). A sync of the wallet ends with an
+  error that names the problem, and the wallet keeps what it knows.
+- What the engine knows about the chain stays valid while it has no connection. After a new
+  connection the engine evaluates the blocks that it missed. It notices a reorganisation that
+  happened in between and treats it like one that it saw while it was connected.
+- A peer of another network does not answer. The engine cannot tell it from a peer that is not
+  reachable.
+
+Rationale for the first rule: the user chooses the peers, for example his own node. A peer learns
+the IP address of the user and the transactions that the user sends, and a client with a single
+peer depends on this peer for a complete view of the chain. The engine must not replace the
+user's choice by peers that it finds itself.
 
 A peer sees the IP address of the user and the transactions that the user sends. Hiding the IP
 address is not part of this specification. This is open point O4 in [README.md](README.md).
@@ -50,6 +70,12 @@ For every trade that is not final, from the moment the trader signed the deposit
 
 Watching works by output script: the engine tests the filter of every new block for the watched
 scripts, loads a block that matches, and looks for the transactions of the trade in it.
+
+A script or an output can be watched from an earlier block on. The engine then evaluates the
+blocks since that block again. Until this is done, it does not count as synced: a transaction that
+it does not know can still be in one of these blocks. The same holds for the scripts of the
+wallet, for example for the scripts that the wallet derives after a payment, and for a key that is
+imported with a start height.
 
 ## Confirmations
 
@@ -74,10 +100,19 @@ passed, and the inputs are unspent as far as it knows.
 A transaction that was sent has the status "sent" until the engine sees it in a block. The engine
 never reports a sent transaction as accepted or confirmed.
 
-The engine sends a transaction again at intervals until:
+The engine sends a transaction again after every new block in which the transaction is not
+confirmed, until:
 
 - the transaction is confirmed, or
 - another transaction that spends one of the same outputs is confirmed.
+
+A sending that fails, for example because no peer is reachable, is repeated after a pause of some
+seconds, without waiting for a new block.
+
+A peer asks for a transaction that it is told about only if it does not have the transaction
+already, and if it has not rejected the transaction since the last block. A sending for which no
+peer asks is therefore no error. The engine waits for the request of a peer for a limited time
+only.
 
 While a transaction stays unconfirmed, the engine can raise its fee ([fees.md](fees.md)).
 
@@ -137,6 +172,10 @@ At start-up the engine evaluates, for every trade that is not final, all blocks 
 at which the trader signed the deposit. It then performs the reactions for the events it finds, as
 if they had just happened. Deadlines are computed from block heights, so they are correct after a
 pause ([persistence-and-recovery.md](persistence-and-recovery.md)).
+
+The engine follows the chain from a block that the wallet knows, some blocks below the chain tip
+of the wallet. When a trade or a key of the wallet needs earlier blocks, the engine follows the
+chain from the earlier block.
 
 The engine observes nothing while `musigd` does not run. `musigd` runs only while bisq2 runs. The
 consequences for the user are stated in [post-trade-protection.md](post-trade-protection.md).

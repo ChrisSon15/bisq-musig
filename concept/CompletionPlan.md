@@ -215,7 +215,7 @@ still does not broadcast (F3).
 | Wallet `BMPWallet` | Real: encrypted, seed, CBF sync, imported keys, coin locks, `drain_imported_balance` | Section 6.2; fee bumping; recording of external transactions; key share derivation (D10) |
 | Wallet gRPC `wallet.Wallet` (`bmp_wallet.proto`) | Real, tested in Rust and Java. bisq2 contains a client for it (`wallet/src/main/java/bisq/wallet/WalletGrpcClient.java`); whether bisq2 uses the client in normal operation was not checked. | Notifications; a `Close` RPC that drains the imported coins (D8) |
 | Old wallet gRPC `walletrpc.Wallet` (`wallet.proto`) | Test wallet with a fixed regtest descriptor | Removed in WP1 (D16) |
-| Chain access (`chain`) | Broadcast trait; CBF scanner that builds a new client for every wallet sync | Long-running CBF client; watching scripts and outpoints; block height; reorganisation events; broadcast over the peer-to-peer network (D2) |
+| Chain access (`chain`) | Broadcast trait; CBF scanner that builds a new client for every wallet sync. Since WP3: one long-running CBF client for the wallet sync and the trade service. | Long-running CBF client; watching scripts and outpoints; block height; reorganisation events; broadcast over the peer-to-peer network (D2) |
 | `mem` crate | ZMQ transaction stream; no crate uses it | Removed in WP1 (D16) |
 | `musigd` | Starts the services on `127.0.0.1`. Broadcasts wallet transactions through Bitcoin Core RPC (F27). | Drain when Java calls `close` (D8), network checks, configuration, removal of the Bitcoin Core options (D2) |
 | `testenv` | bitcoind 29.0 and electrs on regtest, mining, funding; block filters are enabled | Helpers for reorganisations, mempool checks, lock time maturity, node restart. The Electrum server and its client `Testchain` are removed at the end of WP3. |
@@ -514,6 +514,59 @@ Done when: the engine reports confirmations, spends and reorganisations of trade
 regtest, also after a restart with blocks mined while it was stopped, `musigd` runs without any
 Bitcoin Core RPC connection, and the workspace contains no Electrum client and starts no Electrum
 server.
+
+Status on 2026-11-18 (branch `wp3-chain-access`): the second and the third condition hold. The
+first one holds for the chain client and for the trade service as far as the service goes today:
+the client reports confirmations, spends and reorganisations of the outputs of a trade, also a
+client that starts later (`protocol/tests/trade_model_integration_tests.rs`), and the service
+reports the confirmations of the deposit. The service does not report spends to the caller, and a
+restarted `musigd` knows no trade, because trades are kept in memory (WP4, WP5). The rules are
+specified in `docs/specifications/trade/chain-observation.md`.
+
+Done:
+
+- One long-running client, `chain::client::ChainClient`, with the interface `ChainAccess`:
+  watching of scripts and outputs, also from an earlier block on; chain tip; confirmations; the
+  transaction that spends an output; events for confirmations, reorganisations and the synced
+  height; broadcast of a transaction and of a package of parent and child (F21).
+- The client keeps its connection: it connects again after it lost its peers, evaluates the
+  blocks that it missed, and notices a reorganisation that happened in between. It reports
+  "no peer reachable" and "no compact block filters" (#188). It uses only the configured peers
+  (open point O15 of the specification).
+- The wallet sync and the trade service share this client (F28). `CBFScanner` is removed.
+- `musigd` has no Bitcoin Core options and no RPC connection to a node (F27). The trade service
+  publishes the deposit over the peer-to-peer network, repeats the sending after every block and
+  after a failure, and reports real confirmation events (F3). Requests that need the chain are
+  refused while the peers have a problem.
+- The sync loop of the wallet service continues after an error, with a pause that grows (F18,
+  #190). Peer addresses are parsed without a panic (F22). The wallet is not synced through a
+  client of another network.
+- The fee rate of the engine's own transactions is `protocol::params::engine_fee_rate` (fixed
+  10 sat/vB with a TODO, N1).
+- Package relay (N3): bitcoind 29.0 accepts a parent below the minimum fee of its full mempool
+  in a package from the client (test J7). It does not accept a parent below its fixed minimum
+  relay fee in a package. Both are stated in `docs/specifications/trade/fees.md`.
+- All tests use compact block filters. The Electrum path is removed: `electrs` and `Testchain`
+  in `testenv`, `MemWallet`, `ChainScanner`, and the dependency `bdk_electrum`.
+- Tests: J5, J7, J9, J10 for the client and for the service, J8, J11, and the chain parts of A1.
+
+Not done:
+
+- The harness of section 9.3 with `Party`, `Link` and `TradeSim`, and the check that no funds are
+  lost at the end of a test. The engine tests have a simpler form of it: every trader has a
+  wallet, an engine and an own client.
+- The engine has no state "sent" for a transaction, and it does not check a transaction before
+  it sends it (lock time, inputs). The swap transaction and the custom payout transaction are
+  not sent. All of this belongs to the reactions of WP4.
+- A wallet payment or a drain transaction whose sending fails stays recorded in the wallet and is
+  not sent again (N5).
+- A reorganisation of more than 10 blocks while the client is not connected: the new connection
+  starts at a block that is no longer part of the chain, and the client does not recover.
+- A new wallet follows the chain from its first block, as before. A start block for a new
+  wallet (a wallet birthday) does not exist.
+- The additions to `testenv` for stopping and starting bitcoind inside a test and for funding
+  P2WPKH coins and many small outputs.
+- The Java tests were compiled, not run.
 
 ### WP4 Complete the trade flows (estimate: 4 to 6 weeks)
 
@@ -878,8 +931,8 @@ reason. "Engine refuses" means: the engine returns an error and sends nothing.
    mock wallets (parts of B, C, D, G, K at level L1 and L3). They replace the Java `main` program
    as the only driver of the trade service and protect the move in WP1.
 2. With WP1 and WP2: the harness of 9.3, groups A (without chain timing), B, I, and H9, H10.
-   Status: the tests of these groups exist, but with a simpler helper on the Electrum server of
-   `testenv` instead of the harness on compact block filters.
+   Status: the tests of these groups exist, with a simpler helper instead of the harness. Since
+   WP3 the helper uses compact block filters, with one client per trader.
 3. With WP3: the harness of 9.3 on the shared compact block filter client, the move of the
    existing chain tests to it, the removal of the Electrum path, then J5, J7, J9, J10, J11 and
    the chain parts of A.
@@ -927,7 +980,7 @@ what should be checked at that review.
 | 1 | What does "when the wallet closes" in D8 mean: the shutdown of `musigd` and the closing or locking of the wallet, or the close of each trade? | `BmpWalletService` gets a new method `close`. Java calls it when the user ends the program. The method calls `drain_imported_balance`. | D8 in section 7.1; N5; WP2, WP4, WP7; test group M | The drain does not run when the program ends without the `close` call (crash, kill, power loss). Does `close` also end other work, for example the sync loop or open trades? |
 | 2 | Which payment methods need which lock times, and which values do the deposit timeout (D13) and the release safety margin (F6) get (N9)? | These values must be configurable. | N9; WP1, WP7; tests A11, A12, A15 | The default values, and the limits that the engine enforces. Both peers must use the same lock times. |
 | 3 | Who supplies the fee rate for transactions that the engine builds on its own (N1)? | It is supplied later. For now one method returns a fixed value of 10 sat/vB and contains a TODO. | N1; WP3, WP6; test I8; section 11 | The real fee rate source. With a fixed 10 sat/vB the claim, drain, abort and CPFP transactions can stay unconfirmed when the network needs a higher rate. |
-| 4 | Does package relay of a low-fee parent with its child work over the peer-to-peer network with the nodes that users will connect to (N3)? | Assume yes. | N3; WP3, WP6; test J7 | The result of test J7. It answers the question for bitcoind 29.0 only, not for all nodes that users connect to. |
+| 4 | Does package relay of a low-fee parent with its child work over the peer-to-peer network with the nodes that users will connect to (N3)? | Assume yes. | N3; WP3, WP6; test J7 | The result of test J7. It answers the question for bitcoind 29.0 only, not for all nodes that users connect to. Result of 2026-11-18: yes for a parent below the minimum fee of a full mempool; no for a parent below the fixed minimum relay fee of the node (1 sat/vB by default). A pre-signed fee rate must therefore not be below the fixed minimum relay fee. |
 | 5 | Is the derivation rule of N6 acceptable, including the rule that a trade id can never be used twice? | Yes. | N6; WP2, WP5; tests H9, H10, K2 | The exact derivation path and the test vectors, when `key-derivation.md` is written. |
 | 6 | Is the reorganisation rule of N8 acceptable: reactions at 1 confirmation, final at 3? | Yes. | N8; WP4; tests A14, J1 to J4 | Nothing specific. |
 | 7 | Does `musigd` keep running when bisq2 is closed? | No. | D7 and the paragraph after the table in section 7.1; N5; WP8 | Nothing is watched while bisq2 is closed. For closed trades the drain at `close` is the only protection in that time. For open trades the user must start the program before the claim lock time ends after a peer warning. Is this acceptable for mainnet, or is a watching process needed later? |

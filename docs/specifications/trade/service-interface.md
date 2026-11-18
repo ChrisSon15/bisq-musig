@@ -131,6 +131,8 @@ of the status describes the reason:
 | Unknown trade | `NOT_FOUND` |
 | Known trade ID in `InitTrade` | `ALREADY_EXISTS` |
 | Temporary: no wallet is open | `FAILED_PRECONDITION` |
+| Temporary: `musigd` was started without a peer, so the engine has no access to the chain, and the request needs it | `FAILED_PRECONDITION` |
+| Temporary: no peer is reachable, or no peer serves compact block filters, and the request needs the chain (`PublishDepositTx`, `SubscribeTxConfirmationStatus`) | `UNAVAILABLE`. The message names the problem. The trade is not changed, and the caller can repeat the request. |
 | Internal | `INTERNAL` |
 
 ## Events and responses

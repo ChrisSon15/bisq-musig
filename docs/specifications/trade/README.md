@@ -79,7 +79,7 @@ confirmed. The text of the files contains the rule of the column "Rule in the sp
 | # | Question | Rule in the specification | File |
 |---|---|---|---|
 | O1 | What may a terminated trade (D17) still do after the deposit is signed? **Postponed** on 2026-11-18; listed in `concept/CompletionPlan.md`, section 12, row 8. | Until the decision: the cooperative steps end. The engine keeps watching the chain and keeps every action that the trader can perform alone: warning, redirect, penalty, claim, swap transaction, reading the key from a spend, deposit abort. | [trade-states.md](trade-states.md) |
-| O3 | How does the engine handle a broadcast without a result (N2)? | Status "sent", repeated sending until the transaction or a conflicting one confirms. | [chain-observation.md](chain-observation.md) |
+| O3 | How does the engine handle a broadcast without a result (N2)? | Status "sent", repeated sending after every block until the transaction or a conflicting one confirms. A sending that fails is repeated after some seconds. | [chain-observation.md](chain-observation.md) |
 | O4 | Peers and the visible IP address (N4) | The peer list is a start option. Hiding the IP address is not specified. | [chain-observation.md](chain-observation.md) |
 | O5 | Wording of the security assumption for the open port (N7) | The computer and all its local users are trusted. | [service-interface.md](service-interface.md) |
 | O7 | Default values of the lock times, the deposit timeout and the release safety margin; limits of the lock times (N9) | Defaults until the decision: warning lock time 1440 blocks, claim lock time 720 blocks, deposit timeout 144 blocks, release safety margin 6 blocks. The limits are: warning lock time larger than 3 plus the release safety margin; claim lock time larger than 1. | [parameters.md](parameters.md) |
@@ -90,6 +90,7 @@ confirmed. The text of the files contains the rule of the column "Rule in the sp
 | O12 | Sanity limits of the engine for the deposit fee rate and the prepared fee rate | Not specified. | [fees.md](fees.md) |
 | O13 | Which request carries the trade parameters (amounts, fee rates, trade fee receiver)? The first version of this specification named the request that creates the trade (step 1). | Step 2 (`GetNonceShares`), as in the existing messages. No message changes. Nothing in step 1 depends on the parameters. | [parameters.md](parameters.md), [setup-and-deposit.md](setup-and-deposit.md) |
 | O14 | Two unmodified clients with different lock times in their configuration (D19): the partial signatures do not fit, and the engine cannot tell this from a modified client. | The setup is terminated (D17). Nothing is signed, so no funds are at risk. The reason names the trader's own lock times. | [parameters.md](parameters.md), [trade-states.md](trade-states.md) |
+| O15 | Does the engine use only the peers that the user configured? The library for compact block filters looks for other peers through DNS seeds when the configured peers fail. | Only the configured peers. Without a reachable configured peer the engine waits and reports the condition. | [chain-observation.md](chain-observation.md) |
 
 Points that were open and are decided:
 
