@@ -4,12 +4,16 @@
 //! The trade service uses the wallet of the wallet service, so a trade can be created only after
 //! the wallet is open.
 //!
-//! The test needs no chain. `musigd` creates its Bitcoin Core RPC client at start-up but connects
+//! The lock times of the trades are configuration values of `musigd`. It reads them from the
+//! environment and does not start with values outside the limits.
+//!
+//! The tests need no chain. `musigd` creates its Bitcoin Core RPC client at start-up but connects
 //! only for a broadcast, and without `--wallet-peer` the wallet does not sync.
 
+use std::io::Read as _;
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rpc::pb::bmp_wallet::wallet_client::WalletClient;
 use rpc::pb::bmp_wallet::{IsWalletReadyRequest, OpenOrCreateWalletRequest};
@@ -67,6 +71,9 @@ async fn musigd_serves_trade_service_and_wallet_service() {
         .arg(port.to_string())
         .arg("--wallet-dir")
         .arg(wallet_dir.path())
+        // Lock times from the environment, inside the limits.
+        .env("BISQ_MUSIG_WARNING_LOCK_TIME", "20")
+        .env("BISQ_MUSIG_CLAIM_LOCK_TIME", "10")
         .env("RUST_LOG", "off")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -114,4 +121,59 @@ async fn musigd_serves_trade_service_and_wallet_service() {
         .into_inner();
     assert_eq!(key_shares.buyer_output_pub_key_share.len(), 33);
     assert_eq!(key_shares.multisig_script_key.len(), 32);
+}
+
+/// The lock times are read from the environment: with a warning lock time outside the limits,
+/// `musigd` reports the value and ends, before it serves a request.
+#[test]
+fn musigd_does_not_start_with_a_lock_time_outside_the_limits() {
+    for (variable, value, expected) in [
+        (
+            "BISQ_MUSIG_WARNING_LOCK_TIME",
+            "9",
+            "warning lock time of 9 blocks",
+        ),
+        (
+            "BISQ_MUSIG_CLAIM_LOCK_TIME",
+            "1",
+            "claim lock time of 1 blocks",
+        ),
+        ("BISQ_MUSIG_WARNING_LOCK_TIME", "soon", "invalid value"),
+    ] {
+        let musigd = Command::new(env!("CARGO_BIN_EXE_musigd"))
+            .arg("--port")
+            .arg(free_port().to_string())
+            .env(variable, value)
+            .env("RUST_LOG", "off")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("musigd starts");
+        let mut musigd = MusigdProcess(musigd);
+
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        let status = loop {
+            if let Some(status) = musigd.0.try_wait().expect("process state") {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "musigd keeps running with {variable}={value}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(!status.success(), "{variable}={value}: {status}");
+        let mut error_output = String::new();
+        musigd
+            .0
+            .stderr
+            .take()
+            .expect("stderr is piped")
+            .read_to_string(&mut error_output)
+            .expect("readable error output");
+        assert!(
+            error_output.contains(expected),
+            "{variable}={value}: {error_output}"
+        );
+    }
 }

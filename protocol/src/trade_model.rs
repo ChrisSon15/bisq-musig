@@ -103,6 +103,9 @@ pub enum Role {
 #[derive(Clone, Default)]
 struct Received {
     params: Option<TradeParams>,
+    /// The configuration with which the trade was set up. A trade keeps its lock times when the
+    /// configuration of the engine changes later.
+    config: Option<EngineConfig>,
     nonce_shares: Option<ReceivedNonceShares>,
     partial_signatures: Option<ReceivedPartialSignatures>,
     payment_started: bool,
@@ -510,17 +513,18 @@ impl TradeModel {
                 return Ok(());
             }
             trade.require_state(&[TradeState::Init])?;
-            params.validate(config, trade.network)?;
+            params.validate(trade.network)?;
             let peers_key_shares = decoded(peers_key_shares)?;
             trade.check_peer_key_shares(&peers_key_shares)?;
 
             trade.set_peer_key_shares(&peers_key_shares);
-            trade.set_params(&params)?;
-            trade.aggregate_key_shares(&params)?;
+            trade.set_params(&params, *config)?;
+            trade.aggregate_key_shares(*config)?;
             trade.init_my_addresses(wallet)?;
             trade.init_my_half_deposit_psbt(wallet)?;
             trade.init_my_nonce_shares()?;
             trade.received.params = Some(params);
+            trade.received.config = Some(*config);
             Ok(())
         })
     }
@@ -630,11 +634,14 @@ impl TradeModel {
                 trade.sign_swap_tx_input_partial(sighash)?;
             }
             trade.set_peer_partial_signatures_on_my_txs(&received);
-            trade.aggregate_partial_signatures().or_peer_misbehaved(
-                "a partial signature of the peer is not valid for the transactions that we \
-                 computed (the peer runs modified software, or the two traders use different \
-                 trade parameters)",
-            )?;
+            let config = trade.received.config.unwrap_or_default();
+            trade
+                .aggregate_partial_signatures()
+                .or_peer_misbehaved(&format!(
+                    "a partial signature of the peer is not valid for the transactions that we \
+                     computed (the peer runs modified software, or the two traders use different \
+                     trade parameters or different lock times; our configuration: {config})"
+                ))?;
             trade.compute_my_signed_prepared_txs()?;
             trade.sign_deposit_psbt(wallet)?;
             trade.received.partial_signatures = Some(received);
@@ -1186,7 +1193,7 @@ impl TradeModel {
             .get_or_insert(keys.multisig_script);
     }
 
-    fn set_params(&mut self, params: &TradeParams) -> Result<()> {
+    fn set_params(&mut self, params: &TradeParams, config: EngineConfig) -> Result<()> {
         self.deposit_tx
             .builder
             .set_trade_amount(params.trade_amount)
@@ -1205,11 +1212,11 @@ impl TradeModel {
         for txs in [&mut self.buyer_txs, &mut self.seller_txs] {
             txs.warning
                 .builder
-                .set_lock_time(params.warning_lock_time());
+                .set_lock_time(config.warning_lock_time());
             txs.warning
                 .builder
                 .set_fee_rate(params.prepared_tx_fee_rate);
-            txs.claim.builder.set_lock_time(params.claim_lock_time());
+            txs.claim.builder.set_lock_time(config.claim_lock_time());
             txs.claim.builder.set_fee_rate(params.prepared_tx_fee_rate);
         }
         self.swap_tx
@@ -1218,7 +1225,7 @@ impl TradeModel {
         Ok(())
     }
 
-    fn aggregate_key_shares(&mut self, params: &TradeParams) -> Result<()> {
+    fn aggregate_key_shares(&mut self, config: EngineConfig) -> Result<()> {
         let network = self.network;
         self.keys.buyer_payout_ctx.aggregate_pub_key_shares()?;
         self.keys.seller_payout_ctx.aggregate_pub_key_shares()?;
@@ -1276,19 +1283,19 @@ impl TradeModel {
             .warning
             .seller_input_sig_ctx
             .set_tweaked_key_ctx(seller_payout_tweaked_key_ctx);
-        self.set_warning_escrow_keys(params)
+        self.set_warning_escrow_keys(config)
     }
 
     /// Computes the keys and the addresses of the escrow outputs of both warning transactions.
     /// The escrow of a trader's warning has the internal key of the payout of the peer, and a
     /// script leaf with the trader's own key share as claim key.
-    fn set_warning_escrow_keys(&mut self, params: &TradeParams) -> Result<()> {
+    fn set_warning_escrow_keys(&mut self, config: EngineConfig) -> Result<()> {
         let network = self.network;
         let [buyer_claim_merkle_root, seller_claim_merkle_root] =
             self.keys.claim_key_shares()?.map(|p| {
                 script_paths::warning_escrow_merkle_root(
                     &p.pub_key().to_public_key().into(),
-                    params.claim_lock_time(),
+                    config.claim_lock_time(),
                 )
             });
         let buyers_warning_escrow_tweaked_key_ctx = self
@@ -2051,10 +2058,14 @@ mod tests {
             sellers_security_deposit: Amount::from_sat(30_000),
             deposit_tx_fee_rate: FeeRate::from_sat_per_kwu(3_125),
             prepared_tx_fee_rate: FeeRate::from_sat_per_kwu(2_500),
-            warning_lock_time: 20,
-            claim_lock_time: 10,
             trade_fee_receiver: None,
         }
+    }
+
+    /// The configuration of the engines of both traders. Its lock times differ from the default
+    /// values, so the tests show that the engine uses the configuration.
+    fn config() -> EngineConfig {
+        EngineConfig::new(20, 10, 144, 6).expect("valid configuration")
     }
 
     fn receivers(receivers: [(&str, u64); 3]) -> Vec<Receiver<NetworkUnchecked>> {
@@ -2099,7 +2110,7 @@ mod tests {
         };
         trader.model.receive_key_shares(
             &mut *trader.wallet,
-            &EngineConfig::default(),
+            &config(),
             Ok(peers_key_shares),
             params(),
         )
@@ -2287,7 +2298,7 @@ mod tests {
                 redirect_tx.input[0].sequence,
                 REDIRECT_LOCK_TIME.to_sequence()
             );
-            // D5: the lock times of warning and claim transaction are the trade parameters.
+            // The lock times of warning and claim transaction come from the configuration.
             let warning_tx = me.model.my_signed_warning_tx().expect("signed");
             assert!(warning_tx.input.iter().all(|i| i.sequence.0 == 20));
             let claim_tx = me.model.my_signed_claim_tx().expect("signed");
@@ -2567,24 +2578,22 @@ mod tests {
         }
     }
 
-    /// G6: the peer signed transactions with another lock time. The peer computed its warning
-    /// transactions with another lock time, so its partial signatures are for other messages.
+    /// G6: the engine of the peer is configured with another warning lock time. The peer computed
+    /// its warning transactions with this lock time, so its partial signatures are for other
+    /// messages.
     #[test]
     fn g6_partial_signature_for_other_lock_time() {
         for roles in ROLE_PAIRS {
             let mut me = new_trader(roles.0);
             let mut peer = new_trader(roles.1);
             receive_key_shares(&mut me, &sent_key_shares(&peer)).expect("valid key shares");
-            let peers_params = TradeParams {
-                warning_lock_time: 21,
-                ..params()
-            };
+            let peers_config = EngineConfig::new(21, 10, 144, 6).expect("valid configuration");
             peer.model
                 .receive_key_shares(
                     &mut *peer.wallet,
-                    &EngineConfig::default(),
+                    &peers_config,
                     Ok(sent_key_shares(&me)),
-                    peers_params,
+                    params(),
                 )
                 .expect("valid key shares");
             receive_nonce_shares(&mut me, sent_nonce_shares(&peer), REDIRECTION_RECEIVERS)
@@ -2593,10 +2602,12 @@ mod tests {
                 .expect("valid nonce shares");
 
             let result = receive_partial_signatures(&mut me, &sent_partial_signatures(&peer));
+            // The reason names the own lock times, so that the user can compare them.
             assert_terminated(
                 &result,
                 &me,
-                "the two traders use different trade parameters",
+                "different lock times; our configuration: warning lock time 20 blocks, claim lock \
+                 time 10 blocks",
             );
             assert_deposit_not_signed(&me);
         }
@@ -2621,12 +2632,12 @@ mod tests {
 
             // Invalid trade parameters of the caller.
             let invalid_params = TradeParams {
-                claim_lock_time: 1,
+                sellers_security_deposit: Amount::from_sat(100),
                 ..params()
             };
             let result = me.model.receive_key_shares(
                 &mut *me.wallet,
-                &EngineConfig::default(),
+                &config(),
                 Ok(sent_key_shares(&peer)),
                 invalid_params,
             );
@@ -2647,7 +2658,7 @@ mod tests {
             };
             let result = me.model.receive_key_shares(
                 &mut *me.wallet,
-                &EngineConfig::default(),
+                &config(),
                 Ok(sent_key_shares(&peer)),
                 other_params,
             );
@@ -2728,12 +2739,9 @@ mod tests {
             assert_eq!(me.model.state(), TradeState::Init);
 
             // The key shares of the peer are allowed now.
-            let result = me.model.receive_key_shares(
-                &mut *me.wallet,
-                &EngineConfig::default(),
-                undecodable(),
-                params(),
-            );
+            let result =
+                me.model
+                    .receive_key_shares(&mut *me.wallet, &config(), undecodable(), params());
             assert_terminated(&result, &me, "cannot be decoded: invalid length");
             assert!(
                 me.model.my_half_deposit_psbt().is_err(),

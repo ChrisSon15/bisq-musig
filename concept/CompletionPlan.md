@@ -11,7 +11,7 @@ WP1 was carried out on 2026-11-18 (branches `wp1-first-steps`, `wp1-move-trade-m
 the plan point to the code after WP1. The other text of the plan still describes the state of
 revision 3; sections 2 and 4.3 and the findings name what WP1 changed.
 
-The decisions D17 and D18 and the tests G13 to G15 were added on 2026-11-18.
+The decisions D17, D18 and D19 and the tests G13 to G15 were added on 2026-11-18.
 
 The specification of WP0 was written on 2026-11-18 to `docs/specifications/trade/`. Its README
 lists the open points that wait for a confirmation by the project owner. On the same day O2 was
@@ -282,7 +282,7 @@ The decisions D1 to D16 were taken by the project owner on 2026-11-17, D17 and D
 | D2 | How does the engine observe the chain? | Compact block filters over the peer-to-peer network only. No direct use of Bitcoin Core RPC. Reason: privacy. | One implementation of the chain interface. The engine sees confirmed transactions only. Broadcast goes to peers and returns no acceptance result. `musigd` loses its Bitcoin Core options (F27). The tests still start bitcoind, as the peer that the client connects to and for assertions. Points N1 to N4. |
 | D3 | Claim by pre-signed transaction or by script? | By script spend. | The claim transaction leaves the set of pre-signed transactions: two signing sessions and three protobuf fields less. The claimer builds and signs it alone, with a current fee rate, and can replace it with a higher fee. The escrow output does not change (section 4.1). |
 | D4 | Redirect lock time of 1 block? | Yes. | Constant of the protocol, not a trade parameter. A redirect can be sent when the warning has 1 confirmation. |
-| D5 | Final lock times; values per payment method? | Explicit trade parameters that both peers agree on and that are part of the contract. `NetworkParams for Network` is removed. | Java passes the parameters at trade start: since WP1 with `GetNonceShares` (open point O13 of the specification). The engine checks limits and that both peers use the same values. Tests can use any value. The values per payment method are still open (N9). |
+| D5 | Final lock times; values per payment method? | Explicit trade parameters that both peers agree on and that are part of the contract. `NetworkParams for Network` is removed. For the lock times D19 replaces this decision. | Java passes the parameters at trade start: since WP1 with `GetNonceShares` (open point O13 of the specification). The engine checks limits and that both peers use the same values. Tests can use any value. The values per payment method are still open (N9). |
 | D6 | Confirmations before the payment may start? | A constant with the value 3. | `MIN_CONFIRMATIONS = 3` in the `protocol` crate. The engine refuses to sign the swap transaction and to release a key share below this depth (F9). The handling of reorganisations is specified in WP0 (N8). |
 | D7 | Who starts time-critical reactions? | The engine, automatically, while `musigd` runs. `musigd` runs only while bisq2 runs (section 12, answer 7). | Penalty, redirect after the peer's warning, claim, and the swap transaction before the warning lock time are started by the engine. Java receives events and decides only where the protocol allows a choice. |
 | D8 | Protection after the trade is closed. | `musigd` keeps watching closed trades. When the wallet closes, all imported coins are moved to the seed wallet with `drain_imported_balance`. "The wallet closes" means: Java calls a new method `close` of `BmpWalletService` when the user ends the program (section 12, answer 1). Spending imported coins first stays mandatory. | Watching in WP4. A new `close` method and a `Close` RPC that build, sign, store and send the drain transaction (WP2, WP4, WP7). F15 stays as it is. Point N5. |
@@ -296,6 +296,7 @@ The decisions D1 to D16 were taken by the project owner on 2026-11-17, D17 and D
 | D16 | Future of `walletrpc.Wallet` and the `mem` crate. | Remove both now, also if this breaks bisq2. | First step of WP1. bisq2 at commit `bac6dd1d1c` contains no reference to `walletrpc` (text search), so no break is expected there. |
 | D17 | When does a failed check terminate a trade? | Everything by which the engine detects that the other side tampered with the software or does not run our client terminates the trade. The reason is logged in detail. The trade is unusable afterwards; there is no recovery. Other conditions, which can also happen because of network issues for example, can be repeated. (First form of the decision on the same day: "anything which fails the validation terminates the trade".) | The specification lists the checks of each kind (`docs/specifications/trade/trade-states.md`). The engine marks the trade as terminated, logs the reason, accepts no corrected data and does not change the state. Implemented so far for the check of the peer's nonce shares only (G4). The other checks of peer data do not terminate the trade yet (WP1). Which actions a terminated trade keeps after the deposit is signed is postponed (section 12, row 8). Tests G13, G15. |
 | D18 | In which order does the engine process a request? | Validate before storing, and check the state before any change. | Every engine operation checks the state first, then validates all data of the request, and only then stores data or signs. A refused request leaves no data and no signature in the trade. The handlers in `rpc/src/server.rs` do not follow this order yet: several store request data before the validation, and `SignCustomPayoutTx` signs before the state check (WP1). Tests G14. |
+| D19 | Where do the lock times of a trade come from? | 2026-11-18: the warning lock time and the claim lock time are configuration parameters of bisq-musig, read from the environment. They are not part of the RPC protocol. | `EngineConfig` in `protocol::params` holds them, together with the deposit timeout and the release safety margin. `musigd` reads `BISQ_MUSIG_WARNING_LOCK_TIME`, `BISQ_MUSIG_CLAIM_LOCK_TIME`, `BISQ_MUSIG_DEPOSIT_TIMEOUT` and `BISQ_MUSIG_RELEASE_SAFETY_MARGIN` (or the options of the same meaning) and does not start with values outside the limits. Consequences: one pair of lock times for all trades and payment methods of a daemon; both traders must configure the same values, otherwise the setup is terminated before the deposit is signed (open point O14 of the specification). |
 
 What D8 and answer 7 of section 12 mean together: `musigd` does not run while bisq2 is closed, so
 nothing is watched in that time. For closed trades the drain at `close` is then the only
@@ -393,12 +394,14 @@ Status on 2026-11-18: done, with these differences to the list above.
 - The engine has no chain interface yet. No operation of the engine uses the chain before WP3,
   so the parameter is added there, together with the first use (broadcast of the deposit).
   The ported tests send the transactions to the node themselves.
-- The trade parameters arrive with `GetNonceShares`, not with `InitTrade`. `rpc.proto` got the
-  fields `warningLockTime` and `claimLockTime`. bisq2 must send them (WP7).
+- The trade parameters (amounts, fee rates, trade fee receiver) arrive with `GetNonceShares`, as
+  before, not with `InitTrade`. The lock times are configuration values of `musigd`, read from
+  the environment (D19). `rpc.proto` did not change.
 - `musigd` uses the wallet of the wallet service for trades. A trade needs `--wallet-dir` and an
   open, funded wallet. The development flow of bisq2 with mock data no longer works.
-- The values of `EngineConfig` (deposit timeout 144 blocks, release safety margin 6 blocks) are
-  placeholders until N9 is decided, and `musigd` has no option for them yet.
+- The default values of `EngineConfig` (warning lock time 1440 blocks, claim lock time 720
+  blocks, deposit timeout 144 blocks, release safety margin 6 blocks) are placeholders until N9
+  is decided.
 - The confirmation depth (D6) and the release safety margin (F6) are constants and configuration
   values now, but nothing enforces them before the engine sees the chain (WP3, WP4).
 - The signatures of the peer in a custom payout PSBT are not verified yet. A PSBT without valid
@@ -648,8 +651,8 @@ reason. "Engine refuses" means: the engine returns an error and sends nothing.
 | A8 | Two trades start at the same time from one wallet | No coin is used twice |
 | A9 | Trade with a fee receiver output (D9) | Output exists with the exact amount; paid by the seller's half |
 | A10 | Amount below the minimum (D14) | Rejected before any coin is reserved |
-| A11 | Peers use different fee rates, lock times or amounts (D5) | Setup fails with an error before the deposit is signed |
-| A12 | Trade parameters outside the limits: redirect lock time not 1, warning lock time not larger than `MIN_CONFIRMATIONS` plus margin, zero claim lock time | Rejected in the request that carries the parameters, before a coin is reserved. Since WP1 this is `GetNonceShares` (open point O13 of the specification). |
+| A11 | Peers use different fee rates or amounts (D5), or different lock times in their configuration (D19) | Setup fails with an error before the deposit is signed |
+| A12 | Trade parameters outside the limits: redirect lock time not 1, warning lock time not larger than `MIN_CONFIRMATIONS` plus margin, zero claim lock time | Lock times (D19): `musigd` does not start, and `EngineConfig::new` returns an error. Other parameters: rejected in `GetNonceShares`, before a coin is reserved. |
 | A13 | The peer's deposit input does not exist or is already spent (D12: not checked) | Deposit never confirms; abort as in A3; own coins are free again |
 | A14 | Swap signature or key share requested at 0, 1 and 2 confirmations (both roles) | Engine refuses; succeeds at 3 (D6, F9) |
 | A15 | Deposit timeout and release safety margin set to other values in the configuration | The engine uses the configured values; without configuration it uses the defaults (N9) |

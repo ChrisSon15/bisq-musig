@@ -12,10 +12,6 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 public class TradeProtocolClient {
-    // Lock times in blocks. They are trade parameters and must be the same for both traders.
-    private static final int WARNING_LOCK_TIME = 1440;
-    private static final int CLAIM_LOCK_TIME = 720;
-
     private final MusigGrpc.MusigBlockingStub buyerStub;
     private final MusigGrpc.MusigBlockingStub sellerStub;
 
@@ -28,7 +24,9 @@ public class TradeProtocolClient {
      * Carries out mock trades between two MuSig daemons, one for the buyer and one for the seller.
      *
      * <p>Each daemon must run with a wallet directory, and its wallet must be open and hold
-     * enough funds for the deposits, because the trade service uses the wallet of the daemon. The
+     * enough funds for the deposits, because the trade service uses the wallet of the daemon.
+     * Both daemons must be configured with the same lock times (environment variables
+     * {@code BISQ_MUSIG_WARNING_LOCK_TIME} and {@code BISQ_MUSIG_CLAIM_LOCK_TIME}). The
      * ports are taken from the system properties {@code buyer.port} (default 50051) and
      * {@code seller.port} (default 50052).
      */
@@ -112,8 +110,6 @@ public class TradeProtocolClient {
                 .setBuyersSecurityDeposit(30_000)
                 .setSellersSecurityDeposit(30_000)
                 .setTradeFeeReceiver(mockTradeFeeReceiver())
-                .setWarningLockTime(WARNING_LOCK_TIME)
-                .setClaimLockTime(CLAIM_LOCK_TIME)
                 .build());
         System.out.println("Got reply: " + sellerNonceShareMessage);
 
@@ -130,8 +126,6 @@ public class TradeProtocolClient {
                 .setBuyersSecurityDeposit(30_000)
                 .setSellersSecurityDeposit(30_000)
                 .setTradeFeeReceiver(mockTradeFeeReceiver())
-                .setWarningLockTime(WARNING_LOCK_TIME)
-                .setClaimLockTime(CLAIM_LOCK_TIME)
                 .build());
         System.out.println("Got reply: " + buyerNonceShareMessage);
 
@@ -211,8 +205,6 @@ public class TradeProtocolClient {
                 .setBuyersSecurityDeposit(30_000)
                 .setSellersSecurityDeposit(30_000)
                 .setTradeFeeReceiver(mockTradeFeeReceiver())
-                .setWarningLockTime(WARNING_LOCK_TIME)
-                .setClaimLockTime(CLAIM_LOCK_TIME)
                 .build());
         System.out.println("Got reply: " + buyerNonceShareMessage);
 
@@ -229,8 +221,6 @@ public class TradeProtocolClient {
                 .setBuyersSecurityDeposit(30_000)
                 .setSellersSecurityDeposit(30_000)
                 .setTradeFeeReceiver(mockTradeFeeReceiver())
-                .setWarningLockTime(WARNING_LOCK_TIME)
-                .setClaimLockTime(CLAIM_LOCK_TIME)
                 .build());
         System.out.println("Got reply: " + sellerNonceShareMessage);
 

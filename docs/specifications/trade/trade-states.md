@@ -125,7 +125,9 @@ produces, whatever happens on the network. These are:
 - a half of the deposit that breaks the rules of that file;
 - an address of the peer for another network;
 - a nonce of the peer that is used for more than one signature;
-- a partial signature of the peer that is not valid for the transaction that the trader computed;
+- a partial signature of the peer that is not valid for the transaction that the trader computed.
+  Different lock times in the configuration of two unmodified clients have the same effect, and
+  the engine cannot tell the two cases apart ([parameters.md](parameters.md));
 - a partial signature in message E that does not complete the adaptor signature of the swap
   transaction;
 - a secret key share in message F or G that does not match the public key share of the peer;

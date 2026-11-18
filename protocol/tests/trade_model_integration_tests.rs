@@ -38,10 +38,12 @@ const FEE_RATE: FeeRate = FeeRate::from_sat_per_kwu(2_500);
 // Lock times in blocks. They are short, so that the tests mine only a few blocks.
 const WARNING_LOCK_TIME: u16 = 5;
 const CLAIM_LOCK_TIME: u16 = 3;
-const CONFIG: EngineConfig = EngineConfig {
-    deposit_timeout: 6,
-    release_safety_margin: 1,
-};
+
+/// The configuration of both engines: the lock times of the tests, a deposit timeout of 6 blocks
+/// and a release safety margin of 1 block.
+fn config() -> EngineConfig {
+    EngineConfig::new(WARNING_LOCK_TIME, CLAIM_LOCK_TIME, 6, 1).expect("valid configuration")
+}
 
 // Weights of the signed transactions, as defined in `protocol::transaction`.
 const WARNING_TX_WEIGHT: u64 = 846;
@@ -136,14 +138,12 @@ impl Trader {
             sellers_security_deposit: SELLERS_SECURITY_DEPOSIT,
             deposit_tx_fee_rate: FEE_RATE,
             prepared_tx_fee_rate: FEE_RATE,
-            warning_lock_time: WARNING_LOCK_TIME,
-            claim_lock_time: CLAIM_LOCK_TIME,
             trade_fee_receiver: None,
         };
         self.model
             .receive_key_shares(
                 &mut *self.wallet,
-                &CONFIG,
+                &config(),
                 Ok(peer.sent_key_shares()),
                 params,
             )

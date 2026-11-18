@@ -12,6 +12,20 @@ them by `build.rs` (into `src/pb`), the Java code by Maven. The server hosts the
 `musigd` serves `Musig` always, and `wallet.Wallet` when started with `--wallet-dir`. The trade service uses the wallet
 of the wallet service: a trade can be started only when `musigd` runs with `--wallet-dir` and the wallet is open.
 
+The lock times of the trades are configuration values of `musigd`, not fields of a request. `musigd` reads them from
+the environment when it starts (an option of the same meaning has priority):
+
+| Environment variable               | Option                    | Default | Meaning (all values in blocks)                                                |
+|------------------------------------|---------------------------|---------|-------------------------------------------------------------------------------|
+| `BISQ_MUSIG_WARNING_LOCK_TIME`     | `--warning-lock-time`     | 1440    | Lock time of the warning transactions, after the confirmation of the deposit   |
+| `BISQ_MUSIG_CLAIM_LOCK_TIME`       | `--claim-lock-time`       | 720     | Lock time of the claim transactions, after the confirmation of the warning     |
+| `BISQ_MUSIG_DEPOSIT_TIMEOUT`       | `--deposit-timeout`       | 144     | Blocks without a confirmed deposit after which a trader aborts the deposit     |
+| `BISQ_MUSIG_RELEASE_SAFETY_MARGIN` | `--release-safety-margin` | 6       | The seller does not release when fewer blocks remain before the buyer's warning |
+
+Both traders must use the same two lock times. With different values the setup of a trade ends before the deposit is
+signed. The warning lock time must be larger than 3 plus the release safety margin, and the claim lock time larger
+than 1; `musigd` does not start otherwise.
+
 The behaviour of the trade protocol is specified in [docs/specifications/trade](../docs/specifications/trade/README.md).
 
 #### Trade protocol (`Musig` service)

@@ -1,6 +1,8 @@
 //! Trade parameters, constants of the protocol and configuration values of the engine. The rules
 //! are specified in `docs/specifications/trade/parameters.md`.
 
+use std::fmt::{self, Display, Formatter};
+
 use bdk_wallet::bitcoin::address::NetworkUnchecked;
 use bdk_wallet::bitcoin::amount::CheckedSum as _;
 use bdk_wallet::bitcoin::relative::LockTime;
@@ -32,37 +34,76 @@ pub struct TradeParams {
     pub deposit_tx_fee_rate: FeeRate,
     /// The fee rate of the swap, warning and redirect transactions.
     pub prepared_tx_fee_rate: FeeRate,
-    /// The relative lock time of both warning transactions, in blocks after the confirmation of
-    /// the deposit transaction.
-    pub warning_lock_time: u16,
-    /// The relative lock time of both claim transactions, in blocks after the confirmation of
-    /// the warning transaction.
-    pub claim_lock_time: u16,
     /// At most one output of the deposit transaction that the seller pays.
     pub trade_fee_receiver: Option<Receiver<NetworkUnchecked>>,
 }
 
-/// Values of one trader's engine. The peer does not know them.
+/// The configuration of one trader's engine. It is not part of a request: the program that runs
+/// the engine reads it from its own configuration.
+///
+/// The lock times decide the transactions of a trade, so the engines of both traders must have
+/// the same lock times. The engine cannot compare them directly. If they differ, the partial
+/// signatures of the peer are not valid for the trader's transactions, and the setup fails before
+/// the deposit transaction is signed.
+///
+/// A value of this type satisfies the limits of the specification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EngineConfig {
-    /// The number of blocks without a confirmed deposit after which the trader aborts the deposit.
-    pub deposit_timeout: u16,
-    /// The seller does not release the payout when fewer blocks than this remain before the
-    /// buyer's warning transaction becomes valid.
-    pub release_safety_margin: u16,
+    warning_lock_time: u16,
+    claim_lock_time: u16,
+    deposit_timeout: u16,
+    release_safety_margin: u16,
 }
 
-impl Default for EngineConfig {
-    // TODO: The default values are not decided yet (open point O7 of the specification).
-    fn default() -> Self {
-        Self {
-            deposit_timeout: 144,
-            release_safety_margin: 6,
+impl EngineConfig {
+    // TODO: The default values are not decided yet (open point O7 of the specification). The
+    //  lock times are the values that the engine used for mainnet before they became
+    //  configuration values.
+    pub const DEFAULT_WARNING_LOCK_TIME: u16 = 144 * 10;
+    pub const DEFAULT_CLAIM_LOCK_TIME: u16 = 144 * 5;
+    pub const DEFAULT_DEPOSIT_TIMEOUT: u16 = 144;
+    pub const DEFAULT_RELEASE_SAFETY_MARGIN: u16 = 6;
+
+    /// Creates a configuration, or returns an error if a value is outside the limits. All values
+    /// are numbers of blocks.
+    ///
+    /// - `warning_lock_time`: the relative lock time of both warning transactions, counted from the
+    ///   confirmation of the deposit transaction.
+    /// - `claim_lock_time`: the relative lock time of both claim transactions, counted from the
+    ///   confirmation of the warning transaction.
+    /// - `deposit_timeout`: the number of blocks without a confirmed deposit after which the trader
+    ///   aborts the deposit.
+    /// - `release_safety_margin`: the seller does not release the payout when fewer blocks than
+    ///   this remain before the buyer's warning transaction becomes valid.
+    pub fn new(
+        warning_lock_time: u16,
+        claim_lock_time: u16,
+        deposit_timeout: u16,
+        release_safety_margin: u16,
+    ) -> Result<Self, EngineConfigError> {
+        let minimum_warning_lock_time =
+            u32::from(MIN_CONFIRMATIONS) + u32::from(release_safety_margin);
+        if u32::from(warning_lock_time) <= minimum_warning_lock_time {
+            return Err(EngineConfigError(format!(
+                "the warning lock time of {warning_lock_time} blocks is not larger than \
+                 {minimum_warning_lock_time} blocks (minimum confirmations plus release safety \
+                 margin)"
+            )));
         }
+        if claim_lock_time <= REDIRECT_LOCK_TIME_BLOCKS {
+            return Err(EngineConfigError(format!(
+                "the claim lock time of {claim_lock_time} blocks is not larger than the redirect \
+                 lock time of {REDIRECT_LOCK_TIME_BLOCKS} block"
+            )));
+        }
+        Ok(Self {
+            warning_lock_time,
+            claim_lock_time,
+            deposit_timeout,
+            release_safety_margin,
+        })
     }
-}
 
-impl TradeParams {
     pub const fn warning_lock_time(&self) -> LockTime {
         LockTime::from_height(self.warning_lock_time)
     }
@@ -71,31 +112,49 @@ impl TradeParams {
         LockTime::from_height(self.claim_lock_time)
     }
 
+    pub const fn deposit_timeout(&self) -> u16 {
+        self.deposit_timeout
+    }
+
+    pub const fn release_safety_margin(&self) -> u16 {
+        self.release_safety_margin
+    }
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            warning_lock_time: Self::DEFAULT_WARNING_LOCK_TIME,
+            claim_lock_time: Self::DEFAULT_CLAIM_LOCK_TIME,
+            deposit_timeout: Self::DEFAULT_DEPOSIT_TIMEOUT,
+            release_safety_margin: Self::DEFAULT_RELEASE_SAFETY_MARGIN,
+        }
+    }
+}
+
+impl Display for EngineConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "warning lock time {} blocks, claim lock time {} blocks, deposit timeout {} blocks, \
+             release safety margin {} blocks",
+            self.warning_lock_time,
+            self.claim_lock_time,
+            self.deposit_timeout,
+            self.release_safety_margin
+        )
+    }
+}
+
+#[derive(Error, Debug, Eq, PartialEq)]
+#[error("invalid configuration of the trade engine: {0}")]
+pub struct EngineConfigError(pub String);
+
+impl TradeParams {
     /// Checks the limits of the specification. The check needs no wallet and no data of the peer,
     /// so it can run before any coin is reserved.
-    pub fn validate(
-        &self,
-        config: &EngineConfig,
-        network: Network,
-    ) -> Result<(), TradeParamsError> {
+    pub fn validate(&self, network: Network) -> Result<(), TradeParamsError> {
         let invalid = |reason: String| Err(TradeParamsError(reason));
-
-        let minimum_warning_lock_time =
-            u32::from(MIN_CONFIRMATIONS) + u32::from(config.release_safety_margin);
-        if u32::from(self.warning_lock_time) <= minimum_warning_lock_time {
-            return invalid(format!(
-                "the warning lock time of {} blocks is not larger than {minimum_warning_lock_time} \
-                 blocks (minimum confirmations plus release safety margin)",
-                self.warning_lock_time
-            ));
-        }
-        if self.claim_lock_time <= REDIRECT_LOCK_TIME_BLOCKS {
-            return invalid(format!(
-                "the claim lock time of {} blocks is not larger than the redirect lock time of \
-                 {REDIRECT_LOCK_TIME_BLOCKS} block",
-                self.claim_lock_time
-            ));
-        }
 
         if let Some(receiver) = &self.trade_fee_receiver {
             let receiver = match receiver.clone().require_network(network) {
@@ -174,103 +233,96 @@ mod tests {
             sellers_security_deposit: Amount::from_sat(30_000),
             deposit_tx_fee_rate: FeeRate::from_sat_per_kwu(3_125),
             prepared_tx_fee_rate: FeeRate::from_sat_per_kwu(2_500),
-            warning_lock_time: 20,
-            claim_lock_time: 10,
             trade_fee_receiver: None,
         }
     }
 
     #[track_caller]
-    fn assert_invalid(params: &TradeParams, config: EngineConfig, expected: &str) {
+    fn assert_invalid(params: &TradeParams, expected: &str) {
         let error = params
-            .validate(&config, Network::Regtest)
+            .validate(Network::Regtest)
             .expect_err("params are invalid");
+        assert!(error.0.contains(expected), "unexpected error: {error}");
+    }
+
+    #[track_caller]
+    fn assert_invalid_config(config: Result<EngineConfig, EngineConfigError>, expected: &str) {
+        let error = config.expect_err("the configuration is invalid");
         assert!(error.0.contains(expected), "unexpected error: {error}");
     }
 
     #[test]
     fn valid_params_are_accepted() {
-        assert_eq!(
-            valid_params().validate(&EngineConfig::default(), Network::Regtest),
-            Ok(())
+        assert_eq!(valid_params().validate(Network::Regtest), Ok(()));
+    }
+
+    /// The default configuration satisfies the limits.
+    #[test]
+    fn default_config_is_valid() {
+        let config = EngineConfig::new(
+            EngineConfig::DEFAULT_WARNING_LOCK_TIME,
+            EngineConfig::DEFAULT_CLAIM_LOCK_TIME,
+            EngineConfig::DEFAULT_DEPOSIT_TIMEOUT,
+            EngineConfig::DEFAULT_RELEASE_SAFETY_MARGIN,
         );
+        assert_eq!(config, Ok(EngineConfig::default()));
     }
 
     /// A12: the warning lock time must be larger than the minimum confirmations plus the release
-    /// safety margin, and the claim lock time must be larger than the redirect lock time.
+    /// safety margin, and the claim lock time must be larger than the redirect lock time. A
+    /// configuration outside these limits cannot be created.
     #[test]
     fn a12_lock_times_outside_the_limits_are_rejected() {
-        let config = EngineConfig {
-            release_safety_margin: 6,
-            ..EngineConfig::default()
-        };
-        let params = TradeParams {
-            warning_lock_time: 9,
-            ..valid_params()
-        };
-        assert_invalid(&params, config, "warning lock time of 9 blocks");
-        let params = TradeParams {
-            warning_lock_time: 10,
-            ..valid_params()
-        };
-        assert_eq!(params.validate(&config, Network::Regtest), Ok(()));
+        let release_safety_margin = 6;
+        assert_invalid_config(
+            EngineConfig::new(9, 10, 144, release_safety_margin),
+            "warning lock time of 9 blocks",
+        );
+        let config = EngineConfig::new(10, 10, 144, release_safety_margin).expect("valid");
+        assert_eq!(config.warning_lock_time(), LockTime::from_height(10));
+        assert_eq!(config.claim_lock_time(), LockTime::from_height(10));
+        assert_eq!(config.deposit_timeout(), 144);
+        assert_eq!(config.release_safety_margin(), 6);
 
         // Another margin changes the limit (A15).
-        let config = EngineConfig {
-            release_safety_margin: 0,
-            ..EngineConfig::default()
-        };
-        let params = TradeParams {
-            warning_lock_time: 4,
-            ..valid_params()
-        };
-        assert_eq!(params.validate(&config, Network::Regtest), Ok(()));
-        let params = TradeParams {
-            warning_lock_time: 3,
-            ..valid_params()
-        };
-        assert_invalid(&params, config, "warning lock time of 3 blocks");
+        let release_safety_margin = 0;
+        assert!(EngineConfig::new(4, 10, 144, release_safety_margin).is_ok());
+        assert_invalid_config(
+            EngineConfig::new(3, 10, 144, release_safety_margin),
+            "warning lock time of 3 blocks",
+        );
 
         for claim_lock_time in [0, 1] {
-            let params = TradeParams {
-                claim_lock_time,
-                ..valid_params()
-            };
-            assert_invalid(&params, EngineConfig::default(), "claim lock time");
+            assert_invalid_config(
+                EngineConfig::new(20, claim_lock_time, 144, 6),
+                "claim lock time",
+            );
         }
-        let params = TradeParams {
-            claim_lock_time: 2,
-            ..valid_params()
-        };
-        assert_eq!(
-            params.validate(&EngineConfig::default(), Network::Regtest),
-            Ok(())
-        );
+        assert!(EngineConfig::new(20, 2, 144, 6).is_ok());
     }
 
     /// A10: amounts that would give a dust output in one of the transactions are rejected.
     #[test]
     fn a10_amounts_below_the_minimum_are_rejected() {
-        let config = EngineConfig::default();
         // The swap transaction pays 1110 sat of fee at this fee rate, and its output must not be
         // below 330 sat.
         let params = TradeParams {
             sellers_security_deposit: Amount::from_sat(1_439),
             ..valid_params()
         };
-        assert_invalid(&params, config, "fee of the swap transaction");
+        assert_invalid(&params, "fee of the swap transaction");
         let params = TradeParams {
             sellers_security_deposit: Amount::from_sat(1_440),
             ..valid_params()
         };
-        assert_eq!(params.validate(&config, Network::Regtest), Ok(()));
+        assert_eq!(params.validate(Network::Regtest), Ok(()));
 
         let params = TradeParams {
             trade_amount: Amount::ZERO,
             buyers_security_deposit: Amount::from_sat(329),
             ..valid_params()
         };
-        assert_invalid(&params, config, "payout of the deposit transaction is dust");
+        assert_invalid(&params, "payout of the deposit transaction is dust");
     }
 
     /// The trade fee receiver must have an address of the wallet's network and an amount above
@@ -283,30 +335,24 @@ mod tests {
                 amount: Amount::from_sat(amount),
             })
         };
-        let config = EngineConfig::default();
         let regtest_address = "bcrt1qwk6p86mzqmstcsg99qlu2mhsp3766u68jktv6k";
 
         let params = TradeParams {
             trade_fee_receiver: receiver(regtest_address, 5_000),
             ..valid_params()
         };
-        assert_eq!(params.validate(&config, Network::Regtest), Ok(()));
-        assert_invalid_network(&params);
-        let params = TradeParams {
-            trade_fee_receiver: receiver(regtest_address, 100),
-            ..valid_params()
-        };
-        assert_invalid(&params, config, "is dust");
-    }
-
-    #[track_caller]
-    fn assert_invalid_network(params: &TradeParams) {
+        assert_eq!(params.validate(Network::Regtest), Ok(()));
         let error = params
-            .validate(&EngineConfig::default(), Network::Bitcoin)
+            .validate(Network::Bitcoin)
             .expect_err("address of another network");
         assert!(
             error.0.contains("address of the trade fee receiver"),
             "unexpected error: {error}"
         );
+        let params = TradeParams {
+            trade_fee_receiver: receiver(regtest_address, 100),
+            ..valid_params()
+        };
+        assert_invalid(&params, "is dust");
     }
 }

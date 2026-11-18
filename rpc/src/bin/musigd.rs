@@ -8,7 +8,7 @@ use bdk_wallet::bitcoin::Network;
 use bmp_tracing::tracing::{info, warn};
 use chain::CBFScanner;
 use clap::Parser;
-use protocol::params::EngineConfig;
+use protocol::params::{EngineConfig, EngineConfigError};
 use protocol::trade_model::MemoryTradeStore;
 use rpc::bmp_wallet_service::{
     BMPWalletServiceImpl, BitcoinCoreChainApi, BmpWalletImpl, BmpWalletServer,
@@ -59,12 +59,64 @@ struct Cli {
     /// wait out the default.
     #[arg(long)]
     wallet_poll_secs: Option<u64>,
+
+    /// Relative lock time of the warning transactions of a trade, in blocks after the
+    /// confirmation of the deposit transaction. Both traders must use the same value.
+    #[arg(
+        long,
+        env = "BISQ_MUSIG_WARNING_LOCK_TIME",
+        default_value_t = EngineConfig::DEFAULT_WARNING_LOCK_TIME
+    )]
+    warning_lock_time: u16,
+
+    /// Relative lock time of the claim transactions of a trade, in blocks after the confirmation
+    /// of the warning transaction. Both traders must use the same value.
+    #[arg(
+        long,
+        env = "BISQ_MUSIG_CLAIM_LOCK_TIME",
+        default_value_t = EngineConfig::DEFAULT_CLAIM_LOCK_TIME
+    )]
+    claim_lock_time: u16,
+
+    /// Number of blocks without a confirmed deposit transaction after which a trader aborts the
+    /// deposit.
+    #[arg(
+        long,
+        env = "BISQ_MUSIG_DEPOSIT_TIMEOUT",
+        default_value_t = EngineConfig::DEFAULT_DEPOSIT_TIMEOUT
+    )]
+    deposit_timeout: u16,
+
+    /// The seller does not release the payout when fewer blocks than this remain before the
+    /// buyer's warning transaction becomes valid.
+    #[arg(
+        long,
+        env = "BISQ_MUSIG_RELEASE_SAFETY_MARGIN",
+        default_value_t = EngineConfig::DEFAULT_RELEASE_SAFETY_MARGIN
+    )]
+    release_safety_margin: u16,
+}
+
+impl Cli {
+    /// The configuration of the trade engine, from the options and the environment variables.
+    fn engine_config(&self) -> Result<EngineConfig, EngineConfigError> {
+        EngineConfig::new(
+            self.warning_lock_time,
+            self.claim_lock_time,
+            self.deposit_timeout,
+            self.release_safety_margin,
+        )
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let cli: Cli = Cli::parse();
     bmp_tracing::init("info");
+    // The lock times are part of every trade, so a configuration outside the limits stops the
+    // start of the daemon.
+    let engine_config = cli.engine_config()?;
+    info!("Configuration of the trade engine: {engine_config}.");
     // Create RPC client. (No connection is made at this point.) Only the broadcaster of the BMP
     // wallet uses it.
     let rpc_client = {
@@ -118,7 +170,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let musig = MusigImpl::new(
         Arc::new(MemoryTradeStore::default()),
         trade_wallet,
-        EngineConfig::default(),
+        engine_config,
     );
 
     let mut server = Server::builder().add_service(MusigServer::new(musig));
@@ -132,4 +184,44 @@ async fn main() -> Result<(), Box<dyn Error>> {
     server.serve(addr).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use bdk_wallet::bitcoin::relative::LockTime;
+
+    use super::*;
+
+    /// Without options and environment variables the engine gets its default configuration.
+    #[test]
+    fn engine_config_has_defaults() {
+        let cli = Cli::try_parse_from(["musigd"]).expect("valid command line");
+        assert_eq!(cli.engine_config(), Ok(EngineConfig::default()));
+    }
+
+    #[test]
+    fn engine_config_is_taken_from_the_options() {
+        let cli = Cli::try_parse_from([
+            "musigd",
+            "--warning-lock-time=20",
+            "--claim-lock-time=10",
+            "--deposit-timeout=12",
+            "--release-safety-margin=2",
+        ])
+        .expect("valid command line");
+        let config = cli.engine_config().expect("valid configuration");
+        assert_eq!(config.warning_lock_time(), LockTime::from_height(20));
+        assert_eq!(config.claim_lock_time(), LockTime::from_height(10));
+        assert_eq!(config.deposit_timeout(), 12);
+        assert_eq!(config.release_safety_margin(), 2);
+    }
+
+    /// A lock time outside the limits of the specification is no valid configuration.
+    #[test]
+    fn engine_config_outside_the_limits_is_rejected() {
+        let cli =
+            Cli::try_parse_from(["musigd", "--warning-lock-time=9"]).expect("valid command line");
+        let error = cli.engine_config().expect_err("9 is not larger than 3 + 6");
+        assert!(error.0.contains("warning lock time of 9 blocks"), "{error}");
+    }
 }

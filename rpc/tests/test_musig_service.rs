@@ -58,8 +58,8 @@ const SELLERS_SECURITY_DEPOSIT: u64 = 30_000;
 const BUYERS_PENALTY_TX_FEE_RATE: u64 = 3_750;
 const CUSTOM_PAYOUT_TX_FEE_RATE: u64 = 3_750;
 // Lock times in blocks. The values have no meaning for these tests, because no chain is used.
-const WARNING_LOCK_TIME: u32 = 20;
-const CLAIM_LOCK_TIME: u32 = 10;
+const WARNING_LOCK_TIME: u16 = 20;
+const CLAIM_LOCK_TIME: u16 = 10;
 
 //noinspection SpellCheckingInspection
 const TRADE_FEE_RECEIVER: (&str, u64) = ("bcrt1qwk6p86mzqmstcsg99qlu2mhsp3766u68jktv6k", 5_000);
@@ -177,7 +177,7 @@ async fn start_service(is_buyer: bool) -> (MusigClient<Channel>, Arc<MemoryTrade
     let service = MusigImpl::new(
         Arc::clone(&trades) as _,
         Arc::new(MockWalletProvider(tokio::sync::Mutex::new(wallet))),
-        EngineConfig::default(),
+        EngineConfig::new(WARNING_LOCK_TIME, CLAIM_LOCK_TIME, 144, 6).expect("valid configuration"),
     );
 
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -298,8 +298,6 @@ impl Party {
             buyers_security_deposit: BUYERS_SECURITY_DEPOSIT,
             sellers_security_deposit: SELLERS_SECURITY_DEPOSIT,
             trade_fee_receiver: Some(mock_trade_fee_receiver()),
-            warning_lock_time: WARNING_LOCK_TIME,
-            claim_lock_time: CLAIM_LOCK_TIME,
         }
     }
 

@@ -65,10 +65,10 @@ Requests that the interface needs in addition:
 
 Changes of existing messages that this specification requires:
 
-- The lock times are added to the request of step 2 (`GetNonceShares`), which already contains
-  the other trade parameters ([parameters.md](parameters.md)). A request without lock times is
-  refused, because the value 0 is outside the limits. Which request carries the trade parameters
-  is open point O13 in [README.md](README.md).
+- The lock times are not part of any message. They are configuration values of the engine
+  ([parameters.md](parameters.md)).
+- The trade parameters stay in the request of step 2 (`GetNonceShares`), as in the existing
+  messages. This is open point O13 in [README.md](README.md).
 - The nonces and the partial signature of the claim transactions are removed
   ([transactions.md](transactions.md)). The payout address of each trader stays.
 - The block height in responses is the height of the chain as the engine sees it.

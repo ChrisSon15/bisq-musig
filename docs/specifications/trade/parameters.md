@@ -23,24 +23,28 @@ change.
 | Seller's security deposit `Ds` | sat | |
 | Deposit fee rate | sat per 1000 weight units | Fee rate of the deposit transaction |
 | Prepared fee rate | sat per 1000 weight units | Fee rate of the swap, warning and redirect transactions |
-| Warning lock time | blocks | Relative lock time of both warning transactions, counted from the confirmation of the deposit |
-| Claim lock time | blocks | Relative lock time of both claim transactions, counted from the confirmation of the warning |
 | Trade fee receiver | address and amount | Optional. At most one output in the deposit transaction, paid by the seller |
 | Redirection receivers | list of address and amount | Outputs of both redirect transactions |
 
-The engine has no values of its own for the lock times. There are no values per network.
-
-Rationale: the lock times depend on the payment method, because the warning lock time is also the
-time that the seller has to receive the payment or to start mediation. Values that are fixed in
-the engine would not fit all payment methods, and tests need short lock times.
+The lock times are not trade parameters. They are configuration values of the engine (see
+below).
 
 ### How the traders agree
 
-The engine does not trust the caller that the peer uses the same parameters. The agreement is
-enforced by the signatures: every pre-signed transaction depends on the parameters, and a partial
-signature of the peer is valid only for the transaction that the trader computed himself. If the
-parameters differ, the aggregation of the signatures fails and the deposit is not signed
+The engine does not trust the caller that the peer uses the same parameters, and it cannot see
+the lock times of the peer's engine. The agreement is enforced by the signatures: every pre-signed
+transaction depends on the parameters and on the lock times, and a partial signature of the peer
+is valid only for the transaction that the trader computed himself. If the parameters or the lock
+times differ, the aggregation of the signatures fails and the deposit is not signed
 ([setup-and-deposit.md](setup-and-deposit.md)).
+
+The engine cannot tell different lock times of two unmodified clients from signatures of a
+modified client. In both cases it terminates the setup ([trade-states.md](trade-states.md)).
+Nothing is signed at this point, so no trader loses funds. The reason in the log and in the error
+names the trader's own lock times, so that the two traders can compare them. The caller can find
+the difference one step earlier: the transaction IDs that step 3 returns differ from the IDs of
+the peer. Whether such a difference should be handled in another way is open point O14 in
+[README.md](README.md).
 
 ## Constants of the protocol
 
@@ -55,21 +59,47 @@ These values are the same for every trade and every network. A trade parameter c
 
 ## Configuration values of the engine
 
-These values belong to one trader's engine. The peer does not know them.
+These values belong to one trader's engine. They are not part of any request of the service
+interface. `musigd` reads them when it starts, from its environment or from the option of the
+same meaning.
 
 | Value | Unit | Meaning |
 |---|---|---|
+| Warning lock time | blocks | Relative lock time of both warning transactions, counted from the confirmation of the deposit |
+| Claim lock time | blocks | Relative lock time of both claim transactions, counted from the confirmation of the warning |
 | Deposit timeout | blocks | Number of blocks without a confirmed deposit after which the trader aborts the deposit ([setup-and-deposit.md](setup-and-deposit.md)) |
 | Release safety margin | blocks | The seller does not release the payout when fewer blocks than this remain before the buyer's warning lock time ends ([closing.md](closing.md)) |
 | Engine fee rate | sat per vbyte | Fee rate of the transactions that the engine builds on its own ([fees.md](fees.md)) |
 
-Each value has a default and can be changed in the configuration of `musigd`. The default values
-are open point O7 in [README.md](README.md).
+| Value | Environment variable | Option of `musigd` | Default |
+|---|---|---|---|
+| Warning lock time | `BISQ_MUSIG_WARNING_LOCK_TIME` | `--warning-lock-time` | 1440 |
+| Claim lock time | `BISQ_MUSIG_CLAIM_LOCK_TIME` | `--claim-lock-time` | 720 |
+| Deposit timeout | `BISQ_MUSIG_DEPOSIT_TIMEOUT` | `--deposit-timeout` | 144 |
+| Release safety margin | `BISQ_MUSIG_RELEASE_SAFETY_MARGIN` | `--release-safety-margin` | 6 |
+
+An option has priority over the environment variable. The engine fee rate has no configuration
+yet ([fees.md](fees.md)). The default values are open point O7 in [README.md](README.md).
+
+Rules for the lock times:
+
+- Both traders must use the same warning lock time and the same claim lock time. The peer does
+  not know the other two values.
+- The lock times hold for every trade that the engine sets up, whatever the payment method is.
+- A trade keeps the lock times with which it was set up. A change of the configuration affects
+  only trades that are set up afterwards.
+- `musigd` does not start with values outside the limits below.
+
+This follows a decision of the project owner of 2026-11-18 (D19 in
+`concept/CompletionPlan.md`): the lock times are configuration parameters of bisq-musig, read from
+the environment, and not part of the service interface. The reason for the decision is not
+recorded here. Tests set short lock times through the configuration.
 
 ## Limits
 
 The engine rejects a trade whose parameters break one of these limits. The check happens before
-any coin of the wallet is reserved.
+any coin of the wallet is reserved. The limits of the lock times are checked when `musigd` starts:
+a configuration outside these limits cannot be used for any trade.
 
 Lock times:
 

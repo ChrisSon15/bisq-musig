@@ -184,8 +184,6 @@ impl musig_server::Musig for MusigImpl {
                     prepared_tx_fee_rate: FeeRate::from_sat_per_kwu(
                         request.prepared_tx_fee_rate.check_in_signed_range()?,
                     ),
-                    warning_lock_time: lock_time_in_blocks(request.warning_lock_time)?,
-                    claim_lock_time: lock_time_in_blocks(request.claim_lock_time)?,
                     trade_fee_receiver: request.trade_fee_receiver.try_proto_into()?,
                 };
                 trade_model.receive_key_shares(wallet, &self.config, peers_key_shares, params)?;
@@ -423,12 +421,6 @@ impl musig_server::Musig for MusigImpl {
         })
         .await
     }
-}
-
-/// Converts a lock time of a request. A relative lock time in blocks has 16 bits.
-fn lock_time_in_blocks(lock_time: u32) -> Result<u16> {
-    u16::try_from(lock_time)
-        .map_err(|_| Status::invalid_argument(format!("lock time out of range: {lock_time}")))
 }
 
 fn mock_tx_confirmation_status_stream(
