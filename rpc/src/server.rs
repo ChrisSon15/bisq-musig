@@ -469,7 +469,7 @@ fn mock_tx_confirmation_status_stream(
         debug!(
             trade_id,
             "Deposit tx confirmation status stream has been dropped."
-        )
+        );
     })
 }
 

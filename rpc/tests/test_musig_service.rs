@@ -1978,9 +1978,9 @@ async fn d5_custom_payout_with_changed_peer_psbt() {
 /// cases of G1 and G4 are unit tests of the engine.
 #[tokio::test]
 async fn g1_g4_invalid_encodings_are_rejected() {
+    type Change = fn(&mut PubKeySharesResponse, &[u8]);
     // 33 bytes with a valid prefix, but the X coordinate is not smaller than the field size.
     let no_point = [&[2][..], &[0xff; 32]].concat();
-    type Change = fn(&mut PubKeySharesResponse, &[u8]);
     let changes: [Change; 3] = [
         |key_shares, no_point| key_shares.buyer_output_pub_key_share = no_point.to_vec(),
         |key_shares, no_point| key_shares.seller_output_pub_key_share = no_point[..32].to_vec(),

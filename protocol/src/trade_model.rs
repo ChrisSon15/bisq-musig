@@ -1162,7 +1162,6 @@ impl TradeModel {
         Ok(())
     }
 
-    // TODO: Try to refactor this method:
     fn aggregate_key_shares(&mut self, params: &TradeParams) -> Result<()> {
         let network = self.network;
         self.keys.buyer_payout_ctx.aggregate_pub_key_shares()?;
@@ -1221,7 +1220,14 @@ impl TradeModel {
             .warning
             .seller_input_sig_ctx
             .set_tweaked_key_ctx(seller_payout_tweaked_key_ctx);
+        self.set_warning_escrow_keys(params)
+    }
 
+    /// Computes the keys and the addresses of the escrow outputs of both warning transactions.
+    /// The escrow of a trader's warning has the internal key of the payout of the peer, and a
+    /// script leaf with the trader's own key share as claim key.
+    fn set_warning_escrow_keys(&mut self, params: &TradeParams) -> Result<()> {
+        let network = self.network;
         let [buyer_claim_merkle_root, seller_claim_merkle_root] =
             self.keys.claim_key_shares()?.map(|p| {
                 script_paths::warning_escrow_merkle_root(
