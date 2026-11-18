@@ -93,6 +93,9 @@ impl musig_server::Musig for MusigImpl {
     async fn get_partial_signatures(&self, request: Request<PartialSignaturesRequest>) -> Result<Response<PartialSignaturesMessage>> {
         handle_musig_request(request, move |request, trade_model| {
             if request.buyer_ready_to_release {
+                if !trade_model.am_buyer() {
+                    return Err(Status::failed_precondition("operation only available for buyer").into());
+                }
                 trade_model.set_buyer_ready_to_release()?;
             } else {
                 let peer_nonce_shares = request.peers_nonce_shares

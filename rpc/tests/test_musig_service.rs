@@ -2048,21 +2048,12 @@ fn expected_outcome(side: Side, stage: Stage, call: Call) -> Outcome {
             Stage::DepositSigned => MovedTo(BuyerReadyToRelease),
             _ => Accepted,
         },
-        // This call of the buyer has no role check. It succeeds for the seller as soon as the
-        // seller has the buyer's signature for the swap transaction (difference to K3).
-        (Call::StartPayment, Side::Seller) => match stage {
-            Stage::SignaturesExchanged
-            | Stage::DepositSigned
-            | Stage::BuyerStartedPayment
-            | Stage::CustomPayoutSigned
-            | Stage::ClosedByCustomPayout => Refused,
-            _ => Accepted,
-        },
+        // Calls of the other role.
         (
             Call::SignSwapTx | Call::ReleasePayout | Call::CloseTradeWithoutArguments,
             Side::Buyer,
         )
-        | (Call::CloseTradeWithSwapTx, Side::Seller) => Refused,
+        | (Call::StartPayment | Call::CloseTradeWithSwapTx, Side::Seller) => Refused,
         (Call::SignSwapTx, Side::Seller) => match stage {
             Stage::BuyerStartedPayment => MovedTo(BuyerReadyToRelease),
             // The buyer did not create message E in these stages.
@@ -2375,16 +2366,16 @@ async fn k3_buyer_only_close_by_seller() {
 /// K3, the reverse: the second call of `GetPartialSignatures`, by which the buyer reports the
 /// started payment, is refused for the seller in every stage.
 #[tokio::test]
-#[ignore = "K3: GetPartialSignatures with buyerReadyToRelease has no role check"]
 async fn k3_buyer_only_payment_start_by_seller() {
     for trade_type in TRADE_TYPES {
         for stage in STAGES {
             let mut trade = Trade::at(trade_type, stage).await;
             let state = trade.seller.state();
             let result = trade.seller.start_payment().await;
-            assert!(
-                result.is_err(),
-                "{stage:?}: the call must be refused for the seller"
+            assert_refused(
+                result,
+                Code::FailedPrecondition,
+                "operation only available for buyer",
             );
             assert_eq!(trade.seller.state(), state, "{stage:?}");
         }
