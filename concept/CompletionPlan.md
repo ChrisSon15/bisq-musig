@@ -13,6 +13,9 @@ state of revision 3.
 
 The decisions D17 and D18 and the tests G13 and G14 were added on 2026-11-18.
 
+The specification of WP0 was written on 2026-11-18 to `docs/specifications/trade/`. Its README
+lists twelve open points (O1 to O12) that wait for a confirmation by the project owner.
+
 The identifiers of revision 1 are unchanged: findings F1 to F26, decisions D1 to D16, work packages
 WP0 to WP8, test groups A to L. Revision 2 added findings F27 and F28, the points N1 to N9
 (section 7.2) and test group M.
