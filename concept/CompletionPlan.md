@@ -11,6 +11,8 @@ The file and line references were updated on 2026-11-18 to the code after the fi
 F2 and F4 are fixed. Only the references were updated. The text of the plan still describes the
 state of revision 3.
 
+The decisions D17 and D18 and the tests G13 and G14 were added on 2026-11-18.
+
 The identifiers of revision 1 are unchanged: findings F1 to F26, decisions D1 to D16, work packages
 WP0 to WP8, test groups A to L. Revision 2 added findings F27 and F28, the points N1 to N9
 (section 7.2) and test group M.
@@ -262,7 +264,7 @@ with a running test.
 
 ### 7.1 Decisions taken
 
-All sixteen decisions were taken by the project owner on 2026-11-17.
+The decisions D1 to D16 were taken by the project owner on 2026-11-17, D17 and D18 on 2026-11-18.
 
 | # | Question | Decision | What follows for the work |
 |---|---|---|---|
@@ -282,6 +284,8 @@ All sixteen decisions were taken by the project owner on 2026-11-17.
 | D14 | Minimum trade amount and deposit. | Derived from the dust limit and the fee rate, so that every pre-signed transaction has valid outputs. Smaller trades are rejected in `GetNonceShares`. | Validation in the engine (WP4). |
 | D15 | Where do authoritative specifications live? | `docs/specifications/trade/`. `concept/` keeps the history. | WP0 writes the specification files. Concept files are not updated; section 3 says which ones are outdated. |
 | D16 | Future of `walletrpc.Wallet` and the `mem` crate. | Remove both now, also if this breaks bisq2. | First step of WP1. bisq2 at commit `bac6dd1d1c` contains no reference to `walletrpc` (text search), so no break is expected there. |
+| D17 | What happens to a trade when a request fails a validation? | Anything that fails a validation terminates the trade. The trade is unusable afterwards. There is no recovery: a corrected request is not accepted. | The engine marks the trade as blocked. A blocked trade accepts no further data and does not change its state. Implemented so far for the check of the peer's nonce shares only (G4). The specification must say which actions stay possible for a terminated trade after the deposit is signed, because its funds are then locked in the deposit outputs (WP0). Tests G13. |
+| D18 | In which order does the engine process a request? | Validate before storing, and check the state before any change. | Every engine operation checks the state first, then validates all data of the request, and only then stores data or signs. A refused request leaves no data and no signature in the trade. The handlers in `rpc/src/server.rs` do not follow this order yet: several store request data before the validation, and `SignCustomPayoutTx` signs before the state check (WP1). Tests G14. |
 
 What D8 and answer 7 of section 12 mean together: `musigd` does not run while bisq2 is closed, so
 nothing is watched in that time. For closed trades the drain at `close` is then the only
@@ -701,6 +705,8 @@ reason. "Engine refuses" means: the engine returns an error and sends nothing.
 | G10 | Wrong private key share at close | `MismatchedKeyPair`; state unchanged |
 | G11 | Oversized messages and lists | Rejected by size limits |
 | G12 | Any message repeated or delivered in the wrong order | Same result as the first delivery, or an error; never a second signature with the same nonce |
+| G13 | A request that failed a validation is followed by the corrected request (D17) | Refused; the trade stays terminated and does not change its state |
+| G14 | A request is refused by the state check or by a validation (D18) | The trade holds no data and no signature of this request |
 
 #### H. Restart, persistence and restore
 
