@@ -19,7 +19,7 @@ use bdk_wallet::bitcoin::{
 };
 use chain::client::{ChainClient, ClientError, TrustedPeer};
 use musig2::secp::Scalar;
-use protocol::chain_facts::{ChainFacts, TradeEvent, TxKind};
+use protocol::chain_facts::{ChainFacts, ConfirmedTradeTx, TradeEvent, TxKind};
 use protocol::params::{EngineConfig, TradeParams};
 use protocol::receiver::Receiver;
 use protocol::script_paths::{deposit_payout_descriptor, deposit_payout_tap_tree};
@@ -177,8 +177,21 @@ impl Trader {
     }
 
     /// Passes the facts about the chain to the engine, as the trade service does before every
-    /// request and after every new block. The facts come from the client of the trader.
+    /// request and after every new block. The facts come from the client of the trader. Returns
+    /// the events about the state of the trade: state changes, losses and unexpected events.
     fn observe(&mut self, env: &TestEnv) -> Vec<TradeEvent> {
+        let mut events = self.observe_all(env);
+        events.retain(|event| {
+            !matches!(
+                event,
+                TradeEvent::TxConfirmations(_) | TradeEvent::StatusChanged
+            )
+        });
+        events
+    }
+
+    /// As [`Self::observe`], with all events.
+    fn observe_all(&mut self, env: &TestEnv) -> Vec<TradeEvent> {
         self.chain.wait_for_tip(env);
         let client = &self.chain.client;
         let outputs = self.model.outputs_to_watch().expect("deposit is signed");
@@ -1753,11 +1766,21 @@ fn outcome_deposit_abort_of_a_deposit_that_was_never_published() -> anyhow::Resu
     assert_eq!(seller.react(&env), vec![TxKind::DepositAbort]);
     assert_eq!(seller.model.state(), TradeState::Deposit);
     seller.assert_coins_reserved(true);
+    let abort_txid = seller.model.transactions_to_send(FEE_RATE)[0]
+        .tx
+        .compute_txid();
     env.mine_block()?;
 
     let aborted = closed(ClosureType::DepositAborted);
     for trader in [&mut buyer, &mut seller] {
-        trader.observe(&env);
+        // Both engines report the confirmation of the transaction that ended the deposit.
+        let events = trader.observe_all(&env);
+        let confirmed = TradeEvent::TxConfirmations(ConfirmedTradeTx {
+            kind: TxKind::DepositAbort,
+            txid: abort_txid,
+            confirmations: 1,
+        });
+        assert!(events.contains(&confirmed), "{events:?}");
         assert_eq!(trader.model.state(), aborted);
         assert_eq!(trader.model.transactions_to_send(FEE_RATE), vec![]);
         trader.assert_coins_reserved(false);
