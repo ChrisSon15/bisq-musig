@@ -4,26 +4,26 @@ This is an experimental Rust-based gRPC interface being developed for Bisq's upc
 with Java test clients. The `.proto` files live in [src/main/proto](src/main/proto); the Rust code is generated from
 them by `build.rs` (into `src/pb`), the Java code by Maven. The server hosts these services:
 
-| Service                               | Proto                | Purpose                                                                                                                        |
-|---------------------------------------|----------------------|--------------------------------------------------------------------------------------------------------------------------------|
-| `musigrpc.Musig`                      | `rpc.proto`          | The original trade protocol mock-up (see below)                                                                                |
-| `bmp_protocol.BmpProtocolService`     | `bmp_protocol.proto` | Round-based (`Initialize`, `ExecuteRound1`…`5`) interface onto the `protocol` crate's `BMPProtocol`                            |
-| `wallet.Wallet`                       | `bmp_wallet.proto`   | Bisq2-facing wallet API backed by a persistent `BMPWallet`; derived from bisq2's own `wallet.proto` (see below)                 |
+| Service          | Proto              | Purpose                                                                                                       |
+|------------------|--------------------|---------------------------------------------------------------------------------------------------------------|
+| `musigrpc.Musig` | `rpc.proto`        | The trade protocol (see below)                                                                                |
+| `wallet.Wallet`  | `bmp_wallet.proto` | Bisq2-facing wallet API backed by a persistent `BMPWallet`; derived from bisq2's own `wallet.proto` (see below) |
 
-`musigd` serves `Musig` always, and `wallet.Wallet` when started with `--wallet-dir`.
-`BmpProtocolService` is currently only served by the test daemon in [tests/test_bmp_service.rs](tests/test_bmp_service.rs)
-(see [Integration tests](#integration-tests-using-testenv-crate)).
+`musigd` serves `Musig` always, and `wallet.Wallet` when started with `--wallet-dir`. The trade service uses the wallet
+of the wallet service: a trade can be started only when `musigd` runs with `--wallet-dir` and the wallet is open.
 
-#### Trade protocol mock-up (`Musig` service)
+The behaviour of the trade protocol is specified in [docs/specifications/trade](../docs/specifications/trade/README.md).
 
-The Rust code uses the `musig2` crate to construct aggregated signatures for the traders' warning and redirect
-transactions, with pubkey & nonce shares and partial signatures exchanged with the Java client, to pass them back in as
-fields of the simulated peer's RPC requests, setting up the trade.
+#### Trade protocol (`Musig` service)
 
-The adaptor logic, multiparty signing and simulated steps for the whole of the trade (normal closure, custom payout and
-force-closure via the swap tx) are implemented for the mockup. The txs are built with the `protocol` crate's tx
-builders, but on top of mock trade wallets, and the tx confirmation status streams are mocked. None of the mediation or
-arbitration paths are implemented or mocked yet.
+The service converts between the protobuf messages and the operations of the trade engine in the `protocol` crate
+(`protocol::trade_model`). The engine uses the `musig2` crate to construct aggregated signatures for the traders'
+warning and redirect transactions, with pubkey & nonce shares and partial signatures exchanged with the Java client, to
+pass them back in as fields of the peer's RPC requests, setting up the trade.
+
+The setup, the normal closure, the custom payout and the force-closure via the swap tx are implemented, on top of the
+wallet of the daemon. The service does not broadcast any transaction yet, and the tx confirmation status streams are
+mocked. The warning, redirect, claim and penalty transactions are built and signed, but no RPC publishes them yet.
 
 See [MuSig trade protocol messages](musig-trade-protocol-messages.txt) for my current (incomplete) picture of what the
 trade messages between the peers would look like, and thus the necessary data to exchange in an RPC interface between
@@ -86,11 +86,14 @@ cargo run --bin musigd -- --wallet-dir /tmp/bmp-wallet --wallet-peer 127.0.0.1:1
 
 The following Java clients are run from this directory (`rpc`):
 
-3. To build and run the Java gRPC test client to carry out a mock trade, run:
+3. To build and run the Java gRPC test client to carry out a trade, run:
 
 ```sh
 mvn install exec:java
 ```
+
+The client needs two daemons, one for the buyer and one for the seller, each with a wallet directory and an open,
+funded wallet. Their ports are given with `-Dbuyer.port=...` (default 50051) and `-Dseller.port=...` (default 50052).
 
 4. To exercise every RPC of the Bisq2-facing wallet (needs `musigd` started with `--wallet-dir`), run:
 
@@ -100,20 +103,12 @@ mvn exec:java -Pbmp-wallet
 
 The host and port can be overridden with `-Dwallet.host=...` / `-Dwallet.port=...`.
 
-5. To run the `BmpClient` against the `BmpProtocolService` (needs the test daemon from the next section on port 50051):
-
-```bash
-mvn exec:java -Pbmp
-```
-
 ### Integration tests using testenv crate
 
 The Java integration tests (`mvn verify`) are:
 
-- `BmpServiceIntegrationTest` — simulates a complete trade via the `BmpProtocolService` and verifies it on-chain.
-  Needs a running testenv and two externally started test daemons (steps 1 & 2 below).
 - `BmpWalletServiceIntegrationTest` — funds and spends a `BMPWallet` through the `wallet.Wallet` service. Needs a running
-  testenv; it starts its own `musigd` (step 3 below).
+  testenv; it starts its own `musigd` (step 2 below).
 - `BmpWalletLifecycleIntegrationTest` — opening, password changes and restarts of the `BMPWallet`. Starts its own
   `musigd` and needs no chain.
 - `BmpWalletEndToEndIntegrationTest` — every RPC of the `wallet.Wallet` service against a regtest chain, with three
@@ -129,28 +124,10 @@ To do so run the following command:
 cargo run --bin testenv-server -p testenv
 ```
 
-It prints its connection details as `TESTENV_*=...` lines. Export them in the shell where you'll run Maven (step 4),
-e.g. `TESTENV_RPC_URL`, `TESTENV_RPC_USER`, `TESTENV_RPC_PASS` and `TESTENV_P2P_ADDR`. Note the `TESTENV_RPC_URL` and
-`TESTENV_ELECTRUM_URL` for step 2 as well.
+It prints its connection details as `TESTENV_*=...` lines. Export them in the shell where you'll run Maven (step 3),
+e.g. `TESTENV_RPC_URL`, `TESTENV_RPC_USER`, `TESTENV_RPC_PASS` and `TESTENV_P2P_ADDR`.
 
-2. **Start two test daemons:**
-
-`BmpServiceIntegrationTest` requires two server instances to represent the two parties in the trade (Alice and Bob).
-They are started from an ignored test case in [tests/test_bmp_service.rs](tests/test_bmp_service.rs), as `musigd` doesn't serve
-the `BmpProtocolService` yet. Run these commands from the project's root directory, replacing `RPC_URL` and
-`ELECTRUM_URL` with the values printed in step 1. It's best to run them in separate terminal windows so you can monitor
-their output.
-
-*   Server for Bob (port 50051):
-    ```sh
-    ELECTRUM_URL=127.0.0.1:33575 RPC_URL=http://127.0.0.1:46111 MUSIGD_PORT=50051 cargo test -p rpc --test test_bmp_service -- --ignored run_musigd_server --nocapture
-    ```
-*   Server for Alice (port 50052):
-    ```sh
-    ELECTRUM_URL=127.0.0.1:33575 RPC_URL=http://127.0.0.1:46111 MUSIGD_PORT=50052 cargo test -p rpc --test test_bmp_service -- --ignored run_musigd_server --nocapture
-    ```
-
-3. **Build `musigd`:**
+2. **Build `musigd`:**
 
 The wallet integration tests launch the `musigd` binary themselves, from `target/debug/musigd` (override with
 `-Dmusigd.bin=/path/to/musigd`):
@@ -159,7 +136,7 @@ The wallet integration tests launch the `musigd` binary themselves, from `target
 cargo build --bin musigd
 ```
 
-4. **Run the Maven test command:**
+3. **Run the Maven test command:**
 
    This command will compile the Java code and execute the integration tests. Run it from the project's root directory,
    in the shell where you exported the `TESTENV_*` variables from step 1.

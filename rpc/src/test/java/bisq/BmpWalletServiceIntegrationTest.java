@@ -51,7 +51,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 public class BmpWalletServiceIntegrationTest {
-    /** Kept clear of BmpServiceIntegrationTest's 50051/50052. */
+    /** Kept clear of the default ports 50051/50052. */
     private static final int MUSIGD_PORT = 50061;
     private static final int POLL_SECONDS = 5;
     private static final long SYNC_TIMEOUT_MS = 120_000;

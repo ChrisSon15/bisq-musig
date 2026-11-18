@@ -2,7 +2,6 @@
 pub mod mocks;
 pub mod multisig;
 pub mod params;
-pub mod protocol_musig_adaptor;
 mod psbt;
 pub mod receiver;
 pub mod script_paths;

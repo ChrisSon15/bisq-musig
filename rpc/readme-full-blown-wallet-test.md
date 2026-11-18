@@ -102,7 +102,7 @@ Final balance: 99600 sat after 3 transactions
 |---|---|
 | `-Dmusigd.bin=/path/to/musigd` | use a `musigd` binary other than `target/debug/musigd` (e.g. a release build) |
 | `-Dtestenv.bin=/path/to/testenv-server` | use a `testenv-server` binary other than `target/debug/testenv-server` |
-| `-Dit.test=…` left out | run **all** Java integration tests; two of the other three (`BmpServiceIntegrationTest`, `BmpWalletServiceIntegrationTest`) need a `testenv-server` started by hand and the `TESTENV_*` variables exported, see `README.md`; `BmpWalletLifecycleIntegrationTest` needs neither |
+| `-Dit.test=…` left out | run **all** Java integration tests; one of the other two (`BmpWalletServiceIntegrationTest`) needs a `testenv-server` started by hand and the `TESTENV_*` variables exported, see `README.md`; `BmpWalletLifecycleIntegrationTest` needs neither |
 | `RUST_LOG=debug` in the environment | more verbose `musigd` and `testenv-server` logs (both default to `info`) |
 | `-DskipITs` | skip the integration tests altogether |
 

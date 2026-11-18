@@ -37,8 +37,6 @@ tonic-prost-build = "0.14.6"
 protocol = { workspace = true, features = ["test-utils"] }
 rand = { workspace = true }
 tempfile = { workspace = true }
-bdk_electrum = { workspace = true }
-testenv = { workspace = true }
 
 [lints]
 workspace = true

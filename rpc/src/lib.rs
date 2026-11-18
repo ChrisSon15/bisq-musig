@@ -1,6 +1,4 @@
 pub mod pb {
-    pub mod bmp_converter;
-    pub mod bmp_protocol;
     pub mod bmp_wallet;
     pub mod convert;
     pub mod musigrpc;

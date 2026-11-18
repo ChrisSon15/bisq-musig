@@ -4,10 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = { workspace = true }
 bdk_wallet = { workspace = true }
-chain = { workspace = true }
-guardian = "1.3.0"
 musig2 = { workspace = true }
 paste = "1.0.15"
 rand = { workspace = true }
@@ -23,8 +20,11 @@ test-utils = []
 [dev-dependencies]
 bdk_wallet = { workspace = true, features = ["test-utils"] }
 wallet = { workspace = true, features = ["test-utils"] }
+anyhow = { workspace = true }
+bdk_bitcoind_rpc = { workspace = true }
 bdk_electrum = { workspace = true }
 bmp_tracing = { workspace = true }
+chain = { workspace = true }
 const_format = { workspace = true }
 testenv = { workspace = true }
 tokio = { workspace = true }
