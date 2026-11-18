@@ -35,9 +35,12 @@ This was finding F19.
    The rule cannot be switched off.
 2. **Imported coins that are reserved for an open trade, and coins that are not mature, are left
    out.**
-3. **No request lets the caller select the coins of a transaction.** If such a request is added,
-   rule 1 still holds: the imported coins are added to the coins that the caller selected. This is
-   open point W4 in [README.md](README.md).
+3. **The caller cannot select the coins of a transaction.** The wallet selects them for every
+   transaction, and no request of the wallet service takes a list of coins. So rule 1 has no
+   exception.
+
+Rationale for rule 3: a payment from coins that the user selected by hand could leave an imported
+payout unspent, and the protection of rule 1 would depend on the user's choice.
 
 Consequences that the user must know: a payment after a close links the payout with the payment
 on the chain, and it can be larger than a payment from the seed wallet alone, so its fee is

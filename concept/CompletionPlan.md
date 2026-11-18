@@ -422,7 +422,8 @@ Status on 2026-11-18: done, with these differences to the list above.
 - Import the payout key at close with `deposit_payout_tap_tree`. Give the new sub-wallet a start
   checkpoint at the deposit height, so that no scan from the genesis block starts (F5, F19, #202).
 - Imported coins are spent first in every transaction (D8, F15): keep the rule, specify it, and
-  define what happens when the caller selects coins by hand.
+  define what happens when the caller selects coins by hand. Decided on 2026-11-18: the caller
+  cannot select coins by hand (point W4 of the wallet specification).
 - Drain: `drain_imported_balance` returns an unsigned PSBT today. Add signing, recording and
   storing of the drain transaction, as the wallet part of the `close` method (D8).
 - Fee bumping: build a child transaction that spends an anchor output or an own unconfirmed

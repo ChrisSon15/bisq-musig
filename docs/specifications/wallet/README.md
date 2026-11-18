@@ -22,4 +22,9 @@ confirmed.
 | W1 | A wallet that is restored from its seed words must find funds on keys of trades that lie behind a long row of unused keys. | Not specified. The wallet has no restore from seed words yet. The rule belongs to that function. | [trade-keys.md](trade-keys.md) |
 | W2 | Coins that stay reserved when `musigd` stops during the setup of a trade. | They stay reserved until the trade store exists (work package WP5 of the plan). Then the engine releases them at the next start. | [coin-reservation.md](coin-reservation.md) |
 | W3 | Should the wallet service offer requests to list and release reserved coins by hand? | No such request exists. | [coin-reservation.md](coin-reservation.md) |
-| W4 | May the caller select the coins of a payment by hand, and does the rule "imported coins first" then still hold? | No request lets the caller select coins. If one is added, the imported coins that are not reserved are still added to the transaction. | [imported-keys.md](imported-keys.md) |
+
+Points that were open and are decided:
+
+| # | Question | Decision of the project owner | File |
+|---|---|---|---|
+| W4 | May the caller select the coins of a payment by hand? | 2026-11-18: no. The wallet selects the coins of every transaction, so the rule "imported coins first" has no exception. | [imported-keys.md](imported-keys.md) |
