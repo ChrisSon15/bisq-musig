@@ -17,6 +17,7 @@ use bdk_wallet::bitcoin::address::NetworkUnchecked;
 use bdk_wallet::bitcoin::{
     Amount, BlockHash, FeeRate, Network, OutPoint, Transaction, Txid, XOnlyPublicKey,
 };
+use bdk_wallet::serde_json;
 use chain::client::{ChainClient, ClientError, TrustedPeer};
 use musig2::secp::Scalar;
 use protocol::chain_facts::{ChainFacts, ConfirmedTradeTx, TradeEvent, TxKind};
@@ -44,6 +45,18 @@ const FEE_RATE: FeeRate = FeeRate::from_sat_per_kwu(2_500);
 // Lock times in blocks. They are short, so that the tests mine only a few blocks.
 const WARNING_LOCK_TIME: u16 = 5;
 const CLAIM_LOCK_TIME: u16 = 3;
+
+thread_local! {
+    /// The fee rate of the prepared transactions of the trades of the running test.
+    static PREPARED_FEE_RATE: std::cell::Cell<FeeRate> = const { std::cell::Cell::new(FEE_RATE) };
+}
+
+/// Gives the swap, warning and redirect transactions of the trades that this test sets up a fee
+/// rate of 1 sat per vbyte, the lowest one that a node accepts. Every test runs in its own
+/// thread, so other tests keep their fee rate.
+fn use_lowest_prepared_fee_rate() {
+    PREPARED_FEE_RATE.set(FeeRate::from_sat_per_kwu(250));
+}
 
 /// The configuration of both engines: the lock times of the tests, a deposit timeout of 6 blocks
 /// and a release safety margin of 1 block.
@@ -210,35 +223,52 @@ impl Trader {
     /// transactions that it wants to send go to the network through the client of the trader.
     /// Returns the kinds of the transactions that were sent.
     fn react(&mut self, env: &TestEnv) -> Vec<TxKind> {
+        self.react_with_children(env)
+            .into_iter()
+            .map(|(kind, _)| kind)
+            .collect()
+    }
+
+    /// As [`Self::react`]. Returns for every transaction also the child that raises its fee, if
+    /// the engine named one. A transaction with a child goes to the network as a package.
+    fn react_with_children(&mut self, env: &TestEnv) -> Vec<(TxKind, Option<Transaction>)> {
         self.observe(env);
         let to_send = self.model.transactions_to_send(FEE_RATE);
         for to_send in &to_send {
             let txid = to_send.tx.compute_txid();
+            let child_txid = to_send.child.as_ref().map(Transaction::compute_txid);
+            let in_mempool = |txid: &Txid| env.mempool_contains(txid).expect("RPC");
             // A transaction of an earlier round that is still unconfirmed is not sent again in
             // these tests. The node would not ask for it.
-            if env.mempool_contains(&txid).expect("RPC") {
+            if in_mempool(&txid) && child_txid.as_ref().is_none_or(in_mempool) {
                 continue;
             }
-            let sent = self
-                .chain
-                .runtime
-                .block_on(self.chain.client.broadcast(to_send.tx.clone()));
+            let client = &self.chain.client;
+            let sent = self.chain.runtime.block_on(async {
+                match to_send.child.clone() {
+                    Some(child) => client.broadcast_package(to_send.tx.clone(), child).await,
+                    None => client.broadcast(to_send.tx.clone()).await,
+                }
+            });
             assert!(
                 matches!(sent, Ok(_) | Err(ClientError::NotRequested(_))),
                 "{:?}: {sent:?}",
                 to_send.kind
             );
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            while !env.mempool_contains(&txid).expect("RPC") {
+            while !in_mempool(&txid) || !child_txid.as_ref().is_none_or(in_mempool) {
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "the node accepts the {:?} transaction {txid}",
+                    "the node accepts the {:?} transaction {txid} and its child {child_txid:?}",
                     to_send.kind
                 );
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
-        to_send.into_iter().map(|to_send| to_send.kind).collect()
+        to_send
+            .into_iter()
+            .map(|to_send| (to_send.kind, to_send.child))
+            .collect()
     }
 
     /// The coins that are reserved for the trade are locked in the wallet.
@@ -256,14 +286,15 @@ impl Trader {
         }
     }
 
-    /// The trade parameters of the tests.
-    const fn params() -> TradeParams {
+    /// The trade parameters of the tests. The fee rate of the prepared transactions is
+    /// [`FEE_RATE`], unless the test called [`use_lowest_prepared_fee_rate`].
+    fn params() -> TradeParams {
         TradeParams {
             trade_amount: TRADE_AMOUNT,
             buyers_security_deposit: BUYERS_SECURITY_DEPOSIT,
             sellers_security_deposit: SELLERS_SECURITY_DEPOSIT,
             deposit_tx_fee_rate: FEE_RATE,
-            prepared_tx_fee_rate: FEE_RATE,
+            prepared_tx_fee_rate: PREPARED_FEE_RATE.get(),
             trade_fee_receiver: None,
         }
     }
@@ -377,7 +408,7 @@ impl Trade {
         let receivers = Receiver::compute_receivers_from_shares(
             vec![(env.new_address()?, 1.0)],
             redirection_amount_msat,
-            FEE_RATE,
+            PREPARED_FEE_RATE.get(),
         )
         .expect("the redirection amount is large enough for one receiver");
         let redirection_receiver = Receiver {
@@ -1841,5 +1872,220 @@ fn outcome_deposit_abort_replaces_an_unconfirmed_deposit() -> anyhow::Result<()>
         assert_eq!(trader.model.state(), aborted);
         assert_coins_are_back(trader, &env)?;
     }
+    Ok(())
+}
+
+/// Mines blocks that contain no transaction of the mempool of the node, like the blocks of
+/// miners who did not take a transaction because its fee was too low for them.
+fn mine_blocks_without_the_mempool(env: &TestEnv, count: usize) -> anyhow::Result<()> {
+    let rpc = env.bitcoin_core_rpc_client()?;
+    let address = env.new_address()?.to_string();
+    for _ in 0..count {
+        let _: serde_json::Value = rpc.call(
+            "generateblock",
+            &[serde_json::json!(address), serde_json::json!([])],
+        )?;
+    }
+    Ok(())
+}
+
+/// The fee rate that a transaction and the child that raises its fee pay together, as the node
+/// holds them in its mempool.
+fn package_fee_rate_in_mempool(
+    env: &TestEnv,
+    parent: &Transaction,
+    child: &Transaction,
+) -> anyhow::Result<FeeRate> {
+    let rpc = env.bitcoin_core_rpc_client()?;
+    let fee = rpc.get_mempool_entry(&parent.compute_txid())?.fees.base
+        + rpc.get_mempool_entry(&child.compute_txid())?.fees.base;
+    Ok(fee / (parent.weight() + child.weight()))
+}
+
+const fn sat_per_vb(fee_rate: u64) -> FeeRate {
+    FeeRate::from_sat_per_kwu(fee_rate * 250)
+}
+
+/// E10, E2 (F20): the transactions of the trade were signed with a fee rate of 1 sat per vbyte.
+/// The buyer publishes his warning. The seller's redirect must be confirmed before the buyer's
+/// claim is valid, so the seller's engine sends it at once together with a child of his wallet
+/// that spends the anchor, and both reach the fee rate of the engine in the node. The redirect
+/// confirms, and the wallet holds the change of the child.
+#[test]
+fn e10_redirect_with_a_low_fee_confirms_through_a_child() -> anyhow::Result<()> {
+    use_lowest_prepared_fee_rate();
+    let mut trade = Trade::with_confirmed_deposit()?;
+    trade.wait_for_warning_lock_time()?;
+    // The wallets know the change of the deposit transaction, which pays for a child.
+    trade.sync_wallets();
+    trade.buyer.model.start_warning()?;
+    // The warning has no deadline. It goes out alone first, at the fee rate of the trade.
+    let sent = trade.buyer.react_with_children(&trade.env);
+    assert!(matches!(&sent[..], [(TxKind::Warning, None)]), "{sent:?}");
+    trade.env.mine_block()?;
+
+    let sent = trade.seller.react_with_children(&trade.env);
+    let [(TxKind::Redirect, Some(child))] = &sent[..] else {
+        panic!("the redirect goes out with a child: {sent:?}")
+    };
+    let redirect_tx = trade.seller.model.my_signed_redirect_tx()?.clone();
+    assert!(
+        child
+            .input
+            .iter()
+            .any(|input| input.previous_output.txid == redirect_tx.compute_txid())
+    );
+    let fee_rate = package_fee_rate_in_mempool(&trade.env, &redirect_tx, child)?;
+    assert!(fee_rate >= sat_per_vb(10), "{fee_rate}");
+    assert_eq!(
+        trade
+            .seller
+            .wallet
+            .unconfirmed_outgoing_transactions()
+            .len(),
+        1
+    );
+
+    trade.env.mine_block()?;
+    trade.observe();
+    let redirected = closed(ClosureType::SellersRedirect);
+    assert_eq!(trade.buyer.model.state(), redirected);
+    assert_eq!(trade.seller.model.state(), redirected);
+    trade.sync_wallets();
+    assert_eq!(
+        trade.seller.wallet.unconfirmed_outgoing_transactions(),
+        vec![]
+    );
+    // The seller lost his deposit to the redirect and paid for the child. The rest of the coin
+    // that paid for the child is back.
+    let balance = trade.seller.wallet.balance();
+    let after_the_deposit = FUNDING - TRADE_AMOUNT - SELLERS_SECURITY_DEPOSIT;
+    assert!(
+        balance < after_the_deposit && balance > after_the_deposit - Amount::from_sat(15_000),
+        "{balance}"
+    );
+    Ok(())
+}
+
+/// The scenario of `concept/pinningattack.md`, and E9: the seller publishes his warning at a
+/// low fee rate. The buyer tries to attach his redirect to the unconfirmed warning, as the first
+/// transaction of a chain that would block a fee increase. The node refuses it, because the
+/// redirect has a lock time of one block. The only child that the warning can have is the one
+/// of the seller: the engine raises the fee with it after some blocks, raises it again with a
+/// replacement, and the warning confirms. Then the redirect of the buyer is valid.
+#[test]
+fn pinning_of_a_warning_by_the_redirect_of_the_peer_fails() -> anyhow::Result<()> {
+    use_lowest_prepared_fee_rate();
+    let mut trade = Trade::with_confirmed_deposit()?;
+    trade.wait_for_warning_lock_time()?;
+    // The wallets know the change of the deposit transaction, which pays for a child.
+    trade.sync_wallets();
+    let warning_tx = trade.seller.model.start_warning()?;
+    let sent = trade.seller.react_with_children(&trade.env);
+    assert!(matches!(&sent[..], [(TxKind::Warning, None)]), "{sent:?}");
+
+    let buyers_redirect = trade.buyer.model.my_signed_redirect_tx()?.clone();
+    assert_eq!(
+        buyers_redirect.input[0].previous_output.txid,
+        warning_tx.compute_txid()
+    );
+    let rejected = trade.broadcast(&buyers_redirect).expect_err("lock time");
+    assert!(rejected.contains("non-BIP68-final"), "{rejected}");
+
+    // Six blocks pass without the warning. The engine asks the wallet for a child.
+    let mut children: Vec<Transaction> = Vec::new();
+    for fee_rate in [15, 22] {
+        mine_blocks_without_the_mempool(&trade.env, 6)?;
+        let sent = trade.seller.react_with_children(&trade.env);
+        let [(TxKind::Warning, Some(child))] = &sent[..] else {
+            panic!("the warning goes out with a child: {sent:?}")
+        };
+        let paid = package_fee_rate_in_mempool(&trade.env, &warning_tx, child)?;
+        assert!(paid >= sat_per_vb(fee_rate), "{paid}");
+        if let Some(earlier) = children.last() {
+            assert!(
+                !trade.env.mempool_contains(&earlier.compute_txid())?,
+                "the new child replaced the earlier one"
+            );
+        }
+        children.push(child.clone());
+        // The peer still cannot attach anything to the warning.
+        assert!(trade.broadcast(&buyers_redirect).is_err());
+    }
+    assert_ne!(children[0].compute_txid(), children[1].compute_txid());
+
+    trade.env.mine_block()?;
+    assert_eq!(trade.confirmations(Trade::escrow(&warning_tx)), Some(1));
+    trade.sync_wallets();
+    assert_eq!(
+        trade.seller.wallet.unconfirmed_outgoing_transactions(),
+        vec![]
+    );
+    // The buyer's engine reacts to the confirmed warning in the regular way.
+    let sent = trade.buyer.react_with_children(&trade.env);
+    assert!(
+        matches!(&sent[..], [(TxKind::Redirect, Some(_))]),
+        "{sent:?}"
+    );
+    Ok(())
+}
+
+/// The fee of the seller's warning was raised with a child, which spends a coin of his wallet.
+/// Then the warning of the buyer is confirmed in its place, so the seller's warning and its
+/// child can never confirm. The engine tells the wallet to forget both, and the coin that the
+/// child spent is free again. Without this the coin would stay marked as spent: the wallet does
+/// not watch the payouts of the deposit and cannot notice the other warning itself.
+#[test]
+fn child_of_a_warning_that_lost_is_forgotten() -> anyhow::Result<()> {
+    use_lowest_prepared_fee_rate();
+    let mut trade = Trade::with_confirmed_deposit()?;
+    trade.wait_for_warning_lock_time()?;
+    trade.sync_wallets();
+    let balance = trade.seller.wallet.balance();
+    trade.seller.model.start_warning()?;
+    trade.buyer.model.start_warning()?;
+
+    // The seller's warning does not reach a miner. After six blocks his engine builds a child.
+    mine_blocks_without_the_mempool(&trade.env, 6)?;
+    trade.seller.observe(&trade.env);
+    let to_send = trade.seller.model.transactions_to_send(FEE_RATE);
+    assert_eq!(to_send[0].kind, TxKind::Warning);
+    let child = to_send[0].child.clone().expect("a child");
+    let recorded = trade.seller.wallet.unconfirmed_outgoing_transactions();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].compute_txid(), child.compute_txid());
+
+    // The buyer's warning is confirmed.
+    let sent = trade.buyer.react(&trade.env);
+    assert_eq!(sent, vec![TxKind::Warning]);
+    trade.env.mine_block()?;
+    // The seller's engine sees it, forgets its own warning with the child, and answers the
+    // buyer's warning with the redirect and a new child. The new child can spend the coin
+    // again that the forgotten child had spent.
+    let sent = trade.seller.react_with_children(&trade.env);
+    let [(TxKind::Redirect, Some(redirect_child))] = &sent[..] else {
+        panic!("the redirect goes out with a child: {sent:?}")
+    };
+    assert_eq!(trade.seller.model.state(), TradeState::BuyersWarning);
+    let recorded = trade.seller.wallet.unconfirmed_outgoing_transactions();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the child of the lost warning is forgotten"
+    );
+    assert_eq!(recorded[0].compute_txid(), redirect_child.compute_txid());
+
+    trade.env.mine_block()?;
+    trade.sync_wallets();
+    assert_eq!(
+        trade.seller.wallet.unconfirmed_outgoing_transactions(),
+        vec![]
+    );
+    // Only the child of the redirect was paid for.
+    let after = trade.seller.wallet.balance();
+    assert!(
+        after < balance && after > balance - Amount::from_sat(5_000),
+        "{after}, before {balance}"
+    );
     Ok(())
 }

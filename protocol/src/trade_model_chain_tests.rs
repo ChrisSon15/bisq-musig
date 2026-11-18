@@ -1015,6 +1015,162 @@ fn confirmations_of_the_transactions_of_a_trade_are_reported() {
     );
 }
 
+/// The child that raises the fee of the transaction that the trader wants to send, if there is
+/// one. The mock wallet writes the fee rate that it was asked for, in sat per 1000 weight units,
+/// into the lock time of the child.
+fn fee_bump(trader: &Trader, kind: TxKind) -> Option<(Transaction, u32)> {
+    let to_send = trader.model.transactions_to_send(FEE_RATE);
+    assert_eq!(to_send.len(), 1, "{to_send:?}");
+    assert_eq!(to_send[0].kind, kind);
+    let parent_txid = to_send[0].tx.compute_txid();
+    to_send[0].child.clone().map(|child| {
+        assert_eq!(child.input[0].previous_output.txid, parent_txid);
+        let fee_rate = child.lock_time.to_consensus_u32();
+        (child, fee_rate)
+    })
+}
+
+/// E10, F5 (F20): the redirect and the penalty must be confirmed before the claim of the peer is
+/// valid. They pay the fee rate of the engine themselves here, so they start without a child.
+/// With every step of the fee schedule the engine asks the wallet for a child that pays more.
+/// The claim lock time of these tests is 10 blocks, so a step is one block.
+#[test]
+fn e10_f5_reaction_to_a_warning_gets_a_child_that_pays_more_at_every_step() {
+    for (kind, closed_before) in [(TxKind::Redirect, false), (TxKind::Penalty, true)] {
+        let (mut buyer, mut seller) = trade(BUYER_SELLER_ROLES[0]);
+        observe_both(&mut buyer, &mut seller, &facts(3, &[]));
+        if closed_before {
+            close_cooperatively(&mut buyer, &mut seller);
+        }
+        let warning_tx = buyer.model.my_signed_warning_tx().unwrap().clone();
+        let warned = |confirmations: u32| {
+            facts(
+                WARNING_LOCK_TIME + confirmations,
+                &[(&warning_tx, confirmations)],
+            )
+        };
+        observe(&mut seller, &warned(1));
+        assert_eq!(fee_bump(&seller, kind), None, "{kind:?}");
+
+        let mut children = Vec::new();
+        for (confirmations, fee_rate) in [(2, 3_750), (3, 5_625), (4, 8_438)] {
+            observe(&mut seller, &warned(confirmations));
+            let (child, asked) = fee_bump(&seller, kind).expect("a child");
+            assert_eq!(asked, fee_rate, "{kind:?} at {confirmations} confirmations");
+            // The next look at the same block names the same child.
+            observe(&mut seller, &warned(confirmations));
+            assert_eq!(fee_bump(&seller, kind), Some((child.clone(), asked)));
+            children.push(child);
+        }
+        assert_ne!(children[0], children[1]);
+
+        // The schedule ends at the last step.
+        observe(&mut seller, &warned(CLAIM_LOCK_TIME - 1));
+        let (_, last) = fee_bump(&seller, kind).expect("a child");
+        assert_eq!(
+            u64::from(last),
+            fee_rate_at_step(FEE_RATE, 8).to_sat_per_kwu()
+        );
+    }
+}
+
+/// E9, C5 (F20): the trader's own warning has no deadline. It first gets its chance with the fee
+/// rate that the traders agreed on, and a child after 6 blocks without a confirmation. The swap
+/// transaction must be confirmed before the buyer's warning is valid, so its schedule is faster.
+#[test]
+fn e9_c5_warning_and_swap_get_a_child_when_they_stay_unconfirmed() {
+    let (mut buyer, mut seller) = trade(BUYER_SELLER_ROLES[0]);
+    observe_both(&mut buyer, &mut seller, &facts(WARNING_LOCK_TIME, &[]));
+    buyer.model.start_warning().expect("valid");
+    for (blocks, fee_rate) in [(0, None), (5, None), (6, Some(3_750)), (12, Some(5_625))] {
+        observe(&mut buyer, &facts(WARNING_LOCK_TIME + blocks, &[]));
+        let asked = fee_bump(&buyer, TxKind::Warning).map(|(_, fee_rate)| fee_rate);
+        assert_eq!(asked, fee_rate, "{blocks} blocks");
+    }
+    // The schedule counts from the block at which the trader decided to publish the warning.
+    assert_eq!(
+        buyer.model.sending_since,
+        Some(DEPOSIT_HEIGHT + WARNING_LOCK_TIME - 1)
+    );
+
+    let (mut buyer, mut seller) = trade(BUYER_SELLER_ROLES[0]);
+    observe_both(&mut buyer, &mut seller, &facts(3, &[]));
+    start_payment_and_release(&mut buyer, &mut seller);
+    seller.model.close_by_force().expect("released");
+    assert_eq!(fee_bump(&seller, TxKind::Swap), None);
+    for (confirmations, fee_rate) in [(4, 3_750), (5, 5_625)] {
+        observe(&mut seller, &facts(confirmations, &[]));
+        let (_, asked) = fee_bump(&seller, TxKind::Swap).expect("a child");
+        assert_eq!(asked, fee_rate);
+    }
+}
+
+/// E15 (D3, F20): the claim and the deposit abort need no child. The engine builds them again
+/// with the fee rate of the step, and the new transaction pays enough more to replace the
+/// earlier one in a node.
+#[test]
+fn e15_claim_and_deposit_abort_are_replaced_with_a_higher_fee() {
+    let (mut buyer, mut seller) = trade(BUYER_SELLER_ROLES[0]);
+    observe_both(&mut buyer, &mut seller, &facts(WARNING_LOCK_TIME, &[]));
+    let warning_tx = buyer.model.start_warning().expect("valid");
+    let claim_at = |buyer: &mut Trader, blocks: u32| {
+        let confirmations = CLAIM_LOCK_TIME + blocks;
+        let facts = facts(
+            WARNING_LOCK_TIME + confirmations,
+            &[(&warning_tx, confirmations)],
+        );
+        observe(buyer, &facts);
+        assert_eq!(fee_bump(buyer, TxKind::Claim), None, "no child");
+        tx_to_send(buyer, TxKind::Claim)
+    };
+    let first = claim_at(&mut buyer, 0);
+    assert_eq!(claim_at(&mut buyer, 5), first);
+    let second = claim_at(&mut buyer, 6);
+    assert_eq!(second.input, {
+        let mut input = first.input.clone();
+        input[0].witness = second.input[0].witness.clone();
+        input
+    });
+    let raised = first.output[0].value - second.output[0].value;
+    let relay_step = REPLACEMENT_FEE_RATE_STEP
+        .checked_mul_by_weight(second.weight())
+        .unwrap();
+    assert!(raised >= relay_step, "{raised}");
+    // 15 sat per vbyte in place of 10: the fee rises by one half.
+    let escrow = buyer.model.my_txs().warning.builder.escrow().unwrap();
+    let first_fee = escrow.prevout.value - first.output[0].value;
+    assert!(
+        (raised * 2).to_sat().abs_diff(first_fee.to_sat()) <= 2,
+        "{raised} more than {first_fee}"
+    );
+
+    let (mut buyer, mut seller) = trade_with_signed_deposit();
+    let timeout = u32::from(config().deposit_timeout());
+    observe_both(&mut buyer, &mut seller, &unconfirmed(0));
+    let deposit_psbt = buyer.model.deposit_psbt().unwrap().clone();
+    let mut abort_at = |blocks: u32| {
+        observe(&mut seller, &unconfirmed(timeout + 1 + blocks));
+        assert_eq!(fee_bump(&seller, TxKind::DepositAbort), None, "no child");
+        let abort_tx = tx_to_send(&seller, TxKind::DepositAbort);
+        (fee(&abort_tx, &deposit_psbt), abort_tx)
+    };
+    let (first_fee, first) = abort_at(0);
+    // The first abort pays more than the whole deposit, which is more than the fee rate of
+    // the first steps asks for. The transaction changes when a step asks for more than that.
+    let mut last_fee = first_fee;
+    for blocks in [6, 12, 18, 24] {
+        let (fee, _) = abort_at(blocks);
+        assert!(fee >= last_fee, "{fee} after {blocks} blocks");
+        last_fee = fee;
+    }
+    let (raised_fee, raised) = abort_at(60);
+    assert_ne!(raised.compute_txid(), first.compute_txid());
+    let relay_step = REPLACEMENT_FEE_RATE_STEP
+        .checked_mul_by_weight(raised.weight())
+        .unwrap();
+    assert!(raised_fee >= first_fee + relay_step);
+}
+
 /// A buyer and a seller who have signed the same custom payout, with a confirmed deposit.
 fn trade_with_signed_custom_payout() -> (Trader, Trader) {
     let (mut buyer, mut seller) = trade(BUYER_SELLER_ROLES[0]);

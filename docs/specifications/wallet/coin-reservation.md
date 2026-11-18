@@ -83,12 +83,33 @@ transaction.
 
 ### Forgetting a recorded transaction
 
-The wallet offers an operation that removes a recorded unconfirmed transaction. The coins that it
-spends count as unspent again, and its outputs no longer count as incoming. A transaction that is
-unknown or confirmed is left as it is.
+The wallet offers an operation that removes a recorded unconfirmed transaction, together with
+every recorded unconfirmed transaction that spends one of its outputs, directly or through other
+such transactions. The coins that the removed transactions spend count as unspent again, and
+their outputs no longer count as incoming. A transaction that is unknown or confirmed is left as
+it is.
 
-The engine uses the operation for the deposit transaction when the deposit can never confirm
-([../trade/setup-and-deposit.md](../trade/setup-and-deposit.md)).
+The engine uses the operation for every transaction of the trader that can never confirm: the
+deposit transaction ([../trade/setup-and-deposit.md](../trade/setup-and-deposit.md)), and a
+transaction whose fee was raised with a child ([../trade/fees.md](../trade/fees.md)).
+
+### Raising the fee of a transaction with a child
+
+The wallet offers an operation that raises the fee of an unconfirmed transaction with a child
+transaction.
+
+- The child spends every output of the transaction that belongs to the wallet. If these outputs
+  do not pay for the fee, the wallet adds coins. Coins that are reserved are not used.
+- The child pays so much that the transaction and the child together reach the fee rate that
+  the caller asks for. The caller names the fee that the transaction pays itself.
+- The caller names the highest fee that the child may pay. Above it the wallet builds no child.
+- The wallet records the transaction and the child as unconfirmed.
+- A child that the wallet built earlier for the same transaction is replaced. If no new child
+  can be built, the earlier one stays recorded.
+
+The wallet selects the coins of every transaction itself. Coins that a transaction must spend,
+like the output of the parent here, are spent in addition to the imported coins
+([imported-keys.md](imported-keys.md), spending order).
 
 Rationale: the wallet notices on its own when another confirmed transaction spends one of its
 coins. It cannot notice a transaction that spends a coin of somebody else. The transaction that

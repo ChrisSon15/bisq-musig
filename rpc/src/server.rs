@@ -940,6 +940,7 @@ fn trade_event(
         deadlines: deadlines.collect(),
         required_actions: required_actions.collect(),
         num_confirmations: None,
+        fee_bump_tx_id: None,
     }
 }
 
@@ -975,8 +976,9 @@ async fn watch_trades(
     watched: Arc<Mutex<HashSet<String>>>,
 ) {
     let mut chain_events = chain.subscribe();
-    // The height of the chain at which a transaction was sent last.
-    let mut sent_at: HashMap<Txid, Option<u32>> = HashMap::new();
+    // The height of the chain at which a transaction was sent last, with the child that raised
+    // its fee. A new child is sent at once, also at the same height.
+    let mut sent_at: HashMap<(Txid, Option<Txid>), Option<u32>> = HashMap::new();
     let mut reported_problem: Option<PeerProblem> = None;
     loop {
         let problem = chain.peer_problem();
@@ -1022,19 +1024,31 @@ async fn watch_trades(
 
         let height = chain.tip_height();
         let mut failed = false;
-        for (event, TxToSend { kind, tx }) in to_send {
+        for (event, TxToSend { kind, tx, child }) in to_send {
             let txid = tx.compute_txid();
-            if sent_at.get(&txid) == Some(&height) {
+            let child_txid = child.as_ref().map(Transaction::compute_txid);
+            let sent = (txid, child_txid);
+            if sent_at.get(&sent) == Some(&height) {
                 continue;
             }
-            match chain.broadcast(tx).await {
+            let first_sending = sent_at.keys().all(|(parent, _)| *parent != txid);
+            let result = send_tx(&*chain, tx, child, first_sending).await;
+            match result {
                 // "Sent" does not mean that a node accepted the transaction.
                 Ok(_) => {
-                    info!(trade_id = event.trade_id, ?kind, %txid, ?height, "Sent a transaction.");
-                    sent_at.insert(txid, height);
+                    info!(
+                        trade_id = event.trade_id,
+                        ?kind,
+                        %txid,
+                        ?child_txid,
+                        ?height,
+                        "Sent a transaction."
+                    );
+                    sent_at.insert(sent, height);
                     let _ = events.send(TradeEvent {
                         tx_kind: Some(tx_kind(kind).into()),
                         tx_id: Some(txid.to_string()),
+                        fee_bump_tx_id: child_txid.map(|txid| txid.to_string()),
                         ..event
                     });
                 }
@@ -1042,7 +1056,7 @@ async fn watch_trades(
                 // block. It is announced again after the next block.
                 Err(ClientError::NotRequested(_)) => {
                     debug!(%txid, ?height, "No peer asked for the announced transaction.");
-                    sent_at.insert(txid, height);
+                    sent_at.insert(sent, height);
                 }
                 Err(error) => {
                     warn!(?kind, %txid, %error, "Could not send a transaction. Trying again.");
@@ -1066,6 +1080,31 @@ async fn watch_trades(
             () = tokio::time::sleep(pause) => {}
         }
     }
+}
+
+/// Sends a transaction of a trade to the network. A transaction with a child that raises its
+/// fee is sent with the child as one package.
+///
+/// A node takes some seconds longer for a package than for a single transaction, because it
+/// asks for the child and then for the parent, each time after a delay. With `first_sending`,
+/// for a transaction that this run of the program has not sent before, the transaction
+/// therefore goes out alone first: a reaction with a deadline must not wait for the package. A
+/// node that refuses the single transaction for its fee still accepts it in the package.
+async fn send_tx(
+    chain: &dyn ChainAccess,
+    tx: Transaction,
+    child: Option<Transaction>,
+    first_sending: bool,
+) -> Result<Txid, ClientError> {
+    let Some(child) = child else {
+        return chain.broadcast(tx).await;
+    };
+    if first_sending {
+        if let Err(error) = chain.broadcast(tx.clone()).await {
+            debug!(%error, "Transaction not sent alone before its package.");
+        }
+    }
+    chain.broadcast_package(tx, child).await
 }
 
 /// Tells the subscribers of all trades that are not final about the start or the end of a

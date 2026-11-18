@@ -37,6 +37,9 @@ struct Record {
     reserved_coins: Vec<String>,
     deposit_signing_height: Option<u32>,
     deposit_watch_start: Option<u32>,
+    /// The height at which the state last changed. The fee schedule counts from it.
+    #[serde(default)]
+    sending_since: Option<u32>,
     my_script_key: String,
     /// The data of the setup. A trade whose deposit transaction the trader has not signed is
     /// stored without it: its setup cannot continue after a restart, because its nonces are lost.
@@ -236,6 +239,7 @@ impl TradeModel {
                 .collect(),
             deposit_signing_height: self.deposit_signing_height,
             deposit_watch_start: self.deposit_watch_start,
+            sending_since: self.sending_since,
             my_script_key: hex(self
                 .keys
                 .my_multisig_script_key
@@ -427,6 +431,7 @@ impl TradeModel {
             .collect::<Result<_>>()?;
         trade.deposit_signing_height = record.deposit_signing_height;
         trade.deposit_watch_start = record.deposit_watch_start;
+        let sending_since = record.sending_since;
         match record.setup {
             Some(setup) => trade.restore_setup(&setup, state)?,
             None if state >= TradeState::Deposit => {
@@ -437,6 +442,7 @@ impl TradeModel {
             None => {}
         }
         trade.state = state;
+        trade.sending_since = sending_since;
         Ok(trade)
     }
 

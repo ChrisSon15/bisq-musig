@@ -187,8 +187,11 @@ struct FakeChain {
 
 struct FakeChainState {
     height: u32,
-    /// The transactions that the service sent, in the order of sending.
+    /// The transactions that the service sent, in the order of sending. For a package this is
+    /// the parent.
     sent: Vec<Transaction>,
+    /// The packages that the service sent: a transaction and the child that raises its fee.
+    packages: Vec<(Transaction, Transaction)>,
     confirmed: HashMap<Txid, ConfirmedTx>,
     watched_outputs: Vec<OutPoint>,
     /// A problem with the peers that the chain reports. While it lasts, a broadcast fails.
@@ -210,6 +213,7 @@ impl FakeChain {
             state: Mutex::new(FakeChainState {
                 height: Self::START_HEIGHT,
                 sent: Vec::new(),
+                packages: Vec::new(),
                 confirmed: HashMap::new(),
                 watched_outputs: Vec::new(),
                 peer_problem: None,
@@ -224,6 +228,10 @@ impl FakeChain {
 
     fn sent(&self) -> Vec<Transaction> {
         self.state.lock().unwrap().sent.clone()
+    }
+
+    fn packages(&self) -> Vec<(Transaction, Transaction)> {
+        self.state.lock().unwrap().packages.clone()
     }
 
     fn watched_outputs(&self) -> Vec<OutPoint> {
@@ -357,6 +365,12 @@ impl ChainAccess for FakeChain {
         }
         state.sent.push(tx);
         Box::pin(async move { Ok(txid) })
+    }
+
+    fn broadcast_package(&self, parent: Transaction, child: Transaction) -> BroadcastFuture {
+        let sent = self.broadcast(parent.clone());
+        self.state.lock().unwrap().packages.push((parent, child));
+        sent
     }
 }
 
@@ -2378,6 +2392,72 @@ async fn e1_e2_publish_warning_tx_and_redirect() {
         let result = trade.party_mut(peer_side).publish_warning_tx().await;
         assert_refused(result, Code::FailedPrecondition, "not allowed in state");
     }
+}
+
+/// E10 through the service (F20): the redirect of the seller stays unconfirmed. With the next
+/// block the service sends it again, now as a package with a child of the wallet that raises
+/// its fee, and the event of the sending names the child. A further block gives a further child.
+#[tokio::test]
+async fn e10_unconfirmed_redirect_is_sent_as_a_package_with_a_child() {
+    let mut trade = Trade::at(TradeType::TakerIsBuyer, Stage::DepositSigned).await;
+    for _ in 3..WARNING_LOCK_TIME {
+        trade.mine(&[]);
+    }
+    let mut events = trade.seller.subscribe_trade_events().await.unwrap();
+    let buyers_chain = Arc::clone(&trade.buyer.chain);
+    let sellers_chain = Arc::clone(&trade.seller.chain);
+    let buyers_sent = buyers_chain.sent().len();
+    let sellers_sent = sellers_chain.sent().len();
+    trade.buyer.publish_warning_tx().await.expect("valid");
+    let warning_tx = sent_tx(&buyers_chain, buyers_sent + 1).await;
+
+    // The warning is confirmed. The redirect pays the fee rate of the engine itself, so it goes
+    // out alone first.
+    trade.mine(std::slice::from_ref(&warning_tx));
+    let redirect_tx = sent_tx(&sellers_chain, sellers_sent + 1).await;
+    let event = trade_event_of_type(&mut events, TradeEventType::TxSent).await;
+    assert_eq!(event.tx_kind(), TradeTxKind::RedirectTx);
+    assert_eq!(event.fee_bump_tx_id, None);
+    assert_eq!(sellers_chain.packages(), vec![]);
+
+    let mut children = Vec::new();
+    for round in 1..=2 {
+        trade.mine(&[]);
+        assert_eq!(
+            sent_tx(&sellers_chain, sellers_sent + 1 + round).await,
+            redirect_tx
+        );
+        let packages = sellers_chain.packages();
+        assert_eq!(packages.len(), round);
+        let (parent, child) = &packages[round - 1];
+        assert_eq!(parent, &redirect_tx);
+        assert_eq!(
+            child.input[0].previous_output.txid,
+            redirect_tx.compute_txid()
+        );
+        let event = trade_event_of_type(&mut events, TradeEventType::TxSent).await;
+        assert_eq!(event.tx_kind(), TradeTxKind::RedirectTx);
+        assert_eq!(event.tx_id, Some(redirect_tx.compute_txid().to_string()));
+        assert_eq!(event.fee_bump_tx_id, Some(child.compute_txid().to_string()));
+        children.push(child.compute_txid());
+    }
+    assert_ne!(children[0], children[1], "a new child for the next step");
+
+    // After a start of the service the redirect is due at once, with a child. A package needs
+    // longer to reach a node than a single transaction, so the redirect goes out alone first,
+    // and then again as a package with the child.
+    let sent_before = sellers_chain.sent().len();
+    let packages_before = sellers_chain.packages().len();
+    trade.seller.restart().await;
+    assert_eq!(
+        sent_tx(&sellers_chain, sent_before + 2).await,
+        redirect_tx,
+        "sent alone and in a package"
+    );
+    assert_eq!(sellers_chain.sent()[sent_before], redirect_tx);
+    let packages = sellers_chain.packages();
+    assert_eq!(packages.len(), packages_before + 1);
+    assert_eq!(packages[packages_before].0, redirect_tx);
 }
 
 /// D21: a problem with the peers and its end are reported as events of a trade, also to a

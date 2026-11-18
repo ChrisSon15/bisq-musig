@@ -218,6 +218,34 @@ impl<Cs: Iterator<Item = TxOutput>, As: Iterator<Item = Address>> ProtocolWallet
         Ok(())
     }
 
+    /// The mock child spends the last output of the parent, which is the output of the trader in
+    /// the transactions of a trade. It has no signature and no output. Its lock time is the fee
+    /// rate that was asked for, in sat per 1000 weight units, so that a test can read it.
+    fn create_fee_bump_child(
+        &mut self,
+        parent: &Transaction,
+        _parent_fee: Amount,
+        package_fee_rate: FeeRate,
+        _max_child_fee: Amount,
+    ) -> Result<Transaction, WalletErrorKind> {
+        let vout = u32::try_from(parent.output.len())
+            .ok()
+            .and_then(|len| len.checked_sub(1))
+            .ok_or_else(|| mock_error(TransactionErrorKind::MissingTxOutput))?;
+        let fee_rate = u32::try_from(package_fee_rate.to_sat_per_kwu())
+            .map_err(|_| mock_error(TransactionErrorKind::Overflow))?;
+        Ok(Transaction {
+            version: Version::TWO,
+            lock_time: absolute::LockTime::from_height(fee_rate)
+                .map_err(|_| mock_error(TransactionErrorKind::Overflow))?,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(parent.compute_txid(), vout),
+                ..TxIn::default()
+            }],
+            output: Vec::new(),
+        })
+    }
+
     fn trade_key_shares(&self, trade_id: &str) -> wallet::error::Result<TradeKeyShares> {
         let master_key = Xpriv::new_master(Network::Regtest, &self.seed)?;
         derive_trade_key_shares(&master_key, trade_id)

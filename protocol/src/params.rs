@@ -32,6 +32,46 @@ pub const fn engine_fee_rate() -> FeeRate {
     FeeRate::from_sat_per_kwu(2_500)
 }
 
+/// The lowest fee rate of a trade: 1 sat per vbyte, the fixed minimum relay fee of the nodes. A
+/// transaction below it is not accepted by a node, also not together with a child that pays for
+/// it.
+pub const MIN_TRADE_FEE_RATE: FeeRate = FeeRate::from_sat_per_kwu(250);
+
+/// The highest fee rate of a trade: 1000 sat per vbyte. It stops a caller that passes a fee rate
+/// in a wrong unit.
+// TODO: The limits are not decided yet (open point O12 of the specification).
+pub const MAX_TRADE_FEE_RATE: FeeRate = FeeRate::from_sat_per_kwu(250_000);
+
+/// The number of blocks without a confirmation after which the engine raises the fee of a
+/// transaction that has no deadline.
+// TODO: The values of the fee schedule are not decided yet (open point O9 of the specification).
+pub const FEE_STEP_BLOCKS: u32 = 6;
+
+/// The number of steps by which the engine raises a fee at most. Every step multiplies the fee
+/// rate by 3/2, so the last step is about 58 times the first fee rate.
+pub const MAX_FEE_STEPS: u32 = 10;
+
+/// The step of the fee schedule for a transaction that could be in a block for
+/// `blocks_unconfirmed` blocks and is not. A transaction that must be confirmed within
+/// `deadline` blocks reaches the last step after half of this time. Other transactions rise
+/// every [`FEE_STEP_BLOCKS`] blocks.
+pub fn fee_step(blocks_unconfirmed: u32, deadline: Option<u32>) -> u32 {
+    let blocks_per_step = match deadline {
+        Some(deadline) => (deadline / (2 * MAX_FEE_STEPS)).max(1),
+        None => FEE_STEP_BLOCKS,
+    };
+    (blocks_unconfirmed / blocks_per_step).min(MAX_FEE_STEPS)
+}
+
+/// The fee rate of the fee schedule at a step: `first_fee_rate` times 3/2 for every step.
+pub fn fee_rate_at_step(first_fee_rate: FeeRate, step: u32) -> FeeRate {
+    let mut fee_rate = first_fee_rate.to_sat_per_kwu();
+    for _ in 0..step.min(MAX_FEE_STEPS) {
+        fee_rate = fee_rate.saturating_mul(3).div_ceil(2);
+    }
+    FeeRate::from_sat_per_kwu(fee_rate)
+}
+
 /// The parameters of one trade. They are part of the contract of the two traders, and both must
 /// use the same values. The caller of the engine supplies them.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -214,6 +254,20 @@ impl TradeParams {
     pub fn validate(&self, network: Network) -> Result<(), TradeParamsError> {
         let invalid = |reason: String| Err(TradeParamsError(reason));
 
+        for (name, fee_rate) in [
+            ("deposit", self.deposit_tx_fee_rate),
+            ("prepared", self.prepared_tx_fee_rate),
+        ] {
+            if !(MIN_TRADE_FEE_RATE..=MAX_TRADE_FEE_RATE).contains(&fee_rate) {
+                return invalid(format!(
+                    "the {name} fee rate of {} sat/kwu is outside the limits of {} to {} sat/kwu",
+                    fee_rate.to_sat_per_kwu(),
+                    MIN_TRADE_FEE_RATE.to_sat_per_kwu(),
+                    MAX_TRADE_FEE_RATE.to_sat_per_kwu()
+                ));
+            }
+        }
+
         if let Some(receiver) = &self.trade_fee_receiver {
             let receiver = match receiver.clone().require_network(network) {
                 Ok(receiver) => receiver,
@@ -312,6 +366,55 @@ mod tests {
     #[test]
     fn valid_params_are_accepted() {
         assert_eq!(valid_params().validate(Network::Regtest), Ok(()));
+    }
+
+    /// A11 (O12): a fee rate of a trade below the minimum relay fee of the nodes, or above the
+    /// upper limit, is rejected. The limits themselves are accepted.
+    #[test]
+    fn a11_fee_rates_outside_the_limits_are_rejected() {
+        let with_rates = |deposit: u64, prepared: u64| TradeParams {
+            deposit_tx_fee_rate: FeeRate::from_sat_per_kwu(deposit),
+            prepared_tx_fee_rate: FeeRate::from_sat_per_kwu(prepared),
+            ..valid_params()
+        };
+        assert_eq!(with_rates(250, 250).validate(Network::Regtest), Ok(()));
+        assert_eq!(
+            with_rates(250_000, 2_500).validate(Network::Regtest),
+            Ok(())
+        );
+        assert_invalid(
+            &with_rates(249, 2_500),
+            "the deposit fee rate of 249 sat/kwu",
+        );
+        assert_invalid(&with_rates(2_500, 0), "the prepared fee rate of 0 sat/kwu");
+        assert_invalid(&with_rates(250_001, 2_500), "the deposit fee rate");
+        assert_invalid(&with_rates(2_500, 2_500_000), "the prepared fee rate");
+    }
+
+    /// The fee schedule (O9): the fee rate rises by one half with every step, up to the last
+    /// step. A transaction with a deadline reaches the last step after half of its time.
+    #[test]
+    fn fee_schedule_rises_in_steps_up_to_a_limit() {
+        let first = FeeRate::from_sat_per_kwu(2_500);
+        assert_eq!(fee_rate_at_step(first, 0), first);
+        assert_eq!(fee_rate_at_step(first, 1), FeeRate::from_sat_per_kwu(3_750));
+        assert_eq!(fee_rate_at_step(first, 2), FeeRate::from_sat_per_kwu(5_625));
+        let last = fee_rate_at_step(first, MAX_FEE_STEPS);
+        assert_eq!(fee_rate_at_step(first, MAX_FEE_STEPS + 5), last);
+        let factor = last.to_sat_per_kwu() / first.to_sat_per_kwu();
+        assert_eq!(factor, 57, "{last}");
+
+        // Without a deadline: one step every 6 blocks.
+        assert_eq!(fee_step(5, None), 0);
+        assert_eq!(fee_step(6, None), 1);
+        assert_eq!(fee_step(1_000, None), MAX_FEE_STEPS);
+        // A claim lock time of 720 blocks: one step every 36 blocks, the last one at block 360.
+        assert_eq!(fee_step(35, Some(720)), 0);
+        assert_eq!(fee_step(36, Some(720)), 1);
+        assert_eq!(fee_step(360, Some(720)), MAX_FEE_STEPS);
+        // A short deadline: one step with every block.
+        assert_eq!(fee_step(3, Some(10)), 3);
+        assert_eq!(fee_step(3, Some(0)), 3);
     }
 
     /// The default configuration satisfies the limits.

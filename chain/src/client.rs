@@ -436,6 +436,11 @@ pub trait ChainAccess: Send + Sync {
     /// transaction was announced and no peer asked for it, which is the case for a transaction
     /// that the peer has already.
     fn broadcast(&self, tx: Transaction) -> BroadcastFuture;
+
+    /// Sends a transaction together with a child that spends one of its outputs and pays for
+    /// both, as one package. A node then accepts a parent whose own fee is below the minimum
+    /// of its mempool. The result is the ID of the child, with the meaning of [`Self::broadcast`].
+    fn broadcast_package(&self, parent: Transaction, child: Transaction) -> BroadcastFuture;
 }
 
 struct Shared {
@@ -885,6 +890,11 @@ impl ChainAccess for ChainClient {
     fn broadcast(&self, tx: Transaction) -> BroadcastFuture {
         let client = self.clone();
         Box::pin(async move { Self::broadcast(&client, tx).await })
+    }
+
+    fn broadcast_package(&self, parent: Transaction, child: Transaction) -> BroadcastFuture {
+        let client = self.clone();
+        Box::pin(async move { Self::broadcast_package(&client, parent, child).await })
     }
 }
 

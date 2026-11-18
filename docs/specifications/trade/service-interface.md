@@ -72,9 +72,9 @@ of the chain as the engine sees it.
 | Event | Meaning |
 |---|---|
 | State | The first event of a stream, and every change of the state. After a reorganisation the new state can be an earlier state of the trade. |
-| Transaction sent | The engine sent a transaction of the trade to the network: its kind and its ID. This does not mean that a node accepted it. |
+| Transaction sent | The engine sent a transaction of the trade to the network: its kind and its ID, and the ID of the child if the transaction was sent together with a child that raises its fee ([fees.md](fees.md)). This does not mean that a node accepted it. |
 | Loss | The peer took funds of the trader with a claim or a penalty transaction. |
-| Unexpected | Something happened on the chain that the engine does not expect. No state changed. |
+| Unexpected | Something happened on the chain that the engine does not expect, or the engine could not do what the trade needs, for example raise the fee of a transaction because the wallet holds no coin for it. No state changed. |
 | Transaction confirmed | The number of confirmations of a transaction of the trade changed: its kind, its ID and the number. It is reported from the first confirmation until the transaction counts as confirmed (3 confirmations), and with the number 0 when a reorganisation removed the transaction. Blocks that arrive together can give one event. |
 | Status | A deadline, a required action, the terminated mark or the final mark changed, and the state did not. |
 | Problem with the peers, and its end | While the problem lasts, the chain is not observed and nothing can be sent ([chain-observation.md](chain-observation.md)). |

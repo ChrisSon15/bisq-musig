@@ -87,6 +87,9 @@ pub enum TxKind {
 pub struct TxToSend {
     pub kind: TxKind,
     pub tx: Transaction,
+    /// A child transaction that raises the fee of `tx`. The caller sends both as one package,
+    /// so that a node accepts a parent whose own fee is too low for it.
+    pub child: Option<Transaction>,
 }
 
 /// A point in time of a trade at which a rule of the engine changes. Time is counted in blocks,
@@ -179,7 +182,8 @@ pub enum TradeEvent {
     /// The peer took funds of the trader with a claim or a penalty transaction.
     Loss(String),
     /// Something happened on the chain that the engine does not expect from a peer with
-    /// unmodified software. The engine changed no state for it.
+    /// unmodified software, or the engine could not do what the trade needs, for example raise
+    /// the fee of a transaction. The engine changed no state for it.
     Unexpected(String),
     /// The number of confirmations of a transaction of the trade changed. It is reported from
     /// the first confirmation until the transaction counts as confirmed, and with 0 when a

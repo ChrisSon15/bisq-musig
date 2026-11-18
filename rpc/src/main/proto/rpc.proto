@@ -333,4 +333,8 @@ message TradeEvent {
   // Set in an event of the type TX_CONFIRMED, together with txKind and txId. The kind DEPOSIT_ABORT_TX stands for
   // every transaction that spent an input of the deposit transaction in its place, whoever sent it.
   optional uint32 numConfirmations = 13;
+  // Set in an event of the type TX_SENT if the service sent the transaction together with a child transaction that
+  // raises its fee: the ID of the child. A later event for the same transaction can name another child, which pays
+  // more and replaces the earlier one.
+  optional string feeBumpTxId = 14;
 }

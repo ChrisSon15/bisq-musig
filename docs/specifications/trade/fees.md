@@ -12,8 +12,15 @@ unconfirmed transaction is raised.
 | Custom payout fee rate | Request of the caller, the same for both traders | Custom payout transaction |
 | Engine fee rate | The engine | Claim, deposit abort, drain, and every transaction that raises the fee of another one. The deposit abort pays more if the fee of the deposit transaction requires it ([transactions.md](transactions.md)). |
 
-The engine applies sanity limits to the deposit fee rate and the prepared fee rate that the caller
-passes. The limits are open point O12 in [README.md](README.md).
+The engine applies limits to the deposit fee rate and the prepared fee rate that the caller
+passes. A trade with a fee rate outside the limits is refused before any coin is reserved.
+
+| Limit | Value | Reason |
+|---|---|---|
+| Lowest fee rate | 1 sat per vbyte | The fixed minimum relay fee of the nodes. A transaction below it is not accepted, also not together with a child (see "Raising a fee"). |
+| Highest fee rate | 1000 sat per vbyte | It stops a caller that passes a fee rate in a wrong unit. |
+
+The values are open point O12 in [README.md](README.md).
 
 The deposit fee rate and the prepared fee rate are fixed when the trade starts. The pre-signed
 transactions can be published weeks later. Their fee can therefore be too low at that time, and
@@ -73,18 +80,66 @@ the fixed minimum relay fee of the nodes, which is 1 sat/vB by default in Bitcoi
 Both statements are tested with Bitcoin Core 29.0 only (the two tests J7 of
 `chain/tests/chain_client.rs`). Other nodes can behave differently.
 
-Rules for the schedule:
+### The fee schedule
 
-- The first fee rate of a child or of a replaceable transaction is the engine fee rate.
-- Each step raises the fee rate. A replacement pays at least the additional fee that the relay
-  rules require.
-- For the redirect and the penalty the schedule is chosen so that the transaction confirms before
-  the claim lock time of the peer's warning ends.
-- The engine never spends more on fees than the amount that the trader would lose without the
-  transaction.
+The fee rate of a step is the engine fee rate, multiplied by 3/2 for every step. Step 0 is the
+engine fee rate itself. The last step is step 10, which is about 58 times the engine fee rate.
 
-The number of blocks between two steps, the size of a step and the upper limit are open point O9
-in [README.md](README.md).
+The step of a transaction follows from the number of blocks for which the transaction could have
+been in a block and is not:
+
+| Transaction | Counted from | Blocks per step |
+|---|---|---|
+| Deposit | The block at which the engine first saw the chain without the deposit ([setup-and-deposit.md](setup-and-deposit.md)) | 6 |
+| Deposit abort | The end of the deposit timeout | 6 |
+| Warning, custom payout | The block at which the request that makes the engine send the transaction was processed | 6 |
+| Swap | The block at which the seller closed by force, by a request or by the engine | The number of blocks that were left before the buyer's warning became valid, divided by 20, at least 1 |
+| Redirect, penalty | The first confirmation of the peer's warning | The claim lock time divided by 20, at least 1 |
+| Claim | The end of the claim lock time | 6 |
+
+A transaction with a deadline (swap, redirect, penalty) therefore reaches the last step after
+half of the time that it has.
+
+The engine stores no list of the transactions that it sent. Every value of the table follows
+from the stored state of the trade and from the chain, so the schedule continues after a
+restart. The block of the last change of the state is part of the stored trade.
+
+Rules:
+
+- A transaction with a deadline is raised to the fee rate of its step from step 0 on: if it
+  pays less than the engine fee rate itself, it is sent with a child from the start.
+- A transaction without a deadline is first sent as it is, with the fee rate that the traders
+  agreed on. It gets a child from step 1 on.
+- A transaction that pays the fee rate of its step itself gets no child.
+- A child is built by the wallet. It spends the output of the transaction that belongs to the
+  wallet, and coins of the wallet if this output does not pay for the fee. It pays so much that
+  the transaction and the child together reach the fee rate of the step. The wallet records the
+  transaction and the child ([../wallet/coin-reservation.md](../wallet/coin-reservation.md)).
+- At a new step the wallet builds a new child, which replaces the earlier one. A step raises the
+  fee rate by one half, which is more than the additional fee that the relay rules require for
+  a replacement.
+- The claim and the deposit abort are built again by the engine with the fee rate of the step.
+  The deposit abort pays the higher of this fee and the fee that replaces the deposit
+  ([transactions.md](transactions.md)), so its first steps can give the same transaction.
+- A child never pays more than the amount that the transaction spends. This is the upper limit
+  for "the engine never spends more on fees than the trader would lose without the
+  transaction". A lower limit for each role and each transaction is not specified.
+- A transaction that the engine sends for the first time in a run of the program is sent alone
+  first, and then together with its child. A node takes some seconds longer to accept a package
+  than a single transaction, and a reaction with a deadline must not wait for that. A node that
+  refuses the single transaction for its fee accepts it afterwards in the package.
+- If the wallet cannot build a child, for example because it holds no coin that pays for it, the
+  engine sends the transaction without a new child, reports this as an event of the trade, and
+  tries again at the next step.
+- When a transaction of the trader can never confirm, because a confirmed transaction spent one
+  of the outputs that it spends, the engine tells the wallet to forget it together with its
+  child. The coins that the child spent are free again.
+
+Not specified here: raising the fee of the drain transaction and of a payment of the wallet. The
+wallet service sends them again and does not raise their fee.
+
+The values of the schedule (blocks per step, size of a step, number of steps) are open point O9 in
+[README.md](README.md).
 
 ## Protection against a blocked fee increase
 

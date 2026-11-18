@@ -21,7 +21,7 @@ decided (see D17), O6 was accepted (see N6), and O1 was postponed (section 12, r
 The identifiers of revision 1 are unchanged: findings F1 to F26, decisions D1 to D16, work packages
 WP0 to WP8, test groups A to L. Revision 2 added findings F27 and F28, the points N1 to N9
 (section 7.2) and test group M. The findings F29 to F31 were found and fixed during WP4, on
-2026-11-18.
+2026-11-18, and F32 during WP6.
 
 ## 1. Purpose and method
 
@@ -265,6 +265,7 @@ with a running test.
 | F28 | Every wallet sync builds a new CBF client and stops it after the first update. | `sync_cbf` in `chain/src/lib.rs:160-184` | Nothing observes the chain between two syncs, and each sync opens new peer connections. The engine needs one long-running client that the wallet sync shares. Confirmed. |
 | F29 | A deposit that spends a coin of an imported key cannot be signed. | The signer of an imported key in `BMPWallet::sign` needs the fields `tap_internal_key` and `tap_merkle_root` of the PSBT input. `Redact` in `protocol/src/psbt.rs` removes them from the half deposit. | Imported coins are spent first (D8), so every trade that a trader starts while he holds an unspent payout of an earlier trade fails at `SignDepositTx`. Reproduced with a test. Fixed in WP4: the wallet sets the fields from the imported key. |
 | F31 | The wallet of the trader who published the deposit keeps a deposit that can never confirm. | `receive_deposit_psbt` records the deposit in the wallet. The transaction that makes the deposit impossible can spend a coin of the peer, which the wallet does not watch. | After `DepositAborted` the trader's coins stay marked as spent, and the change of the deposit counts as incoming. Reproduced on regtest. Fixed in WP4: `ProtocolWalletApi::forget_transaction`. |
+| F32 | The coin selection of the wallet drops the coins that a transaction must spend. | `AlwaysSpendImportedFirst` in `wallet/src/coin_selection.rs` put the imported coins in the place of the required coins and offered the required ones as optional. | No production code required a coin before WP6. The child that raises a fee must spend the output of its parent, and did not. Reproduced on regtest. Fixed in WP6: required coins stay required, and the imported coins are added to them. |
 
 ### 6.3 Tests and CI
 
@@ -457,7 +458,7 @@ Not done:
 
 - Fee bumping (F20): no child transaction for an anchor, no replace-by-fee. The users of these
   functions are the reactions of WP4, and sending a parent with its child needs the package
-  submission of WP3. Tests C5, E9, E10, E15, F5.
+  submission of WP3. Tests C5, E9, E10, E15, F5. Done in WP6.
 - Sending the stored drain transaction again at the next start, and replacing it (N5, test M4,
   M8). This needs the rebroadcast of pull request #235 and WP3. The sending again was done in
   WP4, by the wallet service on its own and without pull request #235. The replacement is open
@@ -679,7 +680,8 @@ Not done:
 - Fee increases of sent transactions (F20; tests C5, E9, E10, E15, F5): no child transaction for
   an anchor output, no replacement. A reaction that does not confirm at its fee rate stays
   unconfirmed. This holds for the deposit abort and the drain transaction as well: they are sent
-  again, and their fee is not raised. This is the content of WP6.
+  again, and their fee is not raised. This is the content of WP6. Done in WP6, except for the
+  drain transaction.
 - The swap, custom payout, claim and penalty transactions are not recorded in the wallet when
   they are sent. The wallet shows their outputs after they are confirmed. Reason: each of them
   competes with a transaction of the peer for an output that the wallet does not watch. A
@@ -804,6 +806,64 @@ Not done:
 
 Done when: the pinning scenario of `pinningattack.md` fails in a regtest test, and a pre-signed
 transaction with a too low fee confirms through CPFP.
+
+Status on 2026-11-18 (branch `wp6-fees`, on top of `wp5-finish`): the condition holds. The
+pinning scenario fails on regtest (`pinning_of_a_warning_by_the_redirect_of_the_peer_fails`), and
+a redirect that was signed at 1 sat/vB confirms together with a child of the wallet at the fee
+rate of the engine (`e10_redirect_with_a_low_fee_confirms_through_a_child`). The acceptance of a
+package whose parent is below the minimum fee of a full mempool is tested for the chain client
+(test J7 of WP3), not again with a transaction of a trade.
+
+Done:
+
+- Limits for the deposit fee rate and the prepared fee rate of a trade: 1 to 1000 sat/vB (A11;
+  the values are open point O12).
+- Fee schedule without a mempool view (`protocol::params::fee_step`, `fee_rate_at_step`): the fee
+  rate rises by one half per step, at most 10 steps; 6 blocks per step for a transaction without
+  a deadline; a transaction with a deadline (swap, redirect, penalty) reaches the last step
+  after half of its time. The values are open point O9.
+- No list of sent transactions is stored (section 12, row 10). The schedule of every transaction
+  is counted from a value that follows from the chain or from the stored state. One value was
+  added to the stored trade: the block of the last change of the state.
+- Child transactions (F20): the wallet builds a child that spends its output of the parent and,
+  if needed, further coins (`ProtocolWalletApi::create_fee_bump_child`). The engine asks for a
+  child for the deposit, warning, redirect, swap, penalty and custom payout transaction when the
+  schedule reaches a step whose fee rate the transaction does not pay itself. A new step gives a
+  new child, which replaces the earlier one. A child pays at most the amount that its parent
+  spends.
+- The trade service sends a transaction and its child as one package over the peer-to-peer
+  network, and the event of the sending names the child.
+- The claim and the deposit abort are built again with the fee rate of the step (E15).
+- A transaction of the trader that can never confirm is forgotten by the wallet together with
+  its child, so that the coins of the child are free again. The engine finds such transactions
+  from the confirmed spends of the outputs that it watches. This replaces the single case of the
+  deposit (F31).
+- If the wallet cannot build a child, the transaction is sent without one, and the trade reports
+  an event.
+- Redirect lock time 1 (D4) and the reaction to a warning of the peer that confirms in place of
+  the trader's own exist since WP1 and WP4.
+- Tests: A11 and the schedule in `protocol/src/params.rs`; E9, C5, E10, F5, E15 at the level of
+  the engine; the wallet's child on regtest (package at 10 sat/vB, replacement at 20 sat/vB,
+  refusal above the limit, forgetting); three regtest tests of trades (redirect with a child,
+  the pinning scenario with two steps of the schedule, a lost warning whose child is forgotten);
+  one service test of the package and its event.
+
+Not done:
+
+- The fee of the drain transaction and of a payment of the wallet is not raised. They are sent
+  again by the wallet service.
+- Agreement of both peers on the fee rates: the engine has no message for it. Peers with
+  different fee rates end with a terminated setup, as peers with different lock times (O14).
+- The source of the engine fee rate is still the fixed value of 10 sat/vB (N1).
+- The upper limit of a child's fee is the amount that its transaction spends. A lower limit for
+  each role, as the specification demands in general words, is not defined.
+- A child for the warning or the redirect needs a coin of the wallet, because their anchor
+  holds 330 sat. A wallet without a free coin cannot raise these fees. The trade reports it.
+- Review of the anchor amount and of the transaction weights against the relay policy of
+  current nodes (TRUC transactions, cluster mempool): not done. The tests run against Bitcoin
+  Core 29.0.
+- Tests C5, E9 and F5 exist at the level of the engine. On regtest the child is tested for the
+  warning and the redirect.
 
 ### WP7 Interface and operation (estimate: 1 to 2 weeks for the Rust side; issues #33, #58, #180)
 

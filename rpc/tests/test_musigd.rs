@@ -889,15 +889,16 @@ async fn h2_h5_restart_of_two_daemons_during_a_forced_close() -> anyhow::Result<
     assert_eq!(sellers_state.state(), TradeStateKind::SellerReadyToRelease);
     // H3: the seller's caller repeats the release after the restart and gets the key share
     // again.
-    let repeated = seller
-        .musig
-        .sign_swap_tx(SwapTxSignatureRequest {
+    let repeated = until_accepted("release", || {
+        let mut musig = seller.musig.clone();
+        let request = SwapTxSignatureRequest {
             trade_id: trade_id.clone(),
             swap_tx_input_peers_partial_signature: Vec::new(),
             seller_ready_to_release: true,
-        })
-        .await?
-        .into_inner();
+        };
+        async move { musig.sign_swap_tx(request).await }
+    })
+    .await;
     assert!(repeated.peer_output_prv_key_share.is_some());
     // K2: the ID of the trade is known after the restart.
     let duplicate = buyer
@@ -1059,8 +1060,17 @@ async fn h2_h5_restart_of_two_daemons_in_the_dispute_path() -> anyhow::Result<()
     }
     // Both traders lost what they paid into the deposit. The redirect paid it to the receiver.
     expect_balance(&mut buyer, "buyer", FUNDING - BUYERS_SECURITY_DEPOSIT).await;
+    // The seller also paid for the child that raised the fee of the redirect. The claim lock
+    // time of these daemons is 10 blocks, so the fee schedule takes a step with every block,
+    // and the child that got into a block can be one of a late step.
     let sellers_deposit = TRADE_AMOUNT + SELLERS_SECURITY_DEPOSIT;
-    expect_balance(&mut seller, "seller", FUNDING - sellers_deposit).await;
+    let highest_child_fee = 250_000;
+    seller
+        .wait_for_balance("seller", |balance| {
+            let after_the_deposit = FUNDING - sellers_deposit;
+            (after_the_deposit - highest_child_fee..=after_the_deposit).contains(&balance)
+        })
+        .await;
     Ok(())
 }
 

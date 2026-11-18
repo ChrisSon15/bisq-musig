@@ -4,8 +4,8 @@
 //! preconditions, then validates all data, and only then changes the trade. The rules are
 //! specified in `docs/specifications/trade/trade-states.md`.
 
-use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::sync::{Arc, Mutex};
 
@@ -20,7 +20,7 @@ use bdk_wallet::bitcoin::{
 use musig2::secp::{MaybeScalar, Point};
 use musig2::{PartialSignature, PubNonce};
 use thiserror::Error;
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 use wallet::protocol_wallet_api::ProtocolWalletApi;
 use wallet::secret::SecretScalar;
 
@@ -31,6 +31,7 @@ use crate::chain_facts::{
 use crate::multisig::{KeyCtx, KeyPair, PointExt as _, SigCtx};
 use crate::params::{
     EngineConfig, MIN_CONFIRMATIONS, REDIRECT_LOCK_TIME, TradeParams, engine_fee_rate,
+    fee_rate_at_step, fee_step,
 };
 use crate::psbt::extract_signed_tx;
 use crate::receiver::{Receiver, ReceiverList};
@@ -145,8 +146,20 @@ pub struct TradeModel {
     /// timeout is counted from here. `None` while the deposit transaction is confirmed.
     deposit_watch_start: Option<u32>,
     /// The signed deposit abort transaction, from the moment the deposit timeout has passed
-    /// (D13). It is not stored: after a restart the engine builds it again.
-    deposit_abort_tx: Option<Transaction>,
+    /// (D13), with the step of the fee schedule that it was built for. It is not stored: after
+    /// a restart the engine builds it again.
+    deposit_abort_tx: Option<(u32, Transaction)>,
+    /// The height of the chain tip when a request or a decision of the engine last changed the
+    /// state. The fee schedule of a transaction that the trader sends because of this state is
+    /// counted from here.
+    sending_since: Option<u32>,
+    /// The child transactions that raise the fee of a transaction of the trade, by the ID of
+    /// their parent. They are not stored: the wallet has recorded them, and after a restart the
+    /// engine asks the wallet for a new child at the next step of the schedule.
+    fee_bumps: BTreeMap<Txid, FeeBump>,
+    /// The transactions of the trader that can never confirm and that the wallet was told to
+    /// forget, in this run of the program.
+    forgotten: BTreeSet<Txid>,
     /// Set, with the reason, when the peer sent data that an unmodified client never produces.
     /// A terminated trade accepts no further data. Its state changes only once more, and only
     /// if it was terminated during the setup: then the trade is abandoned.
@@ -243,6 +256,30 @@ struct ReceivedPartialSignatures {
     redirect_tx: PartialSignature,
     /// Only the buyer uses the seller's data for the swap transaction during the setup.
     swap_tx: Option<(PartialSignature, TapSighash)>,
+}
+
+/// What the engine did to raise the fee of a transaction at a step of the fee schedule.
+#[derive(Clone)]
+struct FeeBump {
+    step: u32,
+    /// The child that the wallet built. `None` if the wallet could not build one.
+    child: Option<Transaction>,
+}
+
+/// A transaction that the trader should have on the network, with what the fee schedule needs.
+struct Due {
+    kind: TxKind,
+    /// The number of blocks for which the transaction could have been in a block.
+    blocks_unconfirmed: u32,
+    /// The number of blocks, counted from the same moment, within which the transaction must be
+    /// confirmed, if a transaction of the peer competes with it.
+    deadline: Option<u32>,
+}
+
+impl Due {
+    fn fee_step(&self) -> u32 {
+        fee_step(self.blocks_unconfirmed, self.deadline)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -452,6 +489,9 @@ impl TradeModel {
             chain: ChainFacts::default(),
             deposit_watch_start: None,
             deposit_abort_tx: None,
+            sending_since: None,
+            fee_bumps: BTreeMap::new(),
+            forgotten: BTreeSet::new(),
             terminated: None,
             reserved_coins: Vec::new(),
             deposit_signing_height: None,
@@ -620,6 +660,9 @@ impl TradeModel {
         //  persistence, we must ensure that the old state continues to be observed meanwhile.
         info!(trade_id = self.trade_id, %old_state, %new_state, "Updating trade state.");
         self.state = new_state;
+        // Height 0 means that the engine was not told about the chain yet.
+        let tip = self.chain.tip_height;
+        self.sending_since = (tip > 0).then_some(tip);
         Ok(true)
     }
 }
@@ -1329,7 +1372,9 @@ impl TradeModel {
         };
         self.read_key_share_from_spend(wallet, &situation, &mut events);
         self.close_by_force_before_the_warning_is_valid(&situation);
-        self.abort_deposit_after_the_timeout(wallet, &situation);
+        self.abort_deposit_after_the_timeout(wallet);
+        self.forget_dead_transactions(wallet, &mut events);
+        self.raise_fee_with_a_child(wallet, &mut events);
 
         let observed = self.state_from(&situation);
         self.observed_state = (observed != self.state).then_some(observed);
@@ -1645,44 +1690,99 @@ impl TradeModel {
     }
 
     /// The transactions of the trader that should be on the network at the moment, according to
-    /// the state of the trade and the facts about the chain. `fee_rate` is the fee rate of the
-    /// transactions that the engine builds on its own.
+    /// the state of the trade and the facts about the chain. `fee_rate` is the first fee rate of
+    /// the transactions that the engine builds on its own. The fee schedule raises it while a
+    /// transaction stays unconfirmed.
     ///
     /// This is where the engine reacts to the chain (D7): it names the redirect or the penalty
     /// transaction when the warning transaction of the peer is confirmed, and the claim when the
     /// claim lock time of the trader's own warning has passed.
+    ///
+    /// A transaction can come with a child that raises its fee. The caller sends both as one
+    /// package.
     pub fn transactions_to_send(&self, fee_rate: FeeRate) -> Vec<TxToSend> {
-        let to_send = |kind, tx: Result<Transaction>| {
-            tx.ok()
-                .map(|tx| TxToSend { kind, tx })
-                .into_iter()
-                .collect()
+        let Some(due) = self.due_transaction() else {
+            return Vec::new();
         };
+        let fee_rate = fee_rate_at_step(fee_rate, due.fee_step());
+        let Ok(tx) = self.transaction_of(due.kind, fee_rate) else {
+            return Vec::new();
+        };
+        let child = self
+            .fee_bumps
+            .get(&tx.compute_txid())
+            .and_then(|bump| bump.child.clone());
+        vec![TxToSend {
+            kind: due.kind,
+            tx,
+            child,
+        }]
+    }
+
+    /// The transaction of a kind, as the trader holds it. The claim is built for `fee_rate`. The
+    /// deposit abort is the one that the last look at the chain built.
+    fn transaction_of(&self, kind: TxKind, fee_rate: FeeRate) -> Result<Transaction> {
+        match kind {
+            TxKind::Deposit => self.signed_deposit_tx(),
+            TxKind::DepositAbort => self
+                .deposit_abort_tx
+                .as_ref()
+                .map(|(_, abort_tx)| abort_tx.clone())
+                .ok_or(ProtocolErrorKind::MissingDepositAbortTx),
+            TxKind::Swap => self.signed_swap_tx().cloned(),
+            TxKind::CustomPayout => self.signed_custom_payout_tx(),
+            TxKind::Warning => self.my_signed_warning_tx().cloned(),
+            TxKind::Redirect => self.my_signed_redirect_tx().cloned(),
+            TxKind::Claim => self.my_claim_tx(fee_rate),
+            TxKind::Penalty => Ok(self.penalty_tx.builder.signed_tx()?.clone()),
+        }
+    }
+
+    /// The transaction that the trader should have on the network at the moment, if there is
+    /// one, with the number of blocks for which it could have been in a block.
+    fn due_transaction(&self) -> Option<Due> {
         let abandoned = TradeState::TradeClosed(ClosureType::Abandoned);
         if self.state == TradeState::Init || self.state == abandoned {
-            return Vec::new();
+            return None;
         }
-        let Ok(situation) = self.situation() else {
-            return Vec::new();
+        let situation = self.situation().ok()?;
+        let config = self.config().ok()?;
+        let tip = self.chain.tip_height;
+        let due = |kind, blocks_unconfirmed, deadline| {
+            Some(Due {
+                kind,
+                blocks_unconfirmed,
+                deadline,
+            })
         };
+        let since_state_change = tip.saturating_sub(self.sending_since.unwrap_or(tip));
         if self.chain.deposit_confirmations == 0 {
             if situation != Situation::PayoutsUnspent {
-                return Vec::new();
+                return None;
             }
+            let waiting = tip.saturating_sub(self.deposit_watch_start.unwrap_or(tip));
             if self.deposit_abort_is_due(&situation) {
-                let abort_tx = self.deposit_abort_tx.clone();
-                return to_send(
+                let timeout = u32::from(config.deposit_timeout());
+                return due(
                     TxKind::DepositAbort,
-                    abort_tx.ok_or(ProtocolErrorKind::MissingDepositAbortTx),
+                    waiting.saturating_sub(timeout + 1),
+                    None,
                 );
             }
             // Only the trader who holds all signatures can send the deposit transaction. In a
             // state after `Deposit` the deposit transaction was confirmed before and a
             // reorganisation removed it: the trader then sends it again without a time limit.
-            return to_send(TxKind::Deposit, self.signed_deposit_tx());
+            return due(TxKind::Deposit, waiting, None);
         }
         let seller_closed_by_force =
             !self.am_buyer() && self.state == TradeState::TradeClosed(ClosureType::Forced);
+        // The swap transaction must be confirmed before the buyer's warning is valid.
+        let swap = || {
+            let deadline = self
+                .blocks_before_warning_is_valid()
+                .map_or(0, |remaining| remaining + since_state_change);
+            due(TxKind::Swap, since_state_change, Some(deadline))
+        };
         match situation {
             Situation::PayoutsUnspent => {
                 let own_warning = if self.am_buyer() {
@@ -1693,43 +1793,209 @@ impl TradeModel {
                 if self.state == own_warning {
                     let valid = self.blocks_before_warning_is_valid().is_ok_and(|n| n == 0);
                     if valid {
-                        return to_send(TxKind::Warning, self.my_signed_warning_tx().cloned());
+                        return due(TxKind::Warning, since_state_change, None);
                     }
-                    Vec::new()
+                    None
                 } else if seller_closed_by_force {
-                    to_send(TxKind::Swap, self.signed_swap_tx().cloned())
+                    swap()
                 } else if self.state == TradeState::TradeClosed(ClosureType::Custom) {
-                    to_send(TxKind::CustomPayout, self.signed_custom_payout_tx())
+                    due(TxKind::CustomPayout, since_state_change, None)
                 } else {
-                    Vec::new()
+                    None
                 }
             }
             // The buyer spent his payout. The swap transaction of the seller is still valid.
-            Situation::BuyerPayoutSpent { .. } if seller_closed_by_force => {
-                to_send(TxKind::Swap, self.signed_swap_tx().cloned())
-            }
+            Situation::BuyerPayoutSpent { .. } if seller_closed_by_force => swap(),
             Situation::Warning {
                 of_buyer,
                 confirmations,
                 escrow: EscrowSpend::Unspent,
             } => {
+                let claim_lock_time = u32::from(config.claim_lock_time_blocks());
                 if of_buyer == self.am_buyer() {
                     // The trader's own warning: the claim, when its lock time has passed.
-                    let claim_lock_time = self
-                        .config()
-                        .map_or(u32::MAX, |config| config.claim_lock_time_blocks().into());
                     if confirmations >= claim_lock_time {
-                        return to_send(TxKind::Claim, self.my_claim_tx(fee_rate));
+                        return due(TxKind::Claim, confirmations - claim_lock_time, None);
                     }
-                    Vec::new()
-                } else if let Ok(penalty_tx) = self.penalty_tx.builder.signed_tx() {
-                    // The trader holds the full key of the escrow of the peer's warning.
-                    to_send(TxKind::Penalty, Ok(penalty_tx.clone()))
+                    return None;
+                }
+                // The warning of the peer: the reaction must be confirmed before the claim of
+                // the peer is valid. With the full key of the escrow it is the penalty.
+                let kind = if self.penalty_tx.builder.signed_tx().is_ok() {
+                    TxKind::Penalty
                 } else {
-                    to_send(TxKind::Redirect, self.my_signed_redirect_tx().cloned())
+                    TxKind::Redirect
+                };
+                due(kind, confirmations.saturating_sub(1), Some(claim_lock_time))
+            }
+            _ => None,
+        }
+    }
+
+    /// Asks the wallet for a child transaction that raises the fee of the transaction that the
+    /// trader should have on the network, when the fee schedule has reached a new step and the
+    /// transaction does not pay the fee rate of this step itself.
+    ///
+    /// The claim and the deposit abort need no child: the engine builds them again with the fee
+    /// rate of the step.
+    fn raise_fee_with_a_child(
+        &mut self,
+        wallet: &mut dyn ProtocolWalletApi,
+        events: &mut Vec<TradeEvent>,
+    ) {
+        let Some(due) = self.due_transaction() else {
+            return;
+        };
+        if matches!(due.kind, TxKind::Claim | TxKind::DepositAbort) {
+            return;
+        }
+        let Ok(parent) = self.transaction_of(due.kind, engine_fee_rate()) else {
+            return;
+        };
+        let (txid, step) = (parent.compute_txid(), due.fee_step());
+        // A transaction without a deadline first gets its chance with the fee rate that the
+        // traders agreed on. A transaction that competes with one of the peer starts at the
+        // fee rate of the engine.
+        if step == 0 && due.deadline.is_none() {
+            return;
+        }
+        let earlier = self.fee_bumps.get(&txid);
+        if earlier.is_some_and(|bump| bump.step == step) {
+            return;
+        }
+        let Some((parent_fee, input_amount)) = self.fee_and_input_amount(&parent) else {
+            return;
+        };
+        let fee_rate = fee_rate_at_step(engine_fee_rate(), step);
+        let pays_enough = fee_rate
+            .checked_mul_by_weight(parent.weight())
+            .is_some_and(|needed| needed <= parent_fee);
+        if pays_enough {
+            return;
+        }
+        // The engine never pays more for a fee than the amount that the transaction moves.
+        let child = match wallet.create_fee_bump_child(&parent, parent_fee, fee_rate, input_amount)
+        {
+            Ok(child) => {
+                info!(
+                    trade_id = self.trade_id,
+                    kind = ?due.kind,
+                    %txid,
+                    child = %child.compute_txid(),
+                    step,
+                    fee_rate = fee_rate.to_sat_per_kwu(),
+                    "Raising the fee of a transaction with a child transaction."
+                );
+                Some(child)
+            }
+            Err(error) => {
+                warn!(
+                    trade_id = self.trade_id,
+                    kind = ?due.kind,
+                    %txid,
+                    step,
+                    %error,
+                    "Could not raise the fee of a transaction."
+                );
+                // Reported once for a step. The usual reason is a wallet without a coin that
+                // pays for the child, which the user can change.
+                events.push(TradeEvent::Unexpected(format!(
+                    "the fee of the {:?} transaction {txid} cannot be raised to {} sat per 1000 \
+                     weight units: {error}",
+                    due.kind,
+                    fee_rate.to_sat_per_kwu()
+                )));
+                // The wallet keeps the child of an earlier step.
+                earlier.and_then(|bump| bump.child.clone())
+            }
+        };
+        self.fee_bumps.insert(txid, FeeBump { step, child });
+    }
+
+    /// The fee that a transaction of the trade pays, and the sum of the outputs that it spends.
+    /// `None` if the engine does not know all outputs that the transaction spends.
+    fn fee_and_input_amount(&self, tx: &Transaction) -> Option<(Amount, Amount)> {
+        let mut coins = BTreeMap::new();
+        if let Ok(psbt) = self.deposit_tx.builder.psbt() {
+            for (tx_in, input) in psbt.unsigned_tx.input.iter().zip(&psbt.inputs) {
+                if let Some(coin) = &input.witness_utxo {
+                    coins.insert(tx_in.previous_output, coin.value);
                 }
             }
-            _ => Vec::new(),
+        }
+        let outputs = [
+            self.deposit_tx.builder.buyer_payout().ok().cloned(),
+            self.deposit_tx.builder.seller_payout().ok().cloned(),
+            self.buyer_txs.warning.builder.escrow().ok(),
+            self.seller_txs.warning.builder.escrow().ok(),
+        ];
+        for output in outputs.into_iter().flatten() {
+            coins.insert(output.outpoint, output.prevout.value);
+        }
+        let mut input_amount = Amount::ZERO;
+        for input in &tx.input {
+            input_amount = input_amount.checked_add(*coins.get(&input.previous_output)?)?;
+        }
+        let mut fee = input_amount;
+        for output in &tx.output {
+            fee = fee.checked_sub(output.value)?;
+        }
+        Some((fee, input_amount))
+    }
+
+    /// Tells the wallet to forget the transactions of the trader that can never confirm, because
+    /// a confirmed transaction spent one of the outputs that they spend. The wallet has recorded
+    /// such a transaction when the trader published it, or when its fee was raised, together
+    /// with the child that raised the fee.
+    ///
+    /// The other transaction can spend an output that the wallet does not watch, for example a
+    /// payout of the deposit transaction, so the wallet does not notice on its own. Without this
+    /// step the coins that a child spent would stay marked as spent in the wallet.
+    fn forget_dead_transactions(
+        &mut self,
+        wallet: &mut dyn ProtocolWalletApi,
+        events: &mut Vec<TradeEvent>,
+    ) {
+        let own_transactions = [
+            self.deposit_tx
+                .builder
+                .psbt()
+                .ok()
+                .map(|psbt| psbt.unsigned_tx.clone()),
+            self.my_txs().warning.builder.signed_tx().ok().cloned(),
+            self.my_txs().redirect.builder.signed_tx().ok().cloned(),
+            self.swap_tx.builder.signed_tx().ok().cloned(),
+            self.penalty_tx.builder.signed_tx().ok().cloned(),
+            self.custom_payout_tx
+                .builder
+                .psbt()
+                .ok()
+                .map(|psbt| psbt.unsigned_tx.clone()),
+        ];
+        for tx in own_transactions.into_iter().flatten() {
+            let txid = tx.compute_txid();
+            let dead = tx.input.iter().any(|input| {
+                self.chain
+                    .spends
+                    .get(&input.previous_output)
+                    .is_some_and(|spend| spend.tx.compute_txid() != txid)
+            });
+            if !dead {
+                // After a reorganisation the transaction can be valid again.
+                self.forgotten.remove(&txid);
+                continue;
+            }
+            self.fee_bumps.remove(&txid);
+            if !self.forgotten.insert(txid) {
+                continue;
+            }
+            if let Err(error) = wallet.forget_transaction(txid) {
+                self.forgotten.remove(&txid);
+                events.push(TradeEvent::Unexpected(format!(
+                    "the wallet could not forget the transaction {txid}, which can never \
+                     confirm: {error}"
+                )));
+            }
         }
     }
 
@@ -1766,23 +2032,30 @@ impl TradeModel {
     /// Builds and signs the deposit abort transaction when it is due, and records it in the
     /// wallet as unconfirmed. From then on [`Self::transactions_to_send`] names it in place of
     /// the deposit transaction, until one of the two is confirmed.
-    fn abort_deposit_after_the_timeout(
-        &mut self,
-        wallet: &mut dyn ProtocolWalletApi,
-        situation: &Situation,
-    ) {
-        if self.deposit_abort_tx.is_some() || !self.deposit_abort_is_due(situation) {
+    ///
+    /// While the abort stays unconfirmed, the fee schedule raises its fee rate: the engine
+    /// builds the abort again for every step, and the new one replaces the earlier one.
+    fn abort_deposit_after_the_timeout(&mut self, wallet: &mut dyn ProtocolWalletApi) {
+        let Some(due) = self
+            .due_transaction()
+            .filter(|due| due.kind == TxKind::DepositAbort)
+        else {
+            return;
+        };
+        let step = due.fee_step();
+        if matches!(&self.deposit_abort_tx, Some((built_for, _)) if *built_for == step) {
             return;
         }
-        match self.sign_deposit_abort_tx(wallet) {
+        match self.sign_deposit_abort_tx(wallet, fee_rate_at_step(engine_fee_rate(), step)) {
             Ok(abort_tx) => {
                 info!(
                     trade_id = self.trade_id,
                     txid = %abort_tx.compute_txid(),
+                    step,
                     "The deposit transaction was not confirmed within the deposit timeout. \
                      Aborting the deposit."
                 );
-                self.deposit_abort_tx = Some(abort_tx);
+                self.deposit_abort_tx = Some((step, abort_tx));
             }
             Err(error) => {
                 error!(trade_id = self.trade_id, %error, "Could not build the deposit abort transaction.");
@@ -1793,11 +2066,15 @@ impl TradeModel {
     /// The deposit abort transaction pays the coins of the trader's half of the deposit to his
     /// payout address. No other transaction of the trade can pay to this address when the
     /// deposit is aborted, so the address is used once.
-    fn sign_deposit_abort_tx(&self, wallet: &mut dyn ProtocolWalletApi) -> Result<Transaction> {
+    fn sign_deposit_abort_tx(
+        &self,
+        wallet: &mut dyn ProtocolWalletApi,
+        fee_rate: FeeRate,
+    ) -> Result<Transaction> {
         let mut psbt = build_deposit_abort_psbt(
             self.my_half_deposit_psbt()?,
             self.my_txs().payout_address()?,
-            engine_fee_rate(),
+            fee_rate,
             self.deposit_fee()?,
         )?;
         wallet.sign_selected_inputs(&mut psbt, &|_| true)?;
@@ -2029,11 +2306,7 @@ impl TradeModel {
     }
 
     /// Releases the coins that are reserved for the deposit, when the deposit can never confirm.
-    ///
-    /// The wallet of the trader who published the deposit transaction has recorded it as the
-    /// spend of his coins. The transaction that made the deposit impossible can spend a coin of
-    /// the peer, which the wallet does not see, so the engine tells the wallet to forget the
-    /// deposit transaction.
+    /// The wallet forgets the deposit transaction in [`Self::forget_dead_transactions`].
     fn release_reserved_coins(
         &mut self,
         wallet: &mut dyn ProtocolWalletApi,
@@ -2045,18 +2318,6 @@ impl TradeModel {
                     "the reserved coin {outpoint} could not be released: {error}"
                 )));
             }
-        }
-        let forgotten = self
-            .deposit_tx
-            .builder
-            .txid()
-            .map_err(ProtocolErrorKind::from)
-            .and_then(|txid| Ok(wallet.forget_transaction(*txid)?));
-        if let Err(error) = forgotten {
-            events.push(TradeEvent::Unexpected(format!(
-                "the wallet could not forget the deposit transaction, which can never confirm: \
-                 {error}"
-            )));
         }
     }
 
