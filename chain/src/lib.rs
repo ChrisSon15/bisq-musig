@@ -1,28 +1,15 @@
+//! Access to the chain over the Bitcoin peer-to-peer network, with compact block filters.
+//!
+//! [`client::ChainClient`] is the only implementation: one long-running client that the wallet
+//! sync and the trade engine share.
+
 pub mod client;
 
-use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
 
-use bdk_kyoto::bip157::{Builder, Network};
-use bdk_kyoto::{
-    BuilderExt as _, Info, Receiver, ScanType, TrustedPeer, UnboundedReceiver, Update, Warning,
-};
-use bdk_wallet::Wallet;
+use bdk_kyoto::TrustedPeer;
 use bdk_wallet::bitcoin::{Transaction, Txid};
-use bdk_wallet::chain::DescriptorId;
 use thiserror::Error;
-use tokio::select;
-
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum SyncError {
-    #[error("failed to build compact-filter client: {0}")]
-    Build(#[from] bdk_kyoto::builder::BuilderError),
-    #[error("compact-filter client stopped before producing updates: {0}")]
-    Updates(#[from] bdk_kyoto::UpdateError),
-    #[error("failed to shut down compact-filter client: {0}")]
-    Shutdown(#[from] bdk_kyoto::ClientError),
-}
 
 #[derive(Debug, Error)]
 #[error(transparent)]
@@ -89,85 +76,6 @@ pub trait ChainApi: Send + Sync {
     fn transaction_broadcast(&self, tx: &Transaction) -> Result<Txid, ChainApiError>;
 }
 
-pub struct CBFScanner {
-    pub peers: Vec<TrustedPeer>,
-}
-
-impl CBFScanner {
-    #[expect(
-        clippy::missing_const_for_fn,
-        reason = "a const CBFScanner isn't useful, as a \
-        non-empty peer list can't be built at compile time; keeps the body free to grow"
-    )]
-    pub fn new(peers: Vec<TrustedPeer>) -> Self {
-        Self { peers }
-    }
-
-    /// Builds a scanner from plain `host:port` peer addresses, so callers don't need to depend
-    /// on `bdk_kyoto` just to name a peer.
-    pub fn from_hostnames(hostnames: &[String]) -> Result<Self, PeerAddressError> {
-        Ok(Self::new(parse_peers(hostnames)?))
-    }
-
-    async fn traces(
-        mut info_subscriber: Receiver<Info>,
-        mut warning_subscriber: UnboundedReceiver<Warning>,
-    ) {
-        loop {
-            select! {
-                info = info_subscriber.recv() => {
-                    if let Some(info) = info {
-                        match info {
-                            Info::Progress(p) => {
-                                tracing::info!("chain height: {}, filter download progress: {}%", p.chain_height(), p.percentage_complete());
-                            },
-                            Info::BlockReceived(b) => {
-                                tracing::info!("downloaded block: {b}");
-                            },
-                            _ => (),
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                warn = warning_subscriber.recv() => {
-                    if let Some(warn) = warn {
-                        tracing::warn!("{warn}");
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    pub async fn sync_cbf(
-        &self,
-        network: Network,
-        wallets: Vec<(&Wallet, ScanType)>,
-    ) -> Result<BTreeMap<DescriptorId, Update>, SyncError> {
-        let client = Builder::new(network)
-            .add_peers(self.peers.iter().cloned())
-            .build_with_wallets(wallets)?;
-
-        let (client, logging, mut update_subscriber) = client.subscribe();
-
-        tokio::task::spawn(async move {
-            Self::traces(logging.info_subscriber, logging.warning_subscriber).await;
-        });
-        let client = client.start();
-        let requester = client.requester();
-        // Updates are grouped with the `DescriptorId` of the public, external descriptor.
-        let updates = update_subscriber
-            .updates()
-            .await?
-            .collect::<BTreeMap<_, _>>();
-
-        requester.shutdown()?;
-        Ok(updates)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +109,6 @@ mod tests {
             parse_peers(&peers).expect_err("one invalid peer").peer,
             "nonsense"
         );
-        assert!(CBFScanner::from_hostnames(&peers[..1]).is_ok());
+        assert_eq!(parse_peers(&peers[..1]).map(|peers| peers.len()), Ok(1));
     }
 }

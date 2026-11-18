@@ -5,13 +5,12 @@ use std::time::Duration;
 
 use bdk_wallet::bitcoin::Network;
 use bmp_tracing::tracing::{info, warn};
-use chain::CBFScanner;
-use chain::client::{ChainClient, HashCheckpoint};
+use chain::client::ChainClient;
 use clap::Parser;
 use protocol::params::{EngineConfig, EngineConfigError};
 use protocol::trade_model::{MemoryTradeStore, TradeModelStore};
 use rpc::bmp_wallet_service::{
-    BMPWalletServiceImpl, BmpWalletImpl, BmpWalletServer, BmpWalletService as _,
+    BMPWalletServiceImpl, BmpWalletImpl, BmpWalletServer,
 };
 use rpc::server::{MusigImpl, MusigServer, NoTradeWallet, TradeWalletProvider};
 use tonic::transport::Server;
@@ -113,7 +112,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // serve.
     let trades: Arc<dyn TradeModelStore> = Arc::new(MemoryTradeStore::default());
     // All access to the chain goes through peers of the Bitcoin network (D2). One long-running
-    // client serves the trade service and the broadcasts of the wallet.
+    // client serves the sync of the wallet, the trade service and all broadcasts. The first sync
+    // of the wallet starts it, near the chain tip of the wallet: no trade exists before the
+    // wallet is open, so earlier blocks are of no interest.
     let peers = chain::parse_peers(&cli.wallet_peers)?;
     let chain_client = (!peers.is_empty() && cli.wallet_dir.is_some())
         .then(|| ChainClient::new(cli.wallet_network, peers));
@@ -123,7 +124,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let bmp_wallet = if let Some(dir) = &cli.wallet_dir {
         // The wallet service knows the trades, so that it does not release a coin that a trade
         // has reserved.
-        let mut service = BMPWalletServiceImpl::new(dir.clone(), cli.wallet_network)
+        let mut service = BMPWalletServiceImpl::<ChainClient>::new(dir.clone(), cli.wallet_network)
             .with_trade_store(Arc::clone(&trades));
         if let Some(secs) = cli.wallet_poll_secs {
             service = service.with_poll_period(Duration::from_secs(secs));
@@ -134,7 +135,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 "Syncing the BMP wallet over compact block filters once it has been opened."
             );
             service = service
-                .with_chain_data_source(CBFScanner::from_hostnames(&cli.wallet_peers)?)
+                .with_chain_data_source(chain_client.clone())
                 .with_broadcaster(Arc::new(chain_client.clone()));
         } else {
             warn!("No --wallet-peer given: the BMP wallet will not sync with the chain.");
@@ -146,20 +147,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
-
-    // The chain client starts when the wallet has synced: near the chain tip of the wallet,
-    // because no trade exists before the wallet is open, so earlier blocks are of no interest.
-    if let (Some(chain_client), Some(service)) = (&chain_client, &bmp_wallet) {
-        let (chain_client, service) = (chain_client.clone(), Arc::clone(service));
-        tokio::spawn(async move {
-            while !service.is_ready() {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            let start = service.chain_start_point().await;
-            info!(?start, "Starting the chain client of the trade service.");
-            chain_client.start(start.map(|(height, hash)| HashCheckpoint::new(height, hash)));
-        });
-    }
 
     // The trade service uses the wallet of the wallet service. Without a wallet it refuses every
     // request that needs one.

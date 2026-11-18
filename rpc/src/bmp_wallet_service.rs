@@ -28,7 +28,7 @@ use ::wallet::wallet_info::{PubAddressInfo, TxInfo, TxOutputInfo, UtxoInfo};
 use bdk_wallet::Balance;
 use bdk_wallet::bitcoin::address::{NetworkUnchecked, ParseError};
 use bdk_wallet::bitcoin::{
-    Address, Amount, BlockHash, FeeRate, Network, OutPoint, Transaction, Txid,
+    Address, Amount, FeeRate, Network, OutPoint, Transaction, Txid,
 };
 use chain::ChainApi;
 use futures_util::never::Never;
@@ -40,7 +40,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::{self, JoinHandle};
 use tokio::time::{self, Duration, MissedTickBehavior};
 use tonic::{Request, Response, Result, Status};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{error, info, instrument, warn};
 use zeroize::Zeroizing;
 
 use crate::observable::ObservableHashMap;
@@ -71,9 +71,6 @@ const DEFAULT_FEE_RATE: FeeRate = FeeRate::from_sat_per_kwu(500);
 const FIRST_SYNC_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// The longest pause between two attempts of a wallet sync.
 const MAX_SYNC_RETRY_DELAY: Duration = Duration::from_secs(60);
-
-/// The number of known blocks below the chain tip of the wallet at which a chain client starts.
-const CHAIN_START_DEPTH: usize = 10;
 
 /// A wallet operation was attempted before `OpenOrCreateWallet` opened the wallet. Reported to
 /// gRPC clients as `FAILED_PRECONDITION`.
@@ -281,22 +278,6 @@ impl<S> BMPWalletServiceImpl<S> {
             trade_store: Some(trade_store),
             ..self
         }
-    }
-
-    /// The block at which a chain client that starts now should begin: the block that lies
-    /// [`CHAIN_START_DEPTH`] known blocks below the chain tip of the wallet. `None` if no wallet
-    /// is open, or if the wallet knows only the first block of the chain.
-    ///
-    /// The distance to the tip keeps the client correct if the last blocks of the wallet are
-    /// replaced by a reorganisation.
-    pub async fn chain_start_point(&self) -> Option<(u32, BlockHash)> {
-        let guard = self.wallet.lock().await;
-        let start = guard
-            .as_ref()?
-            .checkpoints()
-            .take(CHAIN_START_DEPTH + 1)
-            .last()?;
-        (start.height() > 0).then(|| (start.height(), start.hash()))
     }
 
     #[must_use]
@@ -1049,6 +1030,7 @@ mod tests {
     use bdk_wallet::bitcoin::Network;
     use bdk_wallet::rusqlite::Connection;
     use chain::ChainApiError;
+    use chain::client::{ClientError, PeerProblem};
     use protocol::trade_model::{ProtocolErrorKind, TradeModel};
     use tempfile::tempdir;
 
@@ -1093,7 +1075,8 @@ mod tests {
                 })
                 .is_ok();
             if failed {
-                return Err(ChainDataSourceError::MissingWallet { index: 0 });
+                // The error of a sync while no peer is reachable.
+                return Err(ClientError::Peers(PeerProblem::NoPeerReachable).into());
             }
             Ok(())
         }

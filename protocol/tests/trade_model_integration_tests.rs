@@ -9,14 +9,14 @@
 //! refer to section 9.4 of `concept/CompletionPlan.md`.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use bdk_bitcoind_rpc::bitcoincore_rpc::RpcApi as _;
 use bdk_wallet::bitcoin::address::NetworkUnchecked;
 use bdk_wallet::bitcoin::{
     Amount, BlockHash, FeeRate, Network, OutPoint, Transaction, Txid, XOnlyPublicKey,
 };
-use chain::CBFScanner;
-use chain::client::TrustedPeer;
+use chain::client::{ChainClient, TrustedPeer};
 use musig2::secp::Scalar;
 use protocol::params::{EngineConfig, TradeParams};
 use protocol::receiver::Receiver;
@@ -63,18 +63,42 @@ fn test_password() -> Password {
         .expect("the test password follows the password rules")
 }
 
-/// The wallet sync over compact block filters, with the node of the test as the only peer. This
-/// is the chain access of the wallet in operation (D2).
-fn scanner(env: &TestEnv) -> CBFScanner {
-    let peer = env.p2p_socket_addr().expect("peer address of the node");
-    CBFScanner::new(vec![TrustedPeer::from_socket_addr(peer)])
+/// The chain access of the wallets of a test: the long-running compact block filter client, with
+/// the node of the test as its only peer, and the runtime that it runs on. This is the chain
+/// access of the wallet in operation (D2). The first sync starts the client.
+struct Chain {
+    runtime: Runtime,
+    client: ChainClient,
 }
 
-/// Runs the chain sync of a wallet.
-fn sync(wallet: &mut BMPWallet, scanner: &CBFScanner) {
-    let rt = Runtime::new().expect("create runtime");
-    rt.block_on(async { wallet.sync_all(scanner).await })
-        .expect("the wallet syncs");
+impl Chain {
+    fn new(env: &TestEnv) -> Self {
+        let peer = env.p2p_socket_addr().expect("peer address of the node");
+        Self {
+            runtime: Runtime::new().expect("create runtime"),
+            client: ChainClient::new(Network::Regtest, vec![TrustedPeer::from_socket_addr(peer)]),
+        }
+    }
+
+    /// Runs the chain sync of a wallet, when the client has evaluated all blocks of the node. A
+    /// client that runs learns of a new block a moment after the node has mined it.
+    fn sync(&self, env: &TestEnv, wallet: &mut BMPWallet) {
+        let height = u32::try_from(env.block_count().expect("block count")).expect("small height");
+        self.runtime
+            .block_on(async {
+                if self.client.is_started() {
+                    tokio::time::timeout(
+                        Duration::from_secs(60),
+                        self.client.wait_until_synced_to(height),
+                    )
+                    .await
+                    .expect("the client reaches the chain tip in time")
+                    .expect("the client runs");
+                }
+                wallet.sync_all(&self.client).await
+            })
+            .expect("the wallet syncs");
+    }
 }
 
 /// Sends a transaction to the node through its RPC interface, which only the test code uses.
@@ -101,7 +125,7 @@ fn fund(env: &mut TestEnv, wallet: &mut BMPWallet, funding: Amount) {
     let address = wallet.get_new_address().unwrap();
     let txid = env.fund_address(&address.address, funding).unwrap();
     env.mine_block().unwrap();
-    sync(wallet, &scanner(env));
+    Chain::new(env).sync(env, wallet);
     assert!(
         wallet.list_transactions().iter().any(|tx| tx.tx_id == txid),
         "the wallet found the funding transaction"
@@ -243,7 +267,7 @@ impl Trader {
 /// A trade of two traders with a confirmed deposit transaction.
 struct Trade {
     env: TestEnv,
-    scanner: CBFScanner,
+    chain: Chain,
     buyer: Trader,
     seller: Trader,
     buyer_payout: OutPoint,
@@ -259,7 +283,7 @@ impl Trade {
         let mut env = TestEnv::new()?;
         let mut buyer = Trader::new(&mut env, Role::BuyerAsTaker);
         let mut seller = Trader::new(&mut env, Role::SellerAsMaker);
-        let scanner = scanner(&env);
+        let chain = Chain::new(&env);
 
         seller.receive_key_shares(&buyer);
         buyer.receive_key_shares(&seller);
@@ -310,7 +334,7 @@ impl Trade {
             buyer_payout: payout(TRADE_AMOUNT + BUYERS_SECURITY_DEPOSIT),
             seller_payout: payout(SELLERS_SECURITY_DEPOSIT),
             env,
-            scanner,
+            chain,
             buyer,
             seller,
             redirection_receiver,
@@ -322,8 +346,8 @@ impl Trade {
 
     /// Runs the chain sync of both wallets.
     fn sync_wallets(&mut self) {
-        sync(&mut self.buyer.wallet, &self.scanner);
-        sync(&mut self.seller.wallet, &self.scanner);
+        self.chain.sync(&self.env, &mut self.buyer.wallet);
+        self.chain.sync(&self.env, &mut self.seller.wallet);
     }
 
     /// The number of confirmations of an unspent output, or `None` if the output does not exist
@@ -643,7 +667,7 @@ fn assert_payout_is_kept_and_spent_first(
     payout: OutPoint,
     amount: Amount,
     env: &mut TestEnv,
-    scanner: &CBFScanner,
+    chain: &Chain,
 ) -> anyhow::Result<()> {
     let Trader {
         wallet,
@@ -671,7 +695,7 @@ fn assert_payout_is_kept_and_spent_first(
     );
     send_to_node(env, &payment).map_err(anyhow::Error::msg)?;
     env.mine_block()?;
-    sync(&mut wallet, scanner);
+    chain.sync(env, &mut wallet);
     assert_eq!(wallet.imported_balance().total(), Amount::ZERO);
     let fee = Amount::from_sat(5_000);
     assert!(wallet.balance() > balance - Amount::from_sat(100_000) - fee);
@@ -718,19 +742,19 @@ fn b1_b2_cooperative_close_and_payout_in_the_wallet() -> anyhow::Result<()> {
     let Trade {
         buyer,
         seller,
-        scanner,
+        chain,
         mut env,
         buyer_payout,
         seller_payout,
         ..
     } = trade;
-    assert_payout_is_kept_and_spent_first(buyer, buyer_payout, buyers_payout, &mut env, &scanner)?;
+    assert_payout_is_kept_and_spent_first(buyer, buyer_payout, buyers_payout, &mut env, &chain)?;
     assert_payout_is_kept_and_spent_first(
         seller,
         seller_payout,
         SELLERS_SECURITY_DEPOSIT,
         &mut env,
-        &scanner,
+        &chain,
     )?;
     Ok(())
 }

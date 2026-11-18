@@ -16,7 +16,11 @@ It currently provides the following features:
   - the wallet password can be checked and changed, but not removed
   - importing of external private keys (e.g. for the swap tx), which are signed with alongside the HD keys
   - sending to an address, listing addresses, UTXOs and transactions
-- Syncing using Compact Block Filters (CBF) through `bdk_kyoto`, behind the `ChainDataSource` trait
+- Syncing using Compact Block Filters (CBF), behind the `ChainDataSource` trait. The implementation is the
+  long-running client `chain::client::ChainClient`, which the trade engine uses as well: a sync registers the scripts
+  and the outputs of the wallets with the client, waits until the client has evaluated all blocks up to the chain tip
+  for them, and applies what the client found. The first sync starts the client. A sync fails with an error while no
+  peer is reachable, or while the peer serves no compact block filters.
 
 ## Imported-key identity
 

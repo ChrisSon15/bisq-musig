@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use bdk_wallet::PersistedWallet;
 use bdk_wallet::bitcoin::Network;
-use chain::CBFScanner;
+use chain::client::ChainClient;
 use rpc::bmp_wallet_service::{
     BMPWalletServiceImpl, BmpWalletImpl, BmpWalletServer, BmpWalletService as _,
 };
@@ -48,8 +48,8 @@ struct WalletServiceFixture {
 
 impl WalletServiceFixture {
     async fn start(wallet_dir: &Path) -> anyhow::Result<Self> {
-        // `CBFScanner` only pins the (unused) chain-source type parameter; none is configured.
-        let service = Arc::new(BMPWalletServiceImpl::<CBFScanner>::new(
+        // `ChainClient` only pins the (unused) chain-source type parameter; none is configured.
+        let service = Arc::new(BMPWalletServiceImpl::<ChainClient>::new(
             wallet_dir,
             Network::Regtest,
         ));

@@ -8,14 +8,14 @@ use bdk_wallet::bitcoin::{Address, Amount, Network};
 use bdk_wallet::error::CreateTxError::OutputBelowDustLimit;
 use bdk_wallet::psbt::PsbtUtils as _;
 use bdk_wallet::{KeychainKind, SignOptions};
-use chain::CBFScanner;
+use chain::client::{ChainClient, ClientError, PeerProblem};
 use rand::RngCore as _;
 use rusqlite::Connection;
 use secp::Scalar;
 use tempfile::{TempDir, tempdir};
 use testenv::TestEnv;
 use wallet::bmp_wallet::*;
-use wallet::error::WalletErrorKind;
+use wallet::error::{ChainDataSourceError, WalletErrorKind};
 use wallet::password::Password;
 use wallet::persisted::DBStorage;
 use wallet::protocol_wallet_api::ProtocolWalletApi as _;
@@ -31,11 +31,36 @@ fn test_password() -> Password {
         .expect("TEST_PASSWORD follows the password rules")
 }
 
-/// The wallet sync over compact block filters, with the node of the test as the only peer.
-fn scanner(env: &TestEnv) -> CBFScanner {
-    CBFScanner::new(vec![TrustedPeer::from_socket_addr(
-        env.p2p_socket_addr().expect("peer address of the node"),
-    )])
+/// The wallet sync over compact block filters, with the node of the test as the only peer. This
+/// is the long-running client that the wallet uses in operation. The first sync starts it.
+fn scanner(env: &TestEnv) -> ChainClient {
+    ChainClient::new(
+        Network::Regtest,
+        vec![TrustedPeer::from_socket_addr(
+            env.p2p_socket_addr().expect("peer address of the node"),
+        )],
+    )
+}
+
+/// Syncs the wallet when the client has evaluated all blocks of the node.
+///
+/// A client that runs learns of a new block a moment after the node has mined it. A sync at once
+/// after the mining could end before that.
+async fn sync_to_tip(
+    wallet: &mut BMPWallet,
+    client: &ChainClient,
+    env: &TestEnv,
+) -> anyhow::Result<()> {
+    if client.is_started() {
+        let height = u32::try_from(env.block_count()?)?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            client.wait_until_synced_to(height),
+        )
+        .await??;
+    }
+    wallet.sync_all(client).await?;
+    Ok(())
 }
 
 fn new_private_key() -> Scalar {
@@ -61,7 +86,7 @@ async fn init_test() -> anyhow::Result<()> {
     env.fund_address(&receiving_addr, receive_amount)?;
     env.mine_block()?;
 
-    wallet.sync_all(&chain).await?;
+    sync_to_tip(&mut wallet, &chain, &env).await?;
 
     assert_eq!(wallet.balance(), receive_amount);
     Ok(())
@@ -89,7 +114,7 @@ async fn test_sync_with_imported_keys() -> anyhow::Result<()> {
     env.fund_from_prv_key(&prv_key, receive_amount)?;
     env.mine_block()?;
 
-    wallet.sync_all(&chain).await?;
+    sync_to_tip(&mut wallet, &chain, &env).await?;
     assert_eq!(wallet.balance(), receive_amount + receive_amount);
 
     Ok(())
@@ -121,7 +146,7 @@ async fn test_broadcast_transaction() -> anyhow::Result<()> {
     env.fund_address(&receiving_addr, receive_amount)?;
     env.mine_block()?;
 
-    wallet.sync_all(&chain).await?;
+    sync_to_tip(&mut wallet, &chain, &env).await?;
 
     let mut tx_builder = wallet.build_tx();
     let send_amount = Amount::from_sat(1_000);
@@ -137,7 +162,7 @@ async fn test_broadcast_transaction() -> anyhow::Result<()> {
     env.mine_block()?;
 
     // Rescan the wallet to apply balance changes
-    wallet.sync_all(&chain).await?;
+    sync_to_tip(&mut wallet, &chain, &env).await?;
 
     let new_balance = receive_amount - send_amount - fee;
     assert_eq!(wallet.balance(), new_balance);
@@ -170,7 +195,7 @@ async fn test_broadcast_transaction_two() -> anyhow::Result<()> {
     env.fund_from_prv_key(&prv_key, receive_amount)?;
     env.mine_block()?;
 
-    wallet.sync_all(&chain).await?;
+    sync_to_tip(&mut wallet, &chain, &env).await?;
 
     let mut tx_builder = wallet.build_tx();
     let send_amount = Amount::from_sat(1_000);
@@ -186,7 +211,7 @@ async fn test_broadcast_transaction_two() -> anyhow::Result<()> {
     env.mine_block()?;
 
     // Rescan the wallet to apply balance changes
-    wallet.sync_all(&chain).await?;
+    sync_to_tip(&mut wallet, &chain, &env).await?;
 
     let new_balance = receive_amount - send_amount - fee;
     assert_eq!(wallet.balance(), new_balance);
@@ -224,7 +249,7 @@ async fn test_broadcast_transaction_three() -> anyhow::Result<()> {
 
     env.mine_block()?;
 
-    wallet.sync_all(&chain).await?;
+    sync_to_tip(&mut wallet, &chain, &env).await?;
 
     let mut tx_builder = wallet.build_tx();
     let send_amount = Amount::from_sat(100_000);
@@ -241,7 +266,7 @@ async fn test_broadcast_transaction_three() -> anyhow::Result<()> {
     env.mine_block()?;
 
     // Rescan the wallet to apply balance changes
-    wallet.sync_all(&chain).await?;
+    sync_to_tip(&mut wallet, &chain, &env).await?;
 
     let new_balance = (receive_amount + receive_amount) - send_amount - fee;
     assert_eq!(wallet.balance(), new_balance);
@@ -251,7 +276,7 @@ async fn test_broadcast_transaction_three() -> anyhow::Result<()> {
 
     env.fund_address(&main_wallet_addr, Amount::from_sat(10_000))?;
     env.mine_block()?;
-    enc_wallet.sync_all(&chain).await?;
+    sync_to_tip(&mut enc_wallet, &chain, &env).await?;
     assert_eq!(enc_wallet.balance(), new_balance + Amount::from_sat(10_000));
 
     Ok(())
@@ -276,7 +301,9 @@ async fn test_cbf_main_wallet() -> anyhow::Result<()> {
     let peers = [TrustedPeer::from_socket_addr(
         env.p2p_socket_addr().unwrap(),
     )];
-    wallet.sync_all(&CBFScanner::new(peers.to_vec())).await?;
+    wallet
+        .sync_all(&ChainClient::new(Network::Regtest, peers.to_vec()))
+        .await?;
     assert_eq!(wallet.balance(), Amount::from_sat(100_000));
     Ok(())
 }
@@ -307,7 +334,9 @@ async fn test_cbf_imported() -> anyhow::Result<()> {
         env.p2p_socket_addr().unwrap(),
     )];
 
-    wallet.sync_all(&CBFScanner::new(peers)).await?;
+    wallet
+        .sync_all(&ChainClient::new(Network::Regtest, peers))
+        .await?;
     assert_eq!(wallet.balance(), Amount::from_sat(30_000));
     Ok(())
 }
@@ -322,14 +351,14 @@ async fn i7_cbf_sync_of_a_key_imported_with_start_height() -> anyhow::Result<()>
     let peers = vec![TrustedPeer::from_socket_addr(
         env.p2p_socket_addr().unwrap(),
     )];
-    let cbf = CBFScanner::new(peers);
+    let cbf = ChainClient::new(Network::Regtest, peers);
 
     let mut wallet = BMPWallet::new(
         env.new_temp_path().into(),
         &test_password(),
         Network::Regtest,
     )?;
-    wallet.sync_all(&cbf).await?;
+    sync_to_tip(&mut wallet, &cbf, &env).await?;
     let tip = wallet.latest_checkpoint().height();
     assert!(tip >= 30, "the main wallet knows the chain up to {tip}");
 
@@ -339,7 +368,7 @@ async fn i7_cbf_sync_of_a_key_imported_with_start_height() -> anyhow::Result<()>
 
     env.fund_from_prv_key(&prv_key, Amount::from_sat(10_000))?;
     env.mine_blocks(3)?;
-    wallet.sync_all(&cbf).await?;
+    sync_to_tip(&mut wallet, &cbf, &env).await?;
     assert_eq!(
         wallet.imported_balance().confirmed,
         Amount::from_sat(10_000)
@@ -380,7 +409,9 @@ async fn test_cbf_imported_and_main() -> anyhow::Result<()> {
         env.p2p_socket_addr().unwrap(),
     )];
 
-    wallet.sync_all(&CBFScanner::new(peers)).await?;
+    wallet
+        .sync_all(&ChainClient::new(Network::Regtest, peers))
+        .await?;
 
     assert_eq!(wallet.balance(), Amount::from_sat(130_000));
 
@@ -405,8 +436,8 @@ async fn test_cbf_persistence() -> anyhow::Result<()> {
     )];
     env.mine_block()?;
 
-    let cbf = CBFScanner::new(peers.to_vec());
-    wallet.sync_all(&cbf).await?;
+    let cbf = ChainClient::new(Network::Regtest, peers.to_vec());
+    sync_to_tip(&mut wallet, &cbf, &env).await?;
     assert_eq!(wallet.balance(), Amount::from_sat(230_000));
 
     // Reload the wallet from persisted state
@@ -415,7 +446,7 @@ async fn test_cbf_persistence() -> anyhow::Result<()> {
 
     env.fund_address(&addr, Amount::from_sat(70_000))?;
     env.mine_block()?;
-    loaded_wallet.sync_all(&cbf).await?;
+    sync_to_tip(&mut loaded_wallet, &cbf, &env).await?;
     assert_eq!(loaded_wallet.balance(), Amount::from_sat(300_000));
 
     // Create a transaction and broadcast it to the connected peer
@@ -433,7 +464,7 @@ async fn test_cbf_persistence() -> anyhow::Result<()> {
     env.broadcast(&psbt.extract_tx()?)?;
     env.mine_block()?;
 
-    loaded_wallet.sync_all(&cbf).await?;
+    sync_to_tip(&mut loaded_wallet, &cbf, &env).await?;
     assert_eq!(loaded_wallet.balance(), Amount::from_sat(230_000) - fee);
 
     Ok(())
@@ -468,7 +499,7 @@ async fn test_drain_wallet_with_main_balance() -> anyhow::Result<()> {
     }
 
     env.mine_block()?;
-    wallet.sync_all(&chain).await?;
+    sync_to_tip(&mut wallet, &chain, &env).await?;
 
     // Doing *2 because we have two imported keys with the same amount received 10_000
     let current_balance = amount_to_send_main_wallet + amount_to_send_imported * 2;
@@ -485,7 +516,7 @@ async fn test_drain_wallet_with_main_balance() -> anyhow::Result<()> {
     env.broadcast(&tx)?;
     env.mine_block()?;
 
-    wallet.sync_all(&chain).await?;
+    sync_to_tip(&mut wallet, &chain, &env).await?;
 
     let main_wallet_balance = drained_amount + amount_to_send_main_wallet;
 
@@ -517,7 +548,7 @@ async fn m1_drain_imported_coins() -> anyhow::Result<()> {
         env.fund_from_prv_key(key, amount)?;
     }
     env.mine_block()?;
-    wallet.sync_all(&chain).await?;
+    sync_to_tip(&mut wallet, &chain, &env).await?;
     assert_eq!(wallet.imported_balance().confirmed, amount * 3);
 
     // M3: a coin that is locked for an open trade is not moved.
@@ -562,7 +593,7 @@ async fn m1_drain_imported_coins() -> anyhow::Result<()> {
 
     env.broadcast(&drain_tx)?;
     env.mine_block()?;
-    wallet.sync_all(&chain).await?;
+    sync_to_tip(&mut wallet, &chain, &env).await?;
     // Only the locked coin is left with the imported keys.
     assert_eq!(wallet.imported_balance().total(), amount);
     assert_eq!(wallet.balance(), amount * 2 - fee);
@@ -798,4 +829,204 @@ fn load_wallet_rejects_a_wrong_password() {
         matches!(err, WalletErrorKind::InvalidPassword),
         "unexpected error: {err:?}"
     );
+}
+
+/// The wallet of one network is not synced through peers of another network.
+#[tokio::test]
+async fn sync_refuses_peers_of_another_network() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let mut wallet = BMPWallet::new(dir.path().into(), &test_password(), Network::Regtest)?;
+    let client = ChainClient::new(Network::Signet, Vec::new());
+    let error = wallet.sync_all(&client).await.expect_err("networks differ");
+    assert!(
+        matches!(
+            error,
+            WalletErrorKind::ChainDataSource(ChainDataSourceError::NetworkMismatch {
+                wallet: Network::Regtest,
+                peers: Network::Signet,
+            })
+        ),
+        "{error}"
+    );
+    assert!(!client.is_started(), "the client was not started for that");
+    Ok(())
+}
+
+/// F28: two wallets sync through one client, and a wallet that is loaded again continues with
+/// the same client. A reorganisation reaches the wallets: they follow the new blocks, and a
+/// payment that is confirmed in another block keeps its amount.
+#[tokio::test]
+async fn f28_wallets_share_one_client_and_follow_a_reorganisation() -> anyhow::Result<()> {
+    let mut env = TestEnv::new()?;
+    env.mine_blocks(101)?;
+    let client = scanner(&env);
+    let dir = env.new_temp_path().to_path_buf();
+    let mut first = BMPWallet::new(dir.as_path().into(), &test_password(), Network::Regtest)?;
+    let mut second = BMPWallet::new(
+        env.new_temp_path().into(),
+        &test_password(),
+        Network::Regtest,
+    )?;
+    let first_address = first.next_unused_address(KeychainKind::External);
+    let second_address = second.next_unused_address(KeychainKind::External);
+    env.fund_address(&first_address, Amount::from_sat(100_000))?;
+    env.mine_block()?;
+    sync_to_tip(&mut first, &client, &env).await?;
+    sync_to_tip(&mut second, &client, &env).await?;
+    assert_eq!(first.balance(), Amount::from_sat(100_000));
+    assert_eq!(second.balance(), Amount::ZERO);
+
+    env.fund_address(&second_address, Amount::from_sat(200_000))?;
+    env.mine_block()?;
+    let height = u32::try_from(env.block_count()?)?;
+    sync_to_tip(&mut first, &client, &env).await?;
+    sync_to_tip(&mut second, &client, &env).await?;
+    assert_eq!(second.balance(), Amount::from_sat(200_000));
+    let replaced_block = env.block_hash(u64::from(height))?;
+    assert_eq!(second.latest_checkpoint().hash(), replaced_block);
+
+    // The block with the payment to the second wallet is replaced. The payment is confirmed in
+    // a new block.
+    env.reorganize(1, 2)?;
+    drop(first);
+    let mut first =
+        BMPWallet::load_wallet(dir.as_path().into(), Network::Regtest, &test_password())?;
+    sync_to_tip(&mut first, &client, &env).await?;
+    sync_to_tip(&mut second, &client, &env).await?;
+    for wallet in [&first, &second] {
+        assert_eq!(wallet.latest_checkpoint().height(), height + 1);
+        assert_eq!(
+            wallet.latest_checkpoint().hash(),
+            env.block_hash(u64::from(height) + 1)?
+        );
+        let block_at_height = wallet
+            .checkpoints()
+            .find(|checkpoint| checkpoint.height() == height)
+            .expect("the wallet knows the block");
+        assert_eq!(block_at_height.hash(), env.block_hash(u64::from(height))?);
+        assert_ne!(block_at_height.hash(), replaced_block);
+    }
+    assert_eq!(first.balance(), Amount::from_sat(100_000));
+    assert_eq!(second.balance(), Amount::from_sat(200_000));
+    client.shutdown()?;
+    Ok(())
+}
+
+/// A payment to a script far behind the last used one is found in the same sync as the payment
+/// that brings this script into the range that the wallet derives.
+#[tokio::test]
+async fn sync_finds_payments_to_scripts_that_an_earlier_payment_reveals() -> anyhow::Result<()> {
+    let mut env = TestEnv::new()?;
+    env.mine_blocks(101)?;
+    let client = scanner(&env);
+    let mut wallet = BMPWallet::new(
+        env.new_temp_path().into(),
+        &test_password(),
+        Network::Regtest,
+    )?;
+    sync_to_tip(&mut wallet, &client, &env).await?;
+
+    // A new wallet derives the scripts 0 to 24. Script 20 is among them, script 40 is not.
+    let near = wallet.peek_address(KeychainKind::External, 20);
+    let far = wallet.peek_address(KeychainKind::External, 40);
+    env.fund_address(&near.address, Amount::from_sat(30_000))?;
+    env.mine_block()?;
+    env.fund_address(&far.address, Amount::from_sat(50_000))?;
+    env.mine_block()?;
+    sync_to_tip(&mut wallet, &client, &env).await?;
+    assert_eq!(wallet.balance(), Amount::from_sat(80_000));
+    client.shutdown()?;
+    Ok(())
+}
+
+/// A key whose coin was confirmed before the block at which the client started (for example the
+/// payout of a trade that began in an earlier run of the program) is found: the client follows
+/// the chain from the earlier block for it.
+#[tokio::test]
+async fn sync_of_a_key_imported_with_a_start_below_the_start_of_the_client() -> anyhow::Result<()> {
+    let mut env = TestEnv::new()?;
+    env.mine_blocks(120)?;
+    let prv_key = new_private_key();
+    env.fund_from_prv_key(&prv_key, Amount::from_sat(10_000))?;
+    env.mine_block()?;
+    let coin_height = u32::try_from(env.block_count()?)?;
+    env.mine_blocks(30)?;
+
+    let mut wallet = BMPWallet::new(
+        env.new_temp_path().into(),
+        &test_password(),
+        Network::Regtest,
+    )?;
+    // The first client gives the wallet the blocks of the chain. The second client is the client
+    // of a later run: it starts a few blocks below the tip of the wallet.
+    let first_run = scanner(&env);
+    sync_to_tip(&mut wallet, &first_run, &env).await?;
+    first_run.shutdown()?;
+    let client = scanner(&env);
+    sync_to_tip(&mut wallet, &client, &env).await?;
+    let base_height = client.base().expect("started below the tip").height;
+    assert!(base_height > coin_height, "{base_height} > {coin_height}");
+
+    wallet.import_private_key_since(prv_key, None, coin_height - 1)?;
+    assert_eq!(wallet.imported_wallet_tip_heights(), vec![coin_height - 1]);
+    sync_to_tip(&mut wallet, &client, &env).await?;
+    assert_eq!(
+        wallet.imported_balance().confirmed,
+        Amount::from_sat(10_000)
+    );
+    assert!(client.base().expect("a base").height < coin_height);
+    let tip = wallet.latest_checkpoint().height();
+    assert_eq!(wallet.imported_wallet_tip_heights(), vec![tip]);
+    client.shutdown()?;
+    Ok(())
+}
+
+/// J5 and issue #188 for the wallet: while no peer is reachable, a sync ends with an error that
+/// names the problem, and the wallet keeps what it knows. When the peer is back, the next sync
+/// brings the blocks that were mined in between.
+#[tokio::test]
+async fn j5_sync_reports_an_unreachable_peer_and_works_again_later() -> anyhow::Result<()> {
+    let mut env = TestEnv::new()?;
+    env.mine_blocks(101)?;
+    let client = scanner(&env);
+    let mut wallet = BMPWallet::new(
+        env.new_temp_path().into(),
+        &test_password(),
+        Network::Regtest,
+    )?;
+    let address = wallet.next_unused_address(KeychainKind::External);
+    env.fund_address(&address, Amount::from_sat(100_000))?;
+    env.mine_block()?;
+    sync_to_tip(&mut wallet, &client, &env).await?;
+    assert_eq!(wallet.balance(), Amount::from_sat(100_000));
+
+    env.set_network_active(false)?;
+    env.fund_address(&address, Amount::from_sat(50_000))?;
+    env.mine_block()?;
+    let error = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            // A sync just after the loss of the peer can still end without an error.
+            if let Err(error) = wallet.sync_all(&client).await {
+                return error;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    })
+    .await?;
+    assert!(
+        matches!(
+            error,
+            WalletErrorKind::ChainDataSource(ChainDataSourceError::Client(ClientError::Peers(
+                PeerProblem::NoPeerReachable
+            )))
+        ),
+        "{error}"
+    );
+    assert_eq!(wallet.balance(), Amount::from_sat(100_000));
+
+    env.set_network_active(true)?;
+    sync_to_tip(&mut wallet, &client, &env).await?;
+    assert_eq!(wallet.balance(), Amount::from_sat(150_000));
+    client.shutdown()?;
+    Ok(())
 }

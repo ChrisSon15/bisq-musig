@@ -8,12 +8,16 @@ pub type Result<T, E = WalletErrorKind> = std::result::Result<T, E>;
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum ChainDataSourceError {
-    #[error("chain scanner error: {0}")]
-    Scanner(#[from] chain::SyncError),
-    #[error("chain scanner returned an update for unknown descriptor {descriptor:?}")]
-    UnknownDescriptor { descriptor: bdk_wallet::chain::DescriptorId },
-    #[error("chain scanner returned an update for missing wallet index {index}")]
-    MissingWallet { index: usize },
+    #[error("the compact block filter client cannot sync the wallet: {0}")]
+    Client(#[from] chain::client::ClientError),
+    #[error(
+        "the wallet is a wallet of the network {wallet}, but the peers are peers of the network \
+         {peers}"
+    )]
+    NetworkMismatch {
+        wallet: bdk_wallet::bitcoin::Network,
+        peers: bdk_wallet::bitcoin::Network,
+    },
     #[error("failed to apply chain update: {0}")]
     ApplyUpdate(#[from] bdk_wallet::chain::local_chain::CannotConnectError),
 }
