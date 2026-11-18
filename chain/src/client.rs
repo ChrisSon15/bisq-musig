@@ -387,7 +387,7 @@ impl ChainView {
 }
 
 /// The future of a broadcast.
-pub type BroadcastFuture = Pin<Box<dyn Future<Output = Result<Txid, ChainApiError>> + Send>>;
+pub type BroadcastFuture = Pin<Box<dyn Future<Output = Result<Txid, ClientError>> + Send>>;
 
 /// The access to the chain that the trade engine and its service need: watching scripts and
 /// outputs, reading what was found, events, and sending transactions.
@@ -425,7 +425,9 @@ pub trait ChainAccess: Send + Sync {
     fn subscribe(&self) -> broadcast::Receiver<ChainEvent>;
 
     /// Sends a transaction to the network. A success means that the transaction was sent, not
-    /// that a node accepted it.
+    /// that a node accepted it. The error [`ClientError::NotRequested`] means that the
+    /// transaction was announced and no peer asked for it, which is the case for a transaction
+    /// that the peer has already.
     fn broadcast(&self, tx: Transaction) -> BroadcastFuture;
 }
 
@@ -794,11 +796,9 @@ impl ChainClient {
     /// # Errors
     /// If the client has no connection, or if no peer asked for the transaction in time
     /// ([`ClientError::NotRequested`]).
-    pub async fn broadcast(&self, tx: Transaction) -> Result<Txid, ChainApiError> {
+    pub async fn broadcast(&self, tx: Transaction) -> Result<Txid, ClientError> {
         let txid = tx.compute_txid();
-        self.submit(tx.into())
-            .await
-            .map_err(ChainApiError::backend)?;
+        self.submit(tx.into()).await?;
         Ok(txid)
     }
 
@@ -808,12 +808,11 @@ impl ChainClient {
         &self,
         parent: Transaction,
         child: Transaction,
-    ) -> Result<Txid, ChainApiError> {
+    ) -> Result<Txid, ClientError> {
         let txid = child.compute_txid();
-        let package = Package::new_one_parent_one_child(parent, child).map_err(|error| {
-            ChainApiError::backend(ClientError::InvalidPackage(error.to_string()))
-        })?;
-        self.submit(package).await.map_err(ChainApiError::backend)?;
+        let package = Package::new_one_parent_one_child(parent, child)
+            .map_err(|error| ClientError::InvalidPackage(error.to_string()))?;
+        self.submit(package).await?;
         Ok(txid)
     }
 
@@ -878,7 +877,9 @@ impl ChainApi for ChainClient {
     /// Sends the transaction to the peers. This must be called from a thread that may block, for
     /// example inside `tokio::task::block_in_place`.
     fn transaction_broadcast(&self, tx: &Transaction) -> Result<Txid, ChainApiError> {
-        tokio::runtime::Handle::current().block_on(self.broadcast(tx.clone()))
+        tokio::runtime::Handle::current()
+            .block_on(self.broadcast(tx.clone()))
+            .map_err(ChainApiError::backend)
     }
 }
 

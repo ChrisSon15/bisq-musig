@@ -27,9 +27,7 @@ use ::wallet::protocol_wallet_api::ProtocolWalletApi as _;
 use ::wallet::wallet_info::{PubAddressInfo, TxInfo, TxOutputInfo, UtxoInfo};
 use bdk_wallet::Balance;
 use bdk_wallet::bitcoin::address::{NetworkUnchecked, ParseError};
-use bdk_wallet::bitcoin::{
-    Address, Amount, FeeRate, Network, OutPoint, Transaction, Txid,
-};
+use bdk_wallet::bitcoin::{Address, Amount, FeeRate, Network, OutPoint, Transaction, Txid};
 use chain::ChainApi;
 use futures_util::never::Never;
 use futures_util::stream::{BoxStream, StreamExt as _};
@@ -573,7 +571,7 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
         // The transaction is stored in the wallet at this point. A failure to send it must not
         // fail the close: the wallet still knows the transaction and its coins count as spent.
         // TODO: Send stored unconfirmed transactions again at the next start (point N5 of the
-        //  plan), and send through the peer-to-peer network (F27).
+        //  plan).
         let sent = self.broadcaster.as_ref().map_or_else(
             || Err("no chain backend is configured".to_owned()),
             |broadcaster| {

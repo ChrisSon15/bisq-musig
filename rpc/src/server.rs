@@ -4,10 +4,11 @@ use std::marker::Send;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bdk_wallet::bitcoin::{Amount, FeeRate, Psbt, Transaction, Txid, consensus};
 use bdk_wallet::serde_json;
-use chain::client::ChainAccess;
+use chain::client::{ChainAccess, ClientError};
 use drop_stream::DropStreamExt as _;
 use futures_util::stream::{self, BoxStream, Stream, TryStream, TryStreamExt as _};
 use musig2::PartialSignature;
@@ -92,13 +93,21 @@ impl MusigImpl {
         self
     }
 
-    /// The access to the chain, or the status for a request that needs it.
+    /// The access to the chain, or the status for a request that needs it. While a problem with
+    /// the peers lasts, the chain is not observed and nothing can be sent, so such a request
+    /// does not proceed. The caller can repeat it.
     fn chain(&self) -> Result<Arc<dyn ChainAccess>> {
-        self.chain.clone().ok_or_else(|| {
+        let chain = self.chain.clone().ok_or_else(|| {
             Status::failed_precondition(
                 "the trade service has no access to the chain; start musigd with a peer",
             )
-        })
+        })?;
+        if let Some(problem) = chain.peer_problem() {
+            return Err(Status::unavailable(format!(
+                "the chain cannot be observed and nothing can be sent at the moment: {problem}"
+            )));
+        }
+        Ok(chain)
     }
 
     /// Watches the outputs of a trade whose deposit transaction the trader has signed.
@@ -518,10 +527,14 @@ impl musig_server::Musig for MusigImpl {
 /// The number of confirmations at which a transaction counts as confirmed.
 const MIN_CONFIRMATIONS: u32 = protocol::params::MIN_CONFIRMATIONS as u32;
 
+/// The pause before a transaction that could not be sent is sent again.
+const SEND_RETRY_DELAY: Duration = Duration::from_secs(5);
+
 /// Sends a transaction to the network, and again after every new block in which it was not
 /// confirmed, because a broadcast has no result: the engine does not learn whether a node
-/// accepted the transaction. The sending ends when the transaction counts as confirmed, or after
-/// `max_blocks` blocks without that.
+/// accepted the transaction. A sending that fails, for example while no peer is reachable, is
+/// tried again after a pause. The sending ends when the transaction counts as confirmed, or
+/// after `max_blocks` blocks without that.
 async fn send_until_confirmed(chain: Arc<dyn ChainAccess>, tx: Transaction, max_blocks: u32) {
     let txid = tx.compute_txid();
     let mut events = chain.subscribe();
@@ -541,15 +554,35 @@ async fn send_until_confirmed(chain: Arc<dyn ChainAccess>, tx: Transaction, max_
             warn!(%txid, max_blocks, "The transaction is not confirmed. Sending ends.");
             return;
         }
+        let mut failed = false;
         if confirmations == 0 && last_sent_at != Some(height) {
             match chain.broadcast(tx.clone()).await {
                 // "Sent" does not mean that a node accepted the transaction.
-                Ok(_) => info!(%txid, ?height, "Sent the transaction to the network."),
-                Err(error) => warn!(%txid, %error, "Could not send the transaction."),
+                Ok(_) => {
+                    info!(%txid, ?height, "Sent the transaction to the network.");
+                    last_sent_at = Some(height);
+                }
+                // The peer has the transaction already, or it has rejected it since the last
+                // block. It is announced again after the next block.
+                Err(ClientError::NotRequested(_)) => {
+                    debug!(%txid, ?height, "No peer asked for the announced transaction.");
+                    last_sent_at = Some(height);
+                }
+                Err(error) => {
+                    warn!(%txid, %error, "Could not send the transaction. Trying again.");
+                    failed = true;
+                }
             }
-            last_sent_at = Some(height);
         }
-        match events.recv().await {
+        let event = if failed {
+            match tokio::time::timeout(SEND_RETRY_DELAY, events.recv()).await {
+                Ok(event) => event,
+                Err(_) => continue,
+            }
+        } else {
+            events.recv().await
+        };
+        match event {
             Ok(_) | Err(RecvError::Lagged(_)) => {}
             Err(RecvError::Closed) => return,
         }

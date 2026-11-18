@@ -9,9 +9,7 @@ use chain::client::ChainClient;
 use clap::Parser;
 use protocol::params::{EngineConfig, EngineConfigError};
 use protocol::trade_model::{MemoryTradeStore, TradeModelStore};
-use rpc::bmp_wallet_service::{
-    BMPWalletServiceImpl, BmpWalletImpl, BmpWalletServer,
-};
+use rpc::bmp_wallet_service::{BMPWalletServiceImpl, BmpWalletImpl, BmpWalletServer};
 use rpc::server::{MusigImpl, MusigServer, NoTradeWallet, TradeWalletProvider};
 use tonic::transport::Server;
 

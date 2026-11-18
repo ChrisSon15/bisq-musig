@@ -28,8 +28,9 @@ use bdk_wallet::bitcoin::{
     Address, Amount, BlockHash, Network, OutPoint, Psbt, ScriptBuf, Sequence, TapSighashType,
     Transaction, TxIn, TxOut, Txid, XOnlyPublicKey, absolute, consensus, taproot,
 };
-use chain::ChainApiError;
-use chain::client::{BroadcastFuture, ChainAccess, ChainEvent, ConfirmedTx, PeerProblem};
+use chain::client::{
+    BroadcastFuture, ChainAccess, ChainEvent, ClientError, ConfirmedTx, PeerProblem,
+};
 use futures_util::StreamExt as _;
 use musig2::secp::{Point, Scalar};
 use protocol::mocks::{mock_buyer_trade_wallet, mock_seller_trade_wallet};
@@ -188,6 +189,13 @@ struct FakeChainState {
     watched_outputs: Vec<OutPoint>,
     /// A problem with the peers that the chain reports. While it lasts, a broadcast fails.
     peer_problem: Option<PeerProblem>,
+    /// Whether a broadcast fails, as it does when the connection is lost before the chain
+    /// reports a problem.
+    fail_broadcasts: bool,
+    failed_broadcasts: usize,
+    /// Whether no peer asks for an announced transaction.
+    ignore_broadcasts: bool,
+    ignored_broadcasts: usize,
 }
 
 impl FakeChain {
@@ -201,6 +209,10 @@ impl FakeChain {
                 confirmed: HashMap::new(),
                 watched_outputs: Vec::new(),
                 peer_problem: None,
+                fail_broadcasts: false,
+                failed_broadcasts: 0,
+                ignore_broadcasts: false,
+                ignored_broadcasts: 0,
             }),
             events: broadcast::channel(64).0,
         })
@@ -212,6 +224,22 @@ impl FakeChain {
 
     fn watched_outputs(&self) -> Vec<OutPoint> {
         self.state.lock().unwrap().watched_outputs.clone()
+    }
+
+    fn fail_broadcasts(&self, fail: bool) {
+        self.state.lock().unwrap().fail_broadcasts = fail;
+    }
+
+    fn failed_broadcasts(&self) -> usize {
+        self.state.lock().unwrap().failed_broadcasts
+    }
+
+    fn ignore_broadcasts(&self, ignore: bool) {
+        self.state.lock().unwrap().ignore_broadcasts = ignore;
+    }
+
+    fn ignored_broadcasts(&self) -> usize {
+        self.state.lock().unwrap().ignored_broadcasts
     }
 
     /// Starts or ends a problem with the peers.
@@ -306,7 +334,16 @@ impl ChainAccess for FakeChain {
         let txid = tx.compute_txid();
         let mut state = self.state.lock().unwrap();
         if let Some(problem) = state.peer_problem {
-            return Box::pin(async move { Err(ChainApiError::backend(problem)) });
+            return Box::pin(async move { Err(problem.into()) });
+        }
+        if state.fail_broadcasts {
+            state.failed_broadcasts += 1;
+            return Box::pin(async move { Err(ClientError::NotConnected) });
+        }
+        if state.ignore_broadcasts {
+            state.ignored_broadcasts += 1;
+            let waited = std::time::Duration::from_secs(10);
+            return Box::pin(async move { Err(ClientError::NotRequested(waited)) });
         }
         state.sent.push(tx);
         Box::pin(async move { Ok(txid) })
@@ -1692,6 +1729,155 @@ async fn chain_height_and_missing_chain_access() {
     let trade = trade.lock().unwrap();
     assert_eq!(trade.state(), TradeState::Init);
     assert_eq!(trade.termination_reason(), None);
+}
+
+/// Waits until the chain of a service has got `count` transactions to send.
+async fn sent_count_reaches(chain: &FakeChain, count: usize) -> bool {
+    for _ in 0..500 {
+        if chain.sent().len() >= count {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// A trade in which both traders have signed the deposit transaction, and nobody has published
+/// it.
+async fn trade_with_signed_deposit() -> Trade {
+    let mut trade = Trade::at(TradeType::TakerIsBuyer, Stage::SignaturesExchanged).await;
+    trade.sign_deposit_tx().await;
+    trade
+}
+
+/// J10 and J5 for the service: while the chain reports a problem with the peers, the requests
+/// that need the chain are refused with a status that names the problem, and they change
+/// nothing in the trade. When the problem is over, the same requests succeed.
+#[tokio::test]
+async fn j10_chain_requests_are_refused_while_the_peers_have_a_problem() {
+    for (problem, message) in [
+        (
+            PeerProblem::NoCompactFilters,
+            "does not serve compact block filters",
+        ),
+        (PeerProblem::NoPeerReachable, "no peer"),
+    ] {
+        let mut trade = trade_with_signed_deposit().await;
+        let (maker_side, taker_side) = (trade.maker_side(), trade.taker_side());
+        let makers_deposit_psbt = trade.party(maker_side).deposit_psbt.clone().unwrap();
+        for side in SIDES {
+            trade.party(side).chain.set_peer_problem(Some(problem));
+        }
+
+        let result = trade
+            .party_mut(taker_side)
+            .publish_deposit_tx(&makers_deposit_psbt)
+            .await;
+        assert_refused(result, Code::Unavailable, message);
+        let result = trade
+            .party_mut(maker_side)
+            .subscribe_tx_confirmation_status()
+            .await;
+        assert_refused(result, Code::Unavailable, message);
+        trade.assert_states(TradeState::Deposit, TradeState::Deposit);
+        for side in SIDES {
+            let party = trade.party(side);
+            assert_eq!(party.chain.sent(), vec![], "nothing is sent");
+            let stored = party.trades.get_trade_model(&party.trade_id).unwrap();
+            assert_eq!(stored.lock().unwrap().termination_reason(), None);
+        }
+
+        for side in SIDES {
+            trade.party(side).chain.set_peer_problem(None);
+        }
+        trade
+            .party_mut(maker_side)
+            .subscribe_tx_confirmation_status()
+            .await
+            .expect("SubscribeTxConfirmationStatus succeeds after the problem");
+        drop(trade.publish_deposit_tx().await);
+        assert!(sent_count_reaches(&trade.party(taker_side).chain, 1).await);
+    }
+}
+
+/// J5 for the service: the peers become unreachable after the deposit transaction was accepted
+/// for publishing and before it could be sent. The service keeps trying, reports no
+/// confirmation, and sends the transaction when a peer is reachable again.
+#[tokio::test]
+async fn j5_deposit_is_sent_when_a_peer_is_reachable_again() {
+    let mut trade = trade_with_signed_deposit().await;
+    let taker_side = trade.taker_side();
+    let takers_chain = Arc::clone(&trade.party(taker_side).chain);
+    // The check of the request passes, and the first sending fails.
+    takers_chain.fail_broadcasts(true);
+    let mut events = trade.publish_deposit_tx().await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(takers_chain.sent(), vec![]);
+    assert!(takers_chain.failed_broadcasts() >= 1);
+    trade.assert_states(TradeState::Deposit, TradeState::Deposit);
+
+    // No new block arrives. The service sends again after its pause.
+    takers_chain.fail_broadcasts(false);
+    assert!(
+        sent_count_reaches(&takers_chain, 1).await,
+        "the deposit transaction is sent after the peer is back"
+    );
+    let deposit_tx = takers_chain.sent().remove(0);
+    assert_eq!(deposit_tx.compute_txid(), trade.deposit_tx().compute_txid());
+
+    takers_chain.mine(std::slice::from_ref(&deposit_tx));
+    let event = next_event(&mut events).await.expect("an event");
+    assert_eq!(event.num_confirmations, 1);
+}
+
+/// J9 for the service: a deposit transaction that no node accepts is sent again after every
+/// block, as the schedule of N2 says, also when no peer asks for it. Nothing is reported as
+/// confirmed, the trade stays in its state, and the sending ends after the deposit timeout.
+#[tokio::test]
+async fn j9_deposit_that_never_confirms_is_sent_on_schedule_and_never_reported() {
+    let mut trade = trade_with_signed_deposit().await;
+    let taker_side = trade.taker_side();
+    let takers_chain = Arc::clone(&trade.party(taker_side).chain);
+    let mut events = trade.publish_deposit_tx().await;
+    assert!(sent_count_reaches(&takers_chain, 1).await);
+
+    // The peer does not ask for a transaction that it has rejected since the last block.
+    takers_chain.ignore_broadcasts(true);
+    takers_chain.mine(&[]);
+    for _ in 0..100 {
+        if takers_chain.ignored_broadcasts() >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(takers_chain.ignored_broadcasts(), 1, "announced once");
+    takers_chain.ignore_broadcasts(false);
+
+    // One sending per block, up to the deposit timeout of the configuration.
+    let deposit_timeout = usize::from(EngineConfig::default().deposit_timeout());
+    for block in 2..=deposit_timeout {
+        takers_chain.mine(&[]);
+        assert!(
+            sent_count_reaches(&takers_chain, block).await,
+            "sent again after block {block}"
+        );
+    }
+    // One sending at the start and one after every block of the timeout, less the one for
+    // which no peer asked.
+    assert_eq!(takers_chain.sent().len(), deposit_timeout);
+    // After the timeout the sending ends.
+    takers_chain.mine(&[]);
+    takers_chain.mine(&[]);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(takers_chain.sent().len(), deposit_timeout);
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), events.next())
+            .await
+            .is_err(),
+        "no confirmation event for a transaction that is in no block"
+    );
+    trade.assert_states(TradeState::Deposit, TradeState::Deposit);
 }
 
 #[tokio::test]

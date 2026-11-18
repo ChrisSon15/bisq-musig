@@ -44,14 +44,6 @@ async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
     .unwrap_or_else(|_| panic!("timeout: {what}"));
 }
 
-/// The error of the client inside the error of a broadcast.
-fn client_error(error: &chain::ChainApiError) -> Option<&ClientError> {
-    let chain::ChainApiError::Backend(error) = error else {
-        return None;
-    };
-    error.downcast_ref()
-}
-
 /// The block of the node at `height`, as a start point for a client.
 fn checkpoint(rpc: &RpcClient, height: u32) -> HashCheckpoint {
     let hash = rpc.get_block_hash(u64::from(height)).expect("known block");
@@ -300,8 +292,8 @@ async fn j5_client_connects_again_after_the_peer_was_unreachable() -> anyhow::Re
         .expect_err("nothing can be sent without a peer");
     assert!(
         matches!(
-            client_error(&error),
-            Some(ClientError::NotConnected | ClientError::NotRequested(_) | ClientError::Node(_))
+            error,
+            ClientError::NotConnected | ClientError::NotRequested(_) | ClientError::Node(_)
         ),
         "{error}"
     );
@@ -402,10 +394,7 @@ async fn j9_rejected_transaction_is_never_reported_as_confirmed() -> anyhow::Res
         .broadcast(rejected.clone())
         .await
         .expect_err("the peer does not ask for the transaction");
-    assert!(
-        matches!(client_error(&error), Some(ClientError::NotRequested(_))),
-        "{error}"
-    );
+    assert!(matches!(error, ClientError::NotRequested(_)), "{error}");
 
     env.mine_blocks(2)?;
     synced_to_tip(&client, &env).await;
