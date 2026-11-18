@@ -7,9 +7,9 @@
 //! The tests are the scenarios of the former tests of `BMPProtocol`. The test IDs in the comments
 //! refer to section 9.4 of `concept/CompletionPlan.md`.
 
+use std::path::PathBuf;
+
 use bdk_bitcoind_rpc::bitcoincore_rpc::RpcApi as _;
-use bdk_electrum::BdkElectrumClient;
-use bdk_electrum::electrum_client::Client as ElectrumClient;
 use bdk_wallet::bitcoin::address::NetworkUnchecked;
 use bdk_wallet::bitcoin::{
     Amount, BlockHash, FeeRate, Network, OutPoint, Transaction, Txid, XOnlyPublicKey,
@@ -23,12 +23,13 @@ use protocol::state::{ClosureType, TradeState};
 use protocol::storage::ByVal;
 use protocol::trade_model::{
     ExchangedAddresses, ExchangedKeys, ExchangedNonces, ExchangedSigs, Role, TradeModel,
+    UndecodablePeerData,
 };
 use testenv::{TestEnv, Testchain};
 use tokio::runtime::Runtime;
 use wallet::bmp_wallet::{BMPWallet, WalletApi as _};
 use wallet::password::Password;
-use wallet::protocol_wallet_api::{MemWallet, ProtocolWalletApi};
+use wallet::protocol_wallet_api::ProtocolWalletApi;
 
 const TRADE_AMOUNT: Amount = Amount::from_sat(5_000_000);
 const BUYERS_SECURITY_DEPOSIT: Amount = Amount::from_sat(1_000_000);
@@ -50,7 +51,8 @@ const WARNING_TX_WEIGHT: u64 = 846;
 const FORWARDING_TX_WEIGHT: u64 = 444;
 const ANCHOR_AMOUNT: Amount = Amount::from_sat(330);
 
-type BoxedWallet = Box<dyn ProtocolWalletApi + Send>;
+/// The amount that each wallet of the tests is funded with.
+const FUNDING: Amount = Amount::from_sat(10_0000_0000);
 
 /// A password that follows the wallet's password rules; the test wallets are throwaway.
 fn test_password() -> Password {
@@ -59,67 +61,90 @@ fn test_password() -> Password {
         .expect("the test password follows the password rules")
 }
 
-/// Returns a funded wallet. The backend (`MemWallet` or `BMPWallet`) is selected by the
-/// environment variable `WALLET_BACKEND` (`mem` or `bmp`). The default is `bmp`.
-fn funded_wallet(env: &mut TestEnv) -> BoxedWallet {
-    match std::env::var("WALLET_BACKEND")
-        .unwrap_or_else(|_| "bmp".to_owned())
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "mem" => Box::new(funded_mem_wallet(env)),
-        "bmp" => Box::new(funded_bmp_wallet(env)),
-        other => panic!("unknown WALLET_BACKEND={other:?}, expected `mem` or `bmp`"),
-    }
-}
-
-fn funded_bmp_wallet(env: &mut TestEnv) -> BMPWallet {
-    let mut wallet = BMPWallet::new(
-        env.new_temp_path().into(),
-        &test_password(),
-        Network::Regtest,
-    )
-    .unwrap();
-
-    let address = wallet.get_new_address().unwrap();
-    let txid = env
-        .fund_address(&address.address, Amount::from_btc(10f64).unwrap())
-        .unwrap();
-    env.mine_block().unwrap();
-    env.wait_for_tx(txid).unwrap();
-
-    let chain = env.new_testchain().unwrap();
+/// Runs the chain sync of a wallet.
+fn sync(wallet: &mut BMPWallet, chain: &Testchain) {
     let rt = Runtime::new().expect("create runtime");
-    rt.block_on(async { wallet.sync_all(&chain).await })
-        .unwrap();
-    wallet
+    rt.block_on(async { wallet.sync_all(chain).await })
+        .expect("the wallet syncs");
 }
 
-fn funded_mem_wallet(env: &mut TestEnv) -> MemWallet {
-    let client = BdkElectrumClient::new(ElectrumClient::new(&env.electrum_url()).unwrap());
-    let mut wallet = MemWallet::new(client).unwrap();
-    let address = wallet.next_unused_address();
-    let txid = env
-        .fund_address(&address.address, Amount::from_btc(10f64).unwrap())
-        .unwrap();
+/// Returns a wallet with one confirmed coin of the amount `funding`, and its directory.
+fn funded_wallet(env: &mut TestEnv, funding: Amount) -> (BMPWallet, PathBuf) {
+    let path = env.new_temp_path().to_path_buf();
+    let mut wallet =
+        BMPWallet::new(path.as_path().into(), &test_password(), Network::Regtest).unwrap();
+
+    fund(env, &mut wallet, funding);
+    (wallet, path)
+}
+
+/// Sends a coin of the amount `funding` to the wallet, confirms it and syncs the wallet.
+fn fund(env: &mut TestEnv, wallet: &mut BMPWallet, funding: Amount) {
+    let address = wallet.get_new_address().unwrap();
+    let txid = env.fund_address(&address.address, funding).unwrap();
     env.mine_block().unwrap();
-    env.wait_for_tx(txid).unwrap();
-    wallet.sync().unwrap();
-    wallet
+    // The index server of the test environment sometimes needs longer than the 5 seconds that
+    // `wait_for_tx` waits, so the wait is repeated.
+    let mut attempts = 0;
+    while let Err(error) = env.wait_for_tx(txid) {
+        attempts += 1;
+        assert!(
+            attempts < 4,
+            "the funding transaction is not indexed: {error}"
+        );
+    }
+    sync(wallet, &env.new_testchain().unwrap());
 }
 
 /// One trader: his trade model and his wallet.
 struct Trader {
     model: TradeModel,
-    wallet: BoxedWallet,
+    wallet: BMPWallet,
+    /// The directory of the wallet database, to load the wallet again.
+    wallet_path: PathBuf,
 }
 
 impl Trader {
     fn new(env: &mut TestEnv, role: Role) -> Self {
-        let mut wallet = funded_wallet(env);
-        let model = TradeModel::new("trade-1".to_owned(), role, &mut *wallet)
+        Self::with_funding(env, role, FUNDING)
+    }
+
+    fn with_funding(env: &mut TestEnv, role: Role, funding: Amount) -> Self {
+        let (mut wallet, wallet_path) = funded_wallet(env, funding);
+        let model = TradeModel::new("trade-1".to_owned(), role, &mut wallet)
             .expect("the trade can be created");
-        Self { model, wallet }
+        Self {
+            model,
+            wallet,
+            wallet_path,
+        }
+    }
+
+    /// The coins that are reserved for the trade are locked in the wallet.
+    #[track_caller]
+    fn assert_coins_reserved(&self, reserved: bool) {
+        let coins = self.model.reserved_coins();
+        if reserved {
+            assert!(!coins.is_empty());
+            for coin in coins {
+                assert!(self.wallet.is_utxo_locked(*coin), "{coin} is locked");
+            }
+        } else {
+            assert!(coins.is_empty());
+            assert_eq!(self.wallet.list_locked_utxos(), vec![]);
+        }
+    }
+
+    /// The trade parameters of the tests.
+    const fn params() -> TradeParams {
+        TradeParams {
+            trade_amount: TRADE_AMOUNT,
+            buyers_security_deposit: BUYERS_SECURITY_DEPOSIT,
+            sellers_security_deposit: SELLERS_SECURITY_DEPOSIT,
+            deposit_tx_fee_rate: FEE_RATE,
+            prepared_tx_fee_rate: FEE_RATE,
+            trade_fee_receiver: None,
+        }
     }
 
     fn sent_key_shares(&self) -> ExchangedKeys<'static, ByVal> {
@@ -132,20 +157,12 @@ impl Trader {
     }
 
     fn receive_key_shares(&mut self, peer: &Self) {
-        let params = TradeParams {
-            trade_amount: TRADE_AMOUNT,
-            buyers_security_deposit: BUYERS_SECURITY_DEPOSIT,
-            sellers_security_deposit: SELLERS_SECURITY_DEPOSIT,
-            deposit_tx_fee_rate: FEE_RATE,
-            prepared_tx_fee_rate: FEE_RATE,
-            trade_fee_receiver: None,
-        };
         self.model
             .receive_key_shares(
-                &mut *self.wallet,
+                &mut self.wallet,
                 &config(),
                 Ok(peer.sent_key_shares()),
-                params,
+                Self::params(),
             )
             .expect("valid key shares and parameters");
     }
@@ -206,7 +223,7 @@ impl Trader {
         peers_partial_signatures: ExchangedSigs<'static, ByVal>,
     ) {
         self.model
-            .receive_partial_signatures(&mut *self.wallet, Ok(peers_partial_signatures))
+            .receive_partial_signatures(&mut self.wallet, Ok(peers_partial_signatures))
             .expect("valid partial signatures");
     }
 }
@@ -264,7 +281,9 @@ impl Trade {
 
         // The taker holds all signatures and publishes the deposit transaction.
         let sellers_deposit_psbt = seller.model.deposit_psbt()?.clone();
-        let deposit_tx = buyer.model.receive_deposit_psbt(Ok(sellers_deposit_psbt))?;
+        let deposit_tx = buyer
+            .model
+            .receive_deposit_psbt(&mut buyer.wallet, Ok(sellers_deposit_psbt))?;
         let deposit_txid = chain.transaction_broadcast(&deposit_tx)?;
         env.mine_block()?;
 
@@ -287,6 +306,12 @@ impl Trade {
         assert_eq!(trade.confirmations(trade.buyer_payout), Some(1));
         assert_eq!(trade.confirmations(trade.seller_payout), Some(1));
         Ok(trade)
+    }
+
+    /// Runs the chain sync of both wallets.
+    fn sync_wallets(&mut self) {
+        sync(&mut self.buyer.wallet, &self.chain);
+        sync(&mut self.seller.wallet, &self.chain);
     }
 
     /// The number of confirmations of an unspent output, or `None` if the output does not exist
@@ -338,13 +363,17 @@ impl Trade {
     fn close_cooperatively(&mut self) -> anyhow::Result<()> {
         self.start_payment_and_release()?;
         let sellers_key_share = *self.seller.model.my_private_key_share_for_peer_output()?;
-        self.buyer
-            .model
-            .close_with_key_share(Ok(sellers_key_share), None)?;
+        self.buyer.model.close_with_key_share(
+            &mut self.buyer.wallet,
+            Ok(sellers_key_share),
+            None,
+        )?;
         let buyers_key_share = *self.buyer.model.my_private_key_share_for_peer_output()?;
-        self.seller
-            .model
-            .close_with_key_share(Ok(buyers_key_share), None)?;
+        self.seller.model.close_with_key_share(
+            &mut self.seller.wallet,
+            Ok(buyers_key_share),
+            None,
+        )?;
         let closed = TradeState::TradeClosed(ClosureType::Cooperative);
         assert_eq!(self.buyer.model.state(), closed);
         assert_eq!(self.seller.model.state(), closed);
@@ -388,7 +417,35 @@ fn escrow_amount() -> Amount {
 /// with real wallets confirms, and its payouts have the agreed amounts.
 #[test]
 fn a1_setup_and_deposit() -> anyhow::Result<()> {
-    let trade = Trade::with_confirmed_deposit()?;
+    let mut trade = Trade::with_confirmed_deposit()?;
+    // F13: the coins of both traders are reserved from the moment the half deposit exists.
+    trade.buyer.assert_coins_reserved(true);
+    trade.seller.assert_coins_reserved(true);
+    // F14: the taker recorded the deposit transaction when he published it. His wallet knows
+    // that its coin is spent, although it has not seen the block yet.
+    let buyers_coin = trade.buyer.model.reserved_coins()[0];
+    assert!(
+        trade
+            .buyer
+            .wallet
+            .list_utxos()
+            .iter()
+            .all(|utxo| OutPoint::new(utxo.tx_id, utxo.vout) != buyers_coin)
+    );
+    // After the sync both wallets hold their change, and no unspent coin is locked.
+    trade.sync_wallets();
+    for (trader, paid) in [
+        (&trade.buyer, BUYERS_SECURITY_DEPOSIT),
+        (&trade.seller, TRADE_AMOUNT + SELLERS_SECURITY_DEPOSIT),
+    ] {
+        assert_eq!(trader.wallet.list_locked_utxos(), vec![]);
+        let balance = trader.wallet.balance();
+        assert!(balance < FUNDING - paid, "{balance}");
+        assert!(
+            balance > FUNDING - paid - Amount::from_sat(10_000),
+            "{balance}"
+        );
+    }
     assert_eq!(
         trade.unspent_output(trade.buyer_payout),
         Some((TRADE_AMOUNT + BUYERS_SECURITY_DEPOSIT, 1))
@@ -436,13 +493,235 @@ fn c1_c2_forced_close_with_swap_tx() -> anyhow::Result<()> {
                 .any(|input| input.previous_output == trade.seller_payout)
         })
         .expect("the block contains a spend of the seller's payout");
-    trade.buyer.model.close_with_swap_tx(spending_tx, None)?;
+    trade
+        .buyer
+        .model
+        .close_with_swap_tx(&mut trade.buyer.wallet, spending_tx, None)?;
     assert_eq!(
         trade.buyer.model.state(),
         TradeState::TradeClosed(ClosureType::Forced)
     );
-    // The buyer's payout stays in the deposit output. The buyer now holds its full key.
+    // The buyer's payout stays in the deposit output. The buyer now holds its full key, and the
+    // key is imported into his wallet (F5).
     assert_eq!(trade.confirmations(trade.buyer_payout), Some(2));
+    trade.sync_wallets();
+    assert_eq!(
+        trade.buyer.wallet.imported_balance().confirmed,
+        TRADE_AMOUNT + BUYERS_SECURITY_DEPOSIT
+    );
+    // The seller received his deposit through the swap transaction, to an address of his wallet.
+    assert_eq!(trade.seller.wallet.imported_balance().total(), Amount::ZERO);
+    let sellers_balance = trade.seller.wallet.balance();
+    assert!(
+        sellers_balance > FUNDING - TRADE_AMOUNT - Amount::from_sat(10_000),
+        "{sellers_balance}"
+    );
+    Ok(())
+}
+
+/// A2 and H1: a trade is abandoned before the trader signed the deposit transaction. The reserved
+/// coins are free again, and the trade cannot continue. After the deposit transaction is signed,
+/// a trade cannot be abandoned.
+#[test]
+fn a2_abandon_releases_the_reserved_coins() -> anyhow::Result<()> {
+    let mut env = TestEnv::new()?;
+    let mut buyer = Trader::new(&mut env, Role::BuyerAsTaker);
+    let mut seller = Trader::new(&mut env, Role::SellerAsMaker);
+    seller.receive_key_shares(&buyer);
+    buyer.receive_key_shares(&seller);
+    for trader in [&mut buyer, &mut seller] {
+        trader.assert_coins_reserved(true);
+        assert_eq!(trader.wallet.balance(), Amount::ZERO);
+        assert_eq!(trader.wallet.locked_balance().total(), FUNDING);
+
+        trader.model.abandon(&mut trader.wallet)?;
+        trader.assert_coins_reserved(false);
+        assert_eq!(trader.wallet.balance(), FUNDING);
+        assert_eq!(
+            trader.model.state(),
+            TradeState::TradeClosed(ClosureType::Abandoned)
+        );
+        // The request can be repeated.
+        trader.model.abandon(&mut trader.wallet)?;
+    }
+    // The abandoned trade does not accept the next message of the setup.
+    let result = buyer
+        .model
+        .receive_nonce_shares(Err(UndecodablePeerData("unused".to_owned())), vec![]);
+    assert!(result.expect_err("the trade is abandoned").is_refusal());
+
+    // With a signed deposit transaction the coins stay reserved.
+    let mut trade = Trade::with_confirmed_deposit()?;
+    for trader in [&mut trade.buyer, &mut trade.seller] {
+        let result = trader.model.abandon(&mut trader.wallet);
+        assert!(result.expect_err("the deposit is signed").is_refusal());
+        assert_eq!(trader.model.state(), TradeState::Deposit);
+        trader.assert_coins_reserved(true);
+    }
+    Ok(())
+}
+
+/// A6: the wallet has too few funds for the deposit. The request fails, and nothing is reserved.
+#[test]
+fn a6_too_few_funds() -> anyhow::Result<()> {
+    let mut env = TestEnv::new()?;
+    let mut buyer = Trader::with_funding(&mut env, Role::BuyerAsTaker, Amount::from_sat(500_000));
+    let seller = Trader::new(&mut env, Role::SellerAsMaker);
+    let result = buyer.model.receive_key_shares(
+        &mut buyer.wallet,
+        &config(),
+        Ok(seller.sent_key_shares()),
+        Trader::params(),
+    );
+    let error = result.expect_err("500000 sat do not pay a deposit of 1000000 sat");
+    assert!(error.to_string().contains("Insufficient funds"), "{error}");
+    buyer.assert_coins_reserved(false);
+    assert_eq!(buyer.wallet.balance(), Amount::from_sat(500_000));
+    assert_eq!(buyer.model.state(), TradeState::Init);
+    assert!(buyer.model.my_half_deposit_psbt().is_err());
+    Ok(())
+}
+
+/// A8 and I3: two trades from one wallet never use the same coin, a third trade finds no free
+/// coin, and a payment during the open trades does not use a reserved coin.
+#[test]
+fn a8_i3_reserved_coins_are_used_once() -> anyhow::Result<()> {
+    let mut env = TestEnv::new()?;
+    let peer = Trader::new(&mut env, Role::SellerAsMaker);
+    let (mut wallet, _path) = funded_wallet(&mut env, FUNDING);
+    fund(&mut env, &mut wallet, FUNDING);
+
+    let start_trade = |wallet: &mut BMPWallet, trade_id: &str| {
+        let mut model = TradeModel::new(trade_id.to_owned(), Role::BuyerAsTaker, wallet)?;
+        model.receive_key_shares(
+            wallet,
+            &config(),
+            Ok(peer.sent_key_shares()),
+            Trader::params(),
+        )?;
+        anyhow::Ok(model)
+    };
+    let mut first = start_trade(&mut wallet, "trade-1")?;
+    let second = start_trade(&mut wallet, "trade-2")?;
+    assert_eq!(first.reserved_coins().len(), 1);
+    assert_eq!(second.reserved_coins().len(), 1);
+    assert_ne!(first.reserved_coins(), second.reserved_coins());
+    assert_eq!(wallet.balance(), Amount::ZERO);
+
+    // Both coins are reserved now.
+    let error = start_trade(&mut wallet, "trade-3")
+        .map(|_| ())
+        .expect_err("no free coin");
+    assert!(error.to_string().contains("Insufficient funds"), "{error}");
+    let address = env.new_address()?;
+    let payment = wallet.send_to_address(&address, Amount::from_sat(100_000), FEE_RATE);
+    assert!(payment.is_err(), "a payment does not use a reserved coin");
+    assert_eq!(wallet.list_locked_utxos().len(), 2);
+
+    // When the first trade is abandoned, its coin can be used again.
+    first.abandon(&mut wallet)?;
+    let payment = wallet.send_to_address(&address, Amount::from_sat(100_000), FEE_RATE)?;
+    assert_ne!(payment.input[0].previous_output, second.reserved_coins()[0]);
+    Ok(())
+}
+
+/// I2, B2 and B6 for the wallet of one trader after the close: the imported key and its coin are
+/// stored, so the payout is there after the wallet was closed and loaded again. The next payment
+/// spends the payout first, signed with the imported key, and it confirms.
+fn assert_payout_is_kept_and_spent_first(
+    trader: Trader,
+    payout: OutPoint,
+    amount: Amount,
+    env: &mut TestEnv,
+    chain: &Testchain,
+) -> anyhow::Result<()> {
+    let Trader {
+        wallet,
+        wallet_path,
+        ..
+    } = trader;
+    let balance = wallet.balance();
+    drop(wallet);
+    let mut wallet = BMPWallet::load_wallet(
+        wallet_path.as_path().into(),
+        Network::Regtest,
+        &test_password(),
+    )?;
+    assert_eq!(wallet.imported_balance().confirmed, amount);
+    assert_eq!(wallet.balance(), balance);
+
+    let address = env.new_address()?;
+    let payment = wallet.send_to_address(&address, Amount::from_sat(100_000), FEE_RATE)?;
+    assert!(
+        payment
+            .input
+            .iter()
+            .any(|input| input.previous_output == payout),
+        "the payment spends the imported payout first"
+    );
+    chain.transaction_broadcast(&payment)?;
+    env.mine_block()?;
+    sync(&mut wallet, chain);
+    assert_eq!(wallet.imported_balance().total(), Amount::ZERO);
+    let fee = Amount::from_sat(5_000);
+    assert!(wallet.balance() > balance - Amount::from_sat(100_000) - fee);
+    assert!(wallet.balance() < balance - Amount::from_sat(100_000));
+    Ok(())
+}
+
+/// B1, B2, B6 and I2: after a cooperative close each wallet shows the payout of its trader. The
+/// payout is still there after the wallet was closed and loaded again. The next payment of each
+/// wallet spends the payout first, and it confirms.
+#[test]
+fn b1_b2_cooperative_close_and_payout_in_the_wallet() -> anyhow::Result<()> {
+    let mut trade = Trade::with_confirmed_deposit()?;
+    trade.close_cooperatively()?;
+    // No transaction is needed for the cooperative close. The payouts stay in the deposit.
+    trade.env.mine_block()?;
+    assert_eq!(trade.confirmations(trade.buyer_payout), Some(2));
+    assert_eq!(trade.confirmations(trade.seller_payout), Some(2));
+
+    trade.sync_wallets();
+    let buyers_payout = TRADE_AMOUNT + BUYERS_SECURITY_DEPOSIT;
+    assert_eq!(
+        trade.buyer.wallet.imported_balance().confirmed,
+        buyers_payout
+    );
+    assert_eq!(
+        trade.seller.wallet.imported_balance().confirmed,
+        SELLERS_SECURITY_DEPOSIT
+    );
+    // The buyer gained the trade amount and the seller paid it, apart from the deposit fee.
+    let fee_limit = Amount::from_sat(10_000);
+    let buyers_balance = trade.buyer.wallet.balance();
+    let sellers_balance = trade.seller.wallet.balance();
+    assert!(buyers_balance <= FUNDING + TRADE_AMOUNT && sellers_balance <= FUNDING - TRADE_AMOUNT);
+    assert!(
+        buyers_balance > FUNDING + TRADE_AMOUNT - fee_limit,
+        "{buyers_balance}"
+    );
+    assert!(
+        sellers_balance > FUNDING - TRADE_AMOUNT - fee_limit,
+        "{sellers_balance}"
+    );
+
+    let Trade {
+        buyer,
+        seller,
+        chain,
+        mut env,
+        buyer_payout,
+        seller_payout,
+        ..
+    } = trade;
+    assert_payout_is_kept_and_spent_first(buyer, buyer_payout, buyers_payout, &mut env, &chain)?;
+    assert_payout_is_kept_and_spent_first(
+        seller,
+        seller_payout,
+        SELLERS_SECURITY_DEPOSIT,
+        &mut env,
+        &chain,
+    )?;
     Ok(())
 }
 
@@ -582,7 +861,7 @@ fn d1_custom_payout() -> anyhow::Result<()> {
     for trader in [&mut trade.buyer, &mut trade.seller] {
         trader
             .model
-            .sign_custom_payout(&mut *trader.wallet, sellers_amount, fee_rate)?;
+            .sign_custom_payout(&mut trader.wallet, sellers_amount, fee_rate)?;
         assert_eq!(trader.model.state(), TradeState::CustomPayoutSigned);
     }
     let buyers_psbt = trade.buyer.model.custom_payout_psbt()?.clone();
@@ -590,11 +869,11 @@ fn d1_custom_payout() -> anyhow::Result<()> {
     let custom_payout_tx = trade
         .seller
         .model
-        .finalize_custom_payout(&mut *trade.seller.wallet, Ok(buyers_psbt))?;
+        .finalize_custom_payout(&mut trade.seller.wallet, Ok(buyers_psbt))?;
     let buyers_custom_payout_tx = trade
         .buyer
         .model
-        .finalize_custom_payout(&mut *trade.buyer.wallet, Ok(sellers_psbt))?;
+        .finalize_custom_payout(&mut trade.buyer.wallet, Ok(sellers_psbt))?;
     assert_eq!(
         custom_payout_tx.compute_txid(),
         buyers_custom_payout_tx.compute_txid()

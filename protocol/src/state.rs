@@ -48,12 +48,15 @@ pub enum ClosureType {
     SellersClaim,
     BuyersPenaltyTx,
     SellersPenaltyTx,
+    /// The trade ended in [`TradeState::Init`], before the trader signed the deposit transaction.
+    /// No funds were bound, and the coins that were reserved for the deposit are free again.
+    Abandoned,
 }
 
 impl TradeState {
     /// All possible trade states, in (non-unique) topological order with respect to the
     /// [`PartialOrd`] impl of [`TradeState`].
-    pub const VALUES: [Self; 16] = [
+    pub const VALUES: [Self; 17] = [
         Self::Init,
         Self::Deposit,
         Self::BuyerReadyToRelease,
@@ -70,6 +73,7 @@ impl TradeState {
         Self::TradeClosed(ClosureType::SellersClaim),
         Self::TradeClosed(ClosureType::BuyersPenaltyTx),
         Self::TradeClosed(ClosureType::SellersPenaltyTx),
+        Self::TradeClosed(ClosureType::Abandoned),
     ];
 
     pub fn precedes_for_buyer(self, new_state: Self) -> bool {
@@ -107,7 +111,7 @@ impl TradeState {
 
         match self {
             Self::Init => &[],
-            Self::Deposit => &[Self::Init],
+            Self::Deposit | TradeClosed(ClosureType::Abandoned) => &[Self::Init],
             Self::BuyerReadyToRelease | CustomPayoutSigned | BuyersWarning | SellersWarning => {
                 &[Self::Deposit]
             }
@@ -141,6 +145,8 @@ impl TradeState {
             Self::TradeClosed(ClosureType::SellersClaim) /*    -*/ => 0x06f, // .. .11. 1111
             Self::TradeClosed(ClosureType::BuyersPenaltyTx) /* -*/ => 0x147, // .1 .1.. .111
             Self::TradeClosed(ClosureType::SellersPenaltyTx) /*-*/ => 0x247, // 1. .1.. .111
+            // A bit of its own: the state follows `Init` only, and no state follows it.
+            Self::TradeClosed(ClosureType::Abandoned) /*       -*/ => 0x400,
         }
     }
 }
@@ -181,6 +187,7 @@ impl Display for TradeState {
 #[cfg(test)]
 const TRADE_STATE_TRANSITION_GRAPH: &str = r#"digraph transitions {
     "Init" -> "Deposit"
+    "Init" -> "TradeClosed\n(Abandoned)"
     "Deposit" -> "BuyerReadyToRelease"
     "Deposit" -> "CustomPayoutSigned" [style=dashed]
     "Deposit" -> "BuyersWarning" [style=dashed]

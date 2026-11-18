@@ -21,6 +21,10 @@ service Musig {
   rpc SignCustomPayoutTx (CustomPayoutPsbtRequest) returns (CustomPayoutPsbt);
 
   rpc CustomCloseTrade (CustomCloseTradeRequest) returns (CustomCloseTradeResponse);
+
+  // Ends a trade whose deposit transaction the trader has not signed yet, and releases the coins of the wallet that
+  // were reserved for it. Refused in every later state.
+  rpc AbandonTrade (AbandonTradeRequest) returns (AbandonTradeResponse);
 }
 
 // TODO: Same as 'trade.TradeRole' from Bisq2 protos (minus 'UNSPECIFIED' variant, which should probably be added):
@@ -171,4 +175,11 @@ message CustomCloseTradeRequest {
 
 message CustomCloseTradeResponse {
   bytes customPayoutTx = 1;
+}
+
+message AbandonTradeRequest {
+  string tradeId = 1;
+}
+
+message AbandonTradeResponse {
 }

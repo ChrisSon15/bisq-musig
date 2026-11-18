@@ -26,12 +26,12 @@ use wallet::protocol_wallet_api::ProtocolWalletApi;
 use crate::pb::convert::{CheckInSignedRange as _, TryProtoInto};
 pub use crate::pb::musigrpc::musig_server::MusigServer;
 use crate::pb::musigrpc::{
-    CloseTradeRequest, CloseTradeResponse, CustomCloseTradeRequest, CustomCloseTradeResponse,
-    CustomPayoutPsbt, CustomPayoutPsbtRequest, DepositPsbt, DepositTxSignatureRequest,
-    NonceSharesMessage, NonceSharesRequest, PartialSignaturesMessage, PartialSignaturesRequest,
-    PubKeySharesRequest, PubKeySharesResponse, PublishDepositTxRequest,
-    SubscribeTxConfirmationStatusRequest, SwapTxSignatureRequest, SwapTxSignatureResponse,
-    TxConfirmationStatus, musig_server,
+    AbandonTradeRequest, AbandonTradeResponse, CloseTradeRequest, CloseTradeResponse,
+    CustomCloseTradeRequest, CustomCloseTradeResponse, CustomPayoutPsbt, CustomPayoutPsbtRequest,
+    DepositPsbt, DepositTxSignatureRequest, NonceSharesMessage, NonceSharesRequest,
+    PartialSignaturesMessage, PartialSignaturesRequest, PubKeySharesRequest, PubKeySharesResponse,
+    PublishDepositTxRequest, SubscribeTxConfirmationStatusRequest, SwapTxSignatureRequest,
+    SwapTxSignatureResponse, TxConfirmationStatus, musig_server,
 };
 
 /// An operation of the trade service that needs the wallet of the trader.
@@ -100,27 +100,46 @@ impl MusigImpl {
         })
     }
 
-    /// Looks up the trade of the request and runs `handler` with it.
-    fn handle_trade_request<Req, Res, F>(
+    /// Looks up the trade of the request and runs `handler` with it and with the wallet of the
+    /// trader. Every request of a trade needs the open wallet: the engine takes keys and coins
+    /// from it, records transactions in it, and releases reserved coins in it.
+    async fn handle_trade_request<Req, Res, F>(
         &self,
         request: Request<Req>,
         handler: F,
     ) -> Result<Response<Res>>
     where
-        Req: MusigRequest,
-        Res: Serialize,
-        F: FnOnce(Req, &mut TradeModel) -> Result<Res, HandlerError>,
+        Req: MusigRequest + Send,
+        Res: Serialize + Send,
+        F: FnOnce(Req, &mut TradeModel, &mut dyn ProtocolWalletApi) -> Result<Res, HandlerError>
+            + Send,
     {
-        handle_request(request, move |request| {
-            let trade_model = self
-                .trades
-                .get_trade_model(request.trade_id())
-                .ok_or_else(|| {
-                    Status::not_found(format!("missing trade with id: {}", request.trade_id()))
-                })?;
-            let mut trade_model = trade_model.lock().unwrap();
-            handler(request, &mut trade_model)
+        self.with_wallet(|wallet| {
+            handle_request(request, move |request| {
+                let trade_model =
+                    self.trades
+                        .get_trade_model(request.trade_id())
+                        .ok_or_else(|| {
+                            Status::not_found(format!(
+                                "missing trade with id: {}",
+                                request.trade_id()
+                            ))
+                        })?;
+                let mut trade_model = trade_model.lock().unwrap();
+                let result = handler(request, &mut trade_model, wallet);
+                // A setup that the engine terminated in this request is abandoned, which
+                // releases its reserved coins.
+                if let Err(error) = trade_model.abandon_terminated_setup(wallet) {
+                    error!(
+                        trade_id = trade_model.trade_id(),
+                        %error,
+                        "Could not release the reserved coins of a terminated trade."
+                    );
+                }
+                result
+            })
         })
+        .await
     }
 }
 
@@ -158,48 +177,44 @@ impl musig_server::Musig for MusigImpl {
         &self,
         request: Request<NonceSharesRequest>,
     ) -> Result<Response<NonceSharesMessage>> {
-        self.with_wallet(|wallet| {
-            self.handle_trade_request(request, |request, trade_model| {
-                let peers_key_shares = (|| {
-                    Ok(ExchangedKeys {
-                        buyer_payout: request.buyer_output_peers_pub_key_share.try_proto_into()?,
-                        seller_payout: request
-                            .seller_output_peers_pub_key_share
-                            .try_proto_into()?,
-                        multisig_script: request.peers_multisig_script_key.try_proto_into()?,
-                    })
-                })()
-                .peer_data();
-                let params = TradeParams {
-                    trade_amount: Amount::from_sat(request.trade_amount.check_in_signed_range()?),
-                    buyers_security_deposit: Amount::from_sat(
-                        request.buyers_security_deposit.check_in_signed_range()?,
-                    ),
-                    sellers_security_deposit: Amount::from_sat(
-                        request.sellers_security_deposit.check_in_signed_range()?,
-                    ),
-                    deposit_tx_fee_rate: FeeRate::from_sat_per_kwu(
-                        request.deposit_tx_fee_rate.check_in_signed_range()?,
-                    ),
-                    prepared_tx_fee_rate: FeeRate::from_sat_per_kwu(
-                        request.prepared_tx_fee_rate.check_in_signed_range()?,
-                    ),
-                    trade_fee_receiver: request.trade_fee_receiver.try_proto_into()?,
-                };
-                trade_model.receive_key_shares(wallet, &self.config, peers_key_shares, params)?;
-
-                let redirection_amount_msat = trade_model
-                    .redirection_amount_msat()?
-                    .check_in_signed_range()?;
-                let my_addresses = trade_model.my_addresses()?;
-                let my_half_deposit_psbt = trade_model.my_half_deposit_psbt()?;
-                let my_nonce_shares = trade_model.my_nonce_shares()?;
-
-                Ok(NonceSharesMessage {
-                    half_deposit_psbt: my_half_deposit_psbt.serialize(),
-                    redirection_amount_msat,
-                    ..(my_addresses, my_nonce_shares).into()
+        self.handle_trade_request(request, |request, trade_model, wallet| {
+            let peers_key_shares = (|| {
+                Ok(ExchangedKeys {
+                    buyer_payout: request.buyer_output_peers_pub_key_share.try_proto_into()?,
+                    seller_payout: request.seller_output_peers_pub_key_share.try_proto_into()?,
+                    multisig_script: request.peers_multisig_script_key.try_proto_into()?,
                 })
+            })()
+            .peer_data();
+            let params = TradeParams {
+                trade_amount: Amount::from_sat(request.trade_amount.check_in_signed_range()?),
+                buyers_security_deposit: Amount::from_sat(
+                    request.buyers_security_deposit.check_in_signed_range()?,
+                ),
+                sellers_security_deposit: Amount::from_sat(
+                    request.sellers_security_deposit.check_in_signed_range()?,
+                ),
+                deposit_tx_fee_rate: FeeRate::from_sat_per_kwu(
+                    request.deposit_tx_fee_rate.check_in_signed_range()?,
+                ),
+                prepared_tx_fee_rate: FeeRate::from_sat_per_kwu(
+                    request.prepared_tx_fee_rate.check_in_signed_range()?,
+                ),
+                trade_fee_receiver: request.trade_fee_receiver.try_proto_into()?,
+            };
+            trade_model.receive_key_shares(wallet, &self.config, peers_key_shares, params)?;
+
+            let redirection_amount_msat = trade_model
+                .redirection_amount_msat()?
+                .check_in_signed_range()?;
+            let my_addresses = trade_model.my_addresses()?;
+            let my_half_deposit_psbt = trade_model.my_half_deposit_psbt()?;
+            let my_nonce_shares = trade_model.my_nonce_shares()?;
+
+            Ok(NonceSharesMessage {
+                half_deposit_psbt: my_half_deposit_psbt.serialize(),
+                redirection_amount_msat,
+                ..(my_addresses, my_nonce_shares).into()
             })
         })
         .await
@@ -210,7 +225,7 @@ impl musig_server::Musig for MusigImpl {
         &self,
         request: Request<PartialSignaturesRequest>,
     ) -> Result<Response<PartialSignaturesMessage>> {
-        self.handle_trade_request(request, |request, trade_model| {
+        self.handle_trade_request(request, |request, trade_model, _wallet| {
             if request.buyer_ready_to_release {
                 trade_model.start_payment()?;
             } else {
@@ -235,6 +250,7 @@ impl musig_server::Musig for MusigImpl {
 
             Ok(my_partial_signatures.into())
         })
+        .await
     }
 
     #[instrument(skip_all)]
@@ -242,19 +258,17 @@ impl musig_server::Musig for MusigImpl {
         &self,
         request: Request<DepositTxSignatureRequest>,
     ) -> Result<Response<DepositPsbt>> {
-        self.with_wallet(|wallet| {
-            self.handle_trade_request(request, |request, trade_model| {
-                let peers_partial_signatures = request
-                    .peers_partial_signatures
-                    .ok_or_else(|| Status::not_found("missing request.peers_partial_signatures"))?;
-                let peers_partial_signatures: PeerData<ExchangedSigs<ByVal>> =
-                    peers_partial_signatures.try_proto_into().peer_data();
-                trade_model.receive_partial_signatures(wallet, peers_partial_signatures)?;
-                let deposit_psbt = trade_model.deposit_psbt()?;
+        self.handle_trade_request(request, |request, trade_model, wallet| {
+            let peers_partial_signatures = request
+                .peers_partial_signatures
+                .ok_or_else(|| Status::not_found("missing request.peers_partial_signatures"))?;
+            let peers_partial_signatures: PeerData<ExchangedSigs<ByVal>> =
+                peers_partial_signatures.try_proto_into().peer_data();
+            trade_model.receive_partial_signatures(wallet, peers_partial_signatures)?;
+            let deposit_psbt = trade_model.deposit_psbt()?;
 
-                Ok(DepositPsbt {
-                    deposit_psbt: deposit_psbt.serialize(),
-                })
+            Ok(DepositPsbt {
+                deposit_psbt: deposit_psbt.serialize(),
             })
         })
         .await
@@ -267,13 +281,13 @@ impl musig_server::Musig for MusigImpl {
         &self,
         request: Request<PublishDepositTxRequest>,
     ) -> Result<Response<Self::PublishDepositTxStream>> {
-        self.handle_trade_request(request, |request, trade_model| {
+        self.handle_trade_request(request, |request, trade_model, wallet| {
             let peers_deposit_psbt = request
                 .peers_deposit_psbt
                 .ok_or_else(|| Status::not_found("missing request.peers_deposit_psbt"))?;
             let peers_deposit_psbt: PeerData<Psbt> =
                 peers_deposit_psbt.deposit_psbt.try_proto_into().peer_data();
-            let deposit_tx = trade_model.receive_deposit_psbt(peers_deposit_psbt)?;
+            let deposit_tx = trade_model.receive_deposit_psbt(wallet, peers_deposit_psbt)?;
 
             info!("*** BROADCAST DEPOSIT TX ***"); // TODO: Implement broadcast.
 
@@ -283,6 +297,7 @@ impl musig_server::Musig for MusigImpl {
             )
             .box_traced())
         })
+        .await
     }
 
     type SubscribeTxConfirmationStatusStream = TracedResultStream<TxConfirmationStatus>;
@@ -292,12 +307,13 @@ impl musig_server::Musig for MusigImpl {
         &self,
         request: Request<SubscribeTxConfirmationStatusRequest>,
     ) -> Result<Response<Self::SubscribeTxConfirmationStatusStream>> {
-        self.handle_trade_request(request, |request, _trade_model| {
+        self.handle_trade_request(request, |request, _trade_model, _wallet| {
             Ok(
                 mock_tx_confirmation_status_stream(request.trade_id, b"signed_deposit_tx".into())
                     .box_traced(),
             )
         })
+        .await
     }
 
     #[instrument(skip_all)]
@@ -305,7 +321,7 @@ impl musig_server::Musig for MusigImpl {
         &self,
         request: Request<SwapTxSignatureRequest>,
     ) -> Result<Response<SwapTxSignatureResponse>> {
-        self.handle_trade_request(request, |request, trade_model| {
+        self.handle_trade_request(request, |request, trade_model, _wallet| {
             if request.seller_ready_to_release {
                 let prv_key_share = trade_model.release_payout()?;
 
@@ -322,6 +338,7 @@ impl musig_server::Musig for MusigImpl {
                 Ok(SwapTxSignatureResponse::default())
             }
         })
+        .await
     }
 
     #[instrument(skip_all)]
@@ -329,7 +346,7 @@ impl musig_server::Musig for MusigImpl {
         &self,
         request: Request<CloseTradeRequest>,
     ) -> Result<Response<CloseTradeResponse>> {
-        self.handle_trade_request(request, |request, trade_model| {
+        self.handle_trade_request(request, |request, trade_model, wallet| {
             let penalty_tx_fee_rate = request
                 .penalty_tx_fee_rate
                 .map(u64::check_in_signed_range)
@@ -339,13 +356,17 @@ impl musig_server::Musig for MusigImpl {
                 // Trader receives the private key share from a cooperative peer, closing our trade.
                 let peer_prv_key_share: PeerData<Scalar> =
                     peer_prv_key_share.try_proto_into().peer_data();
-                trade_model.close_with_key_share(peer_prv_key_share, penalty_tx_fee_rate)?;
+                trade_model.close_with_key_share(
+                    wallet,
+                    peer_prv_key_share,
+                    penalty_tx_fee_rate,
+                )?;
             } else if let Some(swap_tx) = request.swap_tx {
                 // Buyer supplies a signed swap tx to the Rust server, to close our trade. (Mainly
                 // for testing -- normally the tx would be picked up from the
                 // bitcoin network by the server.)
                 let swap_tx: Transaction = swap_tx.try_proto_into()?;
-                trade_model.close_with_swap_tx(&swap_tx, penalty_tx_fee_rate)?;
+                trade_model.close_with_swap_tx(wallet, &swap_tx, penalty_tx_fee_rate)?;
             } else {
                 // Peer unresponsive -- force-close our trade by publishing the swap tx. For seller
                 // only.
@@ -368,6 +389,7 @@ impl musig_server::Musig for MusigImpl {
                 penalty_tx: penalty_tx.map(consensus::serialize),
             })
         })
+        .await
     }
 
     #[instrument(skip_all)]
@@ -375,25 +397,23 @@ impl musig_server::Musig for MusigImpl {
         &self,
         request: Request<CustomPayoutPsbtRequest>,
     ) -> Result<Response<CustomPayoutPsbt>> {
-        self.with_wallet(|wallet| {
-            self.handle_trade_request(request, |request, trade_model| {
-                trade_model.sign_custom_payout(
-                    wallet,
-                    Amount::from_sat(
-                        request
-                            .sellers_payout_amount_excluding_fee
-                            .check_in_signed_range()?,
-                    ),
-                    FeeRate::from_sat_per_kwu(request.fee_rate.check_in_signed_range()?),
-                )?;
-                let psbt = trade_model.custom_payout_psbt()?;
+        self.handle_trade_request(request, |request, trade_model, wallet| {
+            trade_model.sign_custom_payout(
+                wallet,
+                Amount::from_sat(
+                    request
+                        .sellers_payout_amount_excluding_fee
+                        .check_in_signed_range()?,
+                ),
+                FeeRate::from_sat_per_kwu(request.fee_rate.check_in_signed_range()?),
+            )?;
+            let psbt = trade_model.custom_payout_psbt()?;
 
-                Ok(CustomPayoutPsbt {
-                    psbt: psbt.serialize(),
-                    tx_id: psbt.unsigned_tx.compute_txid().to_string(),
-                    buyers_payout_amount_including_fee: psbt.unsigned_tx.output[0].value.to_sat(),
-                    sellers_payout_amount_including_fee: psbt.unsigned_tx.output[1].value.to_sat(),
-                })
+            Ok(CustomPayoutPsbt {
+                psbt: psbt.serialize(),
+                tx_id: psbt.unsigned_tx.compute_txid().to_string(),
+                buyers_payout_amount_including_fee: psbt.unsigned_tx.output[0].value.to_sat(),
+                sellers_payout_amount_including_fee: psbt.unsigned_tx.output[1].value.to_sat(),
             })
         })
         .await
@@ -404,20 +424,31 @@ impl musig_server::Musig for MusigImpl {
         &self,
         request: Request<CustomCloseTradeRequest>,
     ) -> Result<Response<CustomCloseTradeResponse>> {
-        self.with_wallet(|wallet| {
-            self.handle_trade_request(request, |request, trade_model| {
-                let peers_psbt: PeerData<Psbt> = request
-                    .peers_custom_payout_psbt
-                    .try_proto_into()
-                    .peer_data();
-                let custom_payout_tx = trade_model.finalize_custom_payout(wallet, peers_psbt)?;
+        self.handle_trade_request(request, |request, trade_model, wallet| {
+            let peers_psbt: PeerData<Psbt> = request
+                .peers_custom_payout_psbt
+                .try_proto_into()
+                .peer_data();
+            let custom_payout_tx = trade_model.finalize_custom_payout(wallet, peers_psbt)?;
 
-                info!("*** BROADCAST CUSTOM PAYOUT TX ***"); // TODO: Implement broadcast.
+            info!("*** BROADCAST CUSTOM PAYOUT TX ***"); // TODO: Implement broadcast.
 
-                Ok(CustomCloseTradeResponse {
-                    custom_payout_tx: consensus::serialize(&custom_payout_tx),
-                })
+            Ok(CustomCloseTradeResponse {
+                custom_payout_tx: consensus::serialize(&custom_payout_tx),
             })
+        })
+        .await
+    }
+
+    #[instrument(skip_all)]
+    async fn abandon_trade(
+        &self,
+        request: Request<AbandonTradeRequest>,
+    ) -> Result<Response<AbandonTradeResponse>> {
+        self.handle_trade_request(request, |_request, trade_model, wallet| {
+            trade_model.abandon(wallet)?;
+
+            Ok(AbandonTradeResponse {})
         })
         .await
     }
@@ -510,6 +541,7 @@ macro_rules! impl_musig_req {
     };
 }
 
+impl_musig_req!(AbandonTradeRequest);
 impl_musig_req!(PartialSignaturesRequest);
 impl_musig_req!(NonceSharesRequest);
 impl_musig_req!(DepositTxSignatureRequest);

@@ -6,7 +6,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .serde_serialized_types(&[
             "ReceiverAddressAndAmount", "PartialSignaturesRequest", "DepositTxSignatureRequest",
             "PublishDepositTxRequest", "SubscribeTxConfirmationStatusRequest", "ContractualTxIds",
-            "CustomPayoutPsbtRequest"
+            "CustomPayoutPsbtRequest", "AbandonTradeRequest", "AbandonTradeResponse"
         ])
         .serde_serialized_type("PubKeySharesRequest", &[
             enum_field("myRole", "Role")

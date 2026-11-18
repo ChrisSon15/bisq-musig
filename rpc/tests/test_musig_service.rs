@@ -35,12 +35,13 @@ use protocol::state::{ClosureType, TradeState};
 use protocol::trade_model::{MemoryTradeStore, TradeModelStore as _};
 use rpc::pb::musigrpc::musig_client::MusigClient;
 use rpc::pb::musigrpc::{
-    CloseTradeRequest, CloseTradeResponse, ContractualTxIds, CustomCloseTradeRequest,
-    CustomCloseTradeResponse, CustomPayoutPsbt, CustomPayoutPsbtRequest, DepositPsbt,
-    DepositTxSignatureRequest, NonceSharesMessage, NonceSharesRequest, PartialSignaturesMessage,
-    PartialSignaturesRequest, PubKeySharesRequest, PubKeySharesResponse, PublishDepositTxRequest,
-    ReceiverAddressAndAmount, Role, SubscribeTxConfirmationStatusRequest, SwapTxSignatureRequest,
-    SwapTxSignatureResponse, TxConfirmationStatus,
+    AbandonTradeRequest, AbandonTradeResponse, CloseTradeRequest, CloseTradeResponse,
+    ContractualTxIds, CustomCloseTradeRequest, CustomCloseTradeResponse, CustomPayoutPsbt,
+    CustomPayoutPsbtRequest, DepositPsbt, DepositTxSignatureRequest, NonceSharesMessage,
+    NonceSharesRequest, PartialSignaturesMessage, PartialSignaturesRequest, PubKeySharesRequest,
+    PubKeySharesResponse, PublishDepositTxRequest, ReceiverAddressAndAmount, Role,
+    SubscribeTxConfirmationStatusRequest, SwapTxSignatureRequest, SwapTxSignatureResponse,
+    TxConfirmationStatus,
 };
 use rpc::server::{MusigImpl, MusigServer, TradeWalletProvider, WalletOperation};
 use tokio::net::TcpListener;
@@ -58,6 +59,9 @@ const SELLERS_SECURITY_DEPOSIT: u64 = 30_000;
 const BUYERS_PENALTY_TX_FEE_RATE: u64 = 3_750;
 const CUSTOM_PAYOUT_TX_FEE_RATE: u64 = 3_750;
 // Lock times in blocks. The values have no meaning for these tests, because no chain is used.
+/// The state of a trade that ended during the setup. A setup that the engine terminates is
+/// abandoned at once, which releases the reserved coins.
+const ABANDONED: TradeState = TradeState::TradeClosed(ClosureType::Abandoned);
 const WARNING_LOCK_TIME: u16 = 20;
 const CLAIM_LOCK_TIME: u16 = 10;
 
@@ -478,6 +482,16 @@ impl Party {
         };
         self.client
             .sign_custom_payout_tx(request)
+            .await
+            .map(Response::into_inner)
+    }
+
+    async fn abandon_trade(&mut self) -> Result<AbandonTradeResponse, Status> {
+        let request = AbandonTradeRequest {
+            trade_id: self.trade_id.clone(),
+        };
+        self.client
+            .abandon_trade(request)
             .await
             .map(Response::into_inner)
     }
@@ -1998,7 +2012,7 @@ async fn g1_g4_invalid_encodings_are_rejected() {
             let party = trade.party_mut(side);
             let result = party.get_nonce_shares(&invalid_key_shares).await;
             assert_terminated(result, party, "could not decode");
-            assert_eq!(party.state(), TradeState::Init);
+            assert_eq!(party.state(), ABANDONED);
         }
 
         let mut trade = Trade::new(TradeType::TakerIsBuyer).await;
@@ -2017,7 +2031,7 @@ async fn g1_g4_invalid_encodings_are_rejected() {
         let party = trade.party_mut(side);
         let result = party.get_partial_signatures(&invalid_nonce_shares).await;
         assert_terminated(result, party, "could not decode pub nonce");
-        assert_eq!(party.state(), TradeState::Init);
+        assert_eq!(party.state(), ABANDONED);
     }
 }
 
@@ -2051,7 +2065,7 @@ async fn g4_repeated_nonce_is_rejected() {
                 assert_terminated(result, party, "the peer's nonce share for the");
                 let result = party.get_partial_signatures(&peers_nonce_shares).await;
                 assert_terminated(result, party, "the peer's nonce share for the");
-                assert_eq!(party.state(), TradeState::Init);
+                assert_eq!(party.state(), ABANDONED);
             }
         }
     }
@@ -2114,7 +2128,7 @@ async fn g13_invalid_peer_data_terminates_the_trade() {
         assert_terminated(result, &trade.buyer, "could not decode");
         let result = trade.buyer.get_nonce_shares(&sellers_key_shares).await;
         assert_terminated(result, &trade.buyer, "could not decode");
-        assert_eq!(trade.buyer.state(), TradeState::Init);
+        assert_eq!(trade.buyer.state(), ABANDONED);
 
         // An invalid partial signature during the setup.
         let mut trade = Trade::at(trade_type, Stage::SignaturesExchanged).await;
@@ -2128,7 +2142,7 @@ async fn g13_invalid_peer_data_terminates_the_trade() {
         assert_terminated(result, &trade.buyer, reason);
         let result = trade.buyer.sign_deposit_tx(&sellers_signatures).await;
         assert_terminated(result, &trade.buyer, reason);
-        assert_eq!(trade.buyer.state(), TradeState::Init);
+        assert_eq!(trade.buyer.state(), ABANDONED);
 
         // A wrong private key share in message F.
         let reason = "does not match its public key share";
@@ -2212,6 +2226,44 @@ async fn g13_invalid_peer_data_in_a_request_that_is_not_allowed() {
         // The trade continues: both sides sign the deposit transaction.
         trade.sign_deposit_tx().await;
         trade.assert_states(TradeState::Deposit, TradeState::Deposit);
+    }
+}
+
+/// A2: a trade can be abandoned while the trader has not signed the deposit transaction. An
+/// abandoned trade accepts no request that would continue it. After the deposit transaction is
+/// signed, the request is refused, because the peer can publish the deposit.
+#[tokio::test]
+async fn a2_abandon_trade() {
+    for trade_type in TRADE_TYPES {
+        let mut trade = Trade::at(trade_type, Stage::SignaturesExchanged).await;
+        for (side, peers_side) in [(Side::Buyer, Side::Seller), (Side::Seller, Side::Buyer)] {
+            let peers_signatures = trade
+                .party(peers_side)
+                .partial_signatures
+                .clone()
+                .expect("C/D");
+            let party = trade.party_mut(side);
+            party.abandon_trade().await.expect("allowed in Init");
+            assert_eq!(party.state(), ABANDONED);
+            party.abandon_trade().await.expect("repeated request");
+
+            // The trade cannot continue: the deposit transaction is not signed any more.
+            let result = party.sign_deposit_tx(&peers_signatures).await;
+            assert_not_allowed(result, party, ABANDONED);
+        }
+
+        for stage in [
+            Stage::DepositSigned,
+            Stage::PaymentStarted,
+            Stage::ClosedCooperatively,
+        ] {
+            let mut trade = Trade::at(trade_type, stage).await;
+            for party in [&mut trade.buyer, &mut trade.seller] {
+                let state = party.state();
+                let result = party.abandon_trade().await;
+                assert_not_allowed(result, party, state);
+            }
+        }
     }
 }
 

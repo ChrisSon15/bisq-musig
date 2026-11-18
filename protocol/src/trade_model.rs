@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use bdk_wallet::bitcoin::address::{NetworkChecked, NetworkUnchecked, NetworkValidation};
 use bdk_wallet::bitcoin::{
-    Address, Amount, FeeRate, Network, Psbt, TapSighash, Transaction, Txid, XOnlyPublicKey,
+    Address, Amount, FeeRate, Network, OutPoint, Psbt, TapSighash, Transaction, Txid,
+    XOnlyPublicKey,
 };
 use musig2::secp::{MaybeScalar, Point, Scalar};
 use musig2::{PartialSignature, PubNonce};
@@ -74,8 +75,15 @@ pub struct TradeModel {
     network: Network,
     state: TradeState,
     /// Set, with the reason, when the peer sent data that an unmodified client never produces.
-    /// A terminated trade accepts no further data and never changes its state again.
+    /// A terminated trade accepts no further data. Its state changes only once more, and only
+    /// if it was terminated during the setup: then the trade is abandoned.
     terminated: Option<String>,
+    /// The coins of the wallet that are reserved for the trader's half of the deposit
+    /// transaction. They are locked in the wallet from the moment the half deposit exists.
+    reserved_coins: Vec<OutPoint>,
+    /// The height of the chain tip of the wallet when the trader signed the deposit transaction.
+    /// The deposit transaction cannot be confirmed at or below this height.
+    deposit_signing_height: Option<u32>,
     /// The data of the requests that were processed. A repeated request is compared with it.
     received: Received,
     keys: Keys,
@@ -365,6 +373,8 @@ impl TradeModel {
             network: wallet.network(),
             state: TradeState::Init,
             terminated: None,
+            reserved_coins: Vec::new(),
+            deposit_signing_height: None,
             received: Received::default(),
             keys,
             deposit_tx: DepositTx::default(),
@@ -471,6 +481,11 @@ impl TradeModel {
     #[instrument(skip_all)]
     fn update_state(&mut self, new_state: TradeState) -> Result<bool> {
         self.check_not_terminated()?;
+        self.set_state(new_state)
+    }
+
+    /// Changes the state, also of a terminated trade.
+    fn set_state(&mut self, new_state: TradeState) -> Result<bool> {
         if self.state >= new_state {
             return Ok(false);
         }
@@ -531,6 +546,9 @@ impl TradeModel {
             trade.init_my_nonce_shares()?;
             trade.received.params = Some(params);
             trade.received.config = Some(*config);
+            // The last step, because it changes the wallet: a request that is refused must not
+            // leave coins reserved.
+            trade.reserve_my_deposit_inputs(wallet)?;
             Ok(())
         })
     }
@@ -649,6 +667,7 @@ impl TradeModel {
                      trade parameters or different lock times; our configuration: {config})"
                 ))?;
             trade.compute_my_signed_prepared_txs()?;
+            trade.deposit_signing_height = Some(wallet.chain_tip_height());
             trade.sign_deposit_psbt(wallet)?;
             trade.received.partial_signatures = Some(received);
             Ok(())
@@ -685,9 +704,12 @@ impl TradeModel {
     }
 
     /// Takes the deposit PSBT with the signatures of the peer and returns the signed deposit
-    /// transaction.
+    /// transaction. The transaction is recorded in the wallet as unconfirmed, so the wallet knows
+    /// that its coins are spent before a block confirms it. The caller sends the transaction to
+    /// the network.
     pub fn receive_deposit_psbt(
         &mut self,
+        wallet: &mut dyn ProtocolWalletApi,
         peers_deposit_psbt: PeerData<Psbt>,
     ) -> Result<Transaction> {
         self.atomically(|trade| {
@@ -709,11 +731,12 @@ impl TradeModel {
                 .builder
                 .combine_psbts(peers_deposit_psbt)
                 .or_peer_misbehaved("the deposit PSBT of the peer cannot be combined with ours")?;
-            trade
-                .deposit_tx
-                .builder
-                .signed_tx()
-                .or_peer_misbehaved("the deposit PSBT of the peer does not sign all its inputs")
+            let deposit_tx =
+                trade.deposit_tx.builder.signed_tx().or_peer_misbehaved(
+                    "the deposit PSBT of the peer does not sign all its inputs",
+                )?;
+            wallet.record_transaction(&deposit_tx)?;
+            Ok(deposit_tx)
         })
     }
 
@@ -789,9 +812,11 @@ impl TradeModel {
         })
     }
 
-    /// Closes the trade with the secret key share that the peer released.
+    /// Closes the trade with the secret key share that the peer released. The trader now holds
+    /// the complete key of his payout, and the key is imported into the wallet.
     pub fn close_with_key_share(
         &mut self,
+        wallet: &mut dyn ProtocolWalletApi,
         peers_key_share: PeerData<Scalar>,
         penalty_tx_fee_rate: Option<FeeRate>,
     ) -> Result<()> {
@@ -826,14 +851,17 @@ impl TradeModel {
                 ))?;
             trade.sign_penalty_tx(penalty_tx_fee_rate)?;
             trade.close_trade(ClosureType::Cooperative)?;
+            trade.import_my_payout_key(wallet)?;
             Ok(())
         })
     }
 
     /// The buyer closes the trade with a transaction that spends the seller's payout. He reads
-    /// the seller's key share from its signature.
+    /// the seller's key share from its signature, and the complete key of his payout is imported
+    /// into the wallet.
     pub fn close_with_swap_tx(
         &mut self,
+        wallet: &mut dyn ProtocolWalletApi,
         swap_tx: &Transaction,
         penalty_tx_fee_rate: Option<FeeRate>,
     ) -> Result<()> {
@@ -853,6 +881,7 @@ impl TradeModel {
                 .map_err(|e| ProtocolErrorKind::UnusableSwapTx(e.to_string()))?;
             trade.sign_penalty_tx(penalty_tx_fee_rate)?;
             trade.close_trade(ClosureType::Forced)?;
+            trade.import_my_payout_key(wallet)?;
             Ok(())
         })
     }
@@ -945,6 +974,80 @@ impl TradeModel {
             trade.close_trade(ClosureType::Custom)?;
             Ok(custom_payout_tx)
         })
+    }
+}
+
+// ---- Coins and keys of the trade in the wallet ----
+
+impl TradeModel {
+    /// Ends a trade whose deposit transaction the trader has not signed, and releases the coins
+    /// that were reserved for it. This is possible only in the state `Init`, also for a trade
+    /// that was terminated. Afterwards the trade accepts no request that would continue it.
+    pub fn abandon(&mut self, wallet: &mut dyn ProtocolWalletApi) -> Result<()> {
+        let abandoned = TradeState::TradeClosed(ClosureType::Abandoned);
+        if self.state == abandoned {
+            return Ok(());
+        }
+        // In every later state the trader has signed the deposit transaction. The peer can
+        // publish it, so the coins must stay reserved.
+        self.require_state(&[TradeState::Init])?;
+        for outpoint in &self.reserved_coins {
+            wallet.unlock_utxo(*outpoint)?;
+        }
+        self.reserved_coins.clear();
+        self.set_state(abandoned)?;
+        Ok(())
+    }
+
+    /// Abandons the trade if it was terminated during the setup. The caller of the engine calls
+    /// this after every request, because the engine has no wallet of its own to release the
+    /// reserved coins at the moment of the termination.
+    pub fn abandon_terminated_setup(&mut self, wallet: &mut dyn ProtocolWalletApi) -> Result<()> {
+        if self.terminated.is_some() && self.state == TradeState::Init {
+            self.abandon(wallet)?;
+        }
+        Ok(())
+    }
+
+    /// The coins of the wallet that are reserved for the trader's half of the deposit.
+    pub fn reserved_coins(&self) -> &[OutPoint] {
+        &self.reserved_coins
+    }
+
+    /// Locks the inputs of the trader's half of the deposit transaction in the wallet, so that
+    /// no other trade and no payment selects them.
+    fn reserve_my_deposit_inputs(&mut self, wallet: &mut dyn ProtocolWalletApi) -> Result<()> {
+        let outpoints = self
+            .my_half_deposit_psbt()?
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|input| input.previous_output)
+            .collect::<Vec<_>>();
+        for (count, outpoint) in outpoints.iter().enumerate() {
+            if let Err(error) = wallet.lock_utxo(*outpoint) {
+                // Release what was locked so far. An error here cannot be handled further.
+                for locked in &outpoints[..count] {
+                    let _ = wallet.unlock_utxo(*locked);
+                }
+                return Err(error.into());
+            }
+        }
+        self.reserved_coins = outpoints;
+        Ok(())
+    }
+
+    /// Imports the complete key of the trader's payout into the wallet, with the script of the
+    /// payout output, so that the wallet shows and can spend the payout.
+    fn import_my_payout_key(&self, wallet: &mut dyn ProtocolWalletApi) -> Result<()> {
+        let payout_key = *self.keys.my_payout_ctx().aggregated_key()?.prv_key()?;
+        let [buyer_script_key, seller_script_key] = self.keys.multisig_script_keys()?;
+        let tap_tree = script_paths::deposit_payout_tap_tree(buyer_script_key, seller_script_key)?;
+        // The deposit transaction cannot be confirmed at or below the height at which the trader
+        // signed it, so the wallet does not need to look for the payout in earlier blocks.
+        let start_height = self.deposit_signing_height.unwrap_or(0);
+        wallet.import_private_key_since(payout_key, Some(tap_tree), start_height)?;
+        Ok(())
     }
 }
 
@@ -1775,7 +1878,7 @@ impl TradeModel {
                 // TODO: Make sure we are committed to broadcasting the Swap Tx.
             }
             ClosureType::Cooperative | ClosureType::Forced => {
-                // TODO: Should export the private key to the wallet, not just check we've got it:
+                // The caller imports the key into the wallet (`import_my_payout_key`).
                 self.keys.my_payout_ctx().aggregated_key()?.prv_key()?;
                 self.penalty_tx.builder.signed_tx()?;
                 // TODO: If forced closure, make sure we've seen the Swap Tx on the network.
@@ -1786,8 +1889,9 @@ impl TradeModel {
                 //  have already seen it on the network.
             }
             // No call starts a warning, redirect, claim or penalty transaction yet, so these
-            // closure types cannot be reached.
-            ClosureType::BuyersRedirect
+            // closure types cannot be reached. A trade is abandoned by `abandon`.
+            ClosureType::Abandoned
+            | ClosureType::BuyersRedirect
             | ClosureType::SellersRedirect
             | ClosureType::BuyersClaim
             | ClosureType::SellersClaim
@@ -2764,11 +2868,15 @@ mod tests {
                 .model
                 .receive_partial_signatures(&mut *me.wallet, undecodable());
             assert_refused(&result, &me);
-            let result = me.model.receive_deposit_psbt(undecodable());
+            let result = me
+                .model
+                .receive_deposit_psbt(&mut *me.wallet, undecodable());
             assert_refused(&result, &me);
             let result = me.model.receive_swap_tx_signature(undecodable());
             assert_refused(&result, &me);
-            let result = me.model.close_with_key_share(undecodable(), None);
+            let result = me
+                .model
+                .close_with_key_share(&mut *me.wallet, undecodable(), None);
             assert_refused(&result, &me);
             let result = me
                 .model
