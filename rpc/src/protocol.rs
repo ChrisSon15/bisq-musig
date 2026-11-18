@@ -215,6 +215,10 @@ impl TradeModel {
         matches!(self.my_role, Role::BuyerAsMaker | Role::BuyerAsTaker)
     }
 
+    pub const fn state(&self) -> TradeState {
+        self.state
+    }
+
     fn trade_wallet(&self) -> Result<ArcMutexGuardian<dyn ProtocolWalletApi + Send + 'static>> {
         Ok(ArcMutexGuardian::take(self.trade_wallet.clone()
             .ok_or(ProtocolErrorKind::MissingTradeWallet)?).unwrap())

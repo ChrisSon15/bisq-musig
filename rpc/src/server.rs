@@ -9,7 +9,7 @@ use bdk_wallet::bitcoin::{Amount, FeeRate, consensus};
 use bdk_wallet::serde_json;
 use drop_stream::DropStreamExt as _;
 use futures_util::stream::{self, BoxStream, Stream, StreamExt as _, TryStream, TryStreamExt as _};
-use protocol::state::ClosureType;
+use protocol::state::{ClosureType, TradeState};
 use serde::Serialize;
 use tokio::time::{self, Duration};
 use tonic::{Request, Response, Result, Status};
@@ -265,6 +265,16 @@ impl musig_server::Musig for MusigImpl {
             Ok(CustomCloseTradeResponse { custom_payout_tx: consensus::serialize(&custom_payout_tx) })
         })
     }
+}
+
+/// Returns the current state of the trade with the given ID, or `None` if no such trade is stored.
+///
+/// The `musigrpc.Musig` service has no RPC that reports the trade state, so this read-only view of
+/// the trade store is the only way for the service tests to observe it.
+pub fn trade_state(trade_id: &str) -> Option<TradeState> {
+    TRADE_MODELS
+        .get_trade_model(trade_id)
+        .map(|trade_model| trade_model.lock().unwrap().state())
 }
 
 fn mock_tx_confirmation_status_stream(trade_id: String, tx: Vec<u8>) -> impl Stream<Item = Result<TxConfirmationStatus>> {
