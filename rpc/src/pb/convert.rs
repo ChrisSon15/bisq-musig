@@ -12,6 +12,7 @@ use protocol::trade_model::{
     ContractualTxids, ExchangedAddresses, ExchangedNonces, ExchangedSigs, Role,
 };
 use tonic::{Result, Status};
+use wallet::secret::SecretScalar;
 
 use crate::pb::musigrpc::{
     self, NonceSharesMessage, PartialSignaturesMessage, ReceiverAddressAndAmount,
@@ -131,6 +132,7 @@ impl_try_proto_into_for_slice!(Point, Point::try_from, "nonzero point");
 impl_try_proto_into_for_slice!(PubNonce, PubNonce::try_from, "pub nonce");
 impl_try_proto_into_for_slice!(Scalar, Scalar::try_from, "nonzero scalar");
 impl_try_proto_into_for_slice!(MaybeScalar, MaybeScalar::try_from, "scalar");
+impl_try_proto_into_for_slice!(SecretScalar, SecretScalar::from_slice, "secret key share");
 
 impl_try_proto_into_for_slice!(Txid, Txid::from_slice, "txid");
 impl_try_proto_into_for_slice!(TapSighash, TapSighash::from_slice, "sighash");

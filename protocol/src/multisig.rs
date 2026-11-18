@@ -5,21 +5,25 @@ use bdk_wallet::bitcoin::{Address, Network, PublicKey, TapNodeHash, TapSighash};
 use musig2::adaptor::AdaptorSignature;
 use musig2::secp::{MaybePoint, MaybeScalar, Point, Scalar};
 use musig2::{
-    AggNonce, KeyAggContext, LiftedSignature, NonceSeed, PartialSignature, PubNonce, SecNonce,
-    SecNonceBuilder,
+    AggNonce, BinaryEncoding as _, KeyAggContext, LiftedSignature, NonceSeed, PartialSignature,
+    PubNonce, SecNonce, SecNonceBuilder,
 };
 use thiserror::Error;
+use wallet::secret::{SecretBytes, SecretScalar};
+use zeroize::Zeroizing;
 
+/// A public key and, if it is known, its secret key. The secret key is wiped when the pair is
+/// dropped.
 #[derive(Clone)]
 pub struct KeyPair {
     pub_key: Point,
-    prv_key: Option<Scalar>,
+    prv_key: Option<SecretScalar>,
 }
 
 impl KeyPair {
     pub const fn pub_key(&self) -> &Point { &self.pub_key }
 
-    pub fn prv_key(&self) -> Result<&Scalar> {
+    pub fn prv_key(&self) -> Result<&SecretScalar> {
         self.prv_key.as_ref().ok_or(MultisigErrorKind::MissingPrvKey)
     }
 
@@ -27,30 +31,58 @@ impl KeyPair {
         Self { pub_key, prv_key: None }
     }
 
-    fn from_private(prv_key: Scalar) -> Self {
-        Self { pub_key: prv_key.base_point_mul(), prv_key: Some(prv_key) }
+    fn from_private(prv_key: SecretScalar) -> Self {
+        Self {
+            pub_key: prv_key.public_point(),
+            prv_key: Some(prv_key),
+        }
     }
 
-    fn set_prv_key(&mut self, prv_key: Scalar) -> Result<&Scalar> {
-        if self.pub_key != prv_key.base_point_mul() {
+    fn set_prv_key(&mut self, prv_key: SecretScalar) -> Result<&SecretScalar> {
+        if self.pub_key != prv_key.public_point() {
             return Err(MultisigErrorKind::MismatchedKeyPair);
         }
         Ok(self.prv_key.insert(prv_key))
     }
 }
 
+/// A secret nonce of a `MuSig2` signature, kept as its bytes so that it is wiped when it is
+/// dropped. The one who learns a secret nonce and sees the partial signature that was made with
+/// it can compute the secret key share.
+#[derive(Clone)]
+struct SecretNonce(SecretBytes);
+
+impl SecretNonce {
+    fn new(sec_nonce: &SecNonce) -> Self {
+        let bytes = Zeroizing::new(sec_nonce.to_bytes());
+        Self(SecretBytes::new(&bytes[..]))
+    }
+
+    /// The nonce in the form of the signing library, for the one signature that it is made for.
+    fn expose(&self) -> SecNonce {
+        SecNonce::from_bytes(self.0.expose()).expect("the bytes come from a valid nonce")
+    }
+}
+
 #[derive(Clone)]
 struct NoncePair {
     pub_nonce: PubNonce,
-    sec_nonce: Option<SecNonce>,
+    sec_nonce: Option<SecretNonce>,
 }
 
 impl NoncePair {
-    fn new(nonce_seed: impl Into<NonceSeed>, seckey: Scalar, aggregated_pubkey: Point) -> Self {
-        let sec_nonce = SecNonceBuilder::from_seckey(nonce_seed, seckey)
+    fn new(
+        nonce_seed: impl Into<NonceSeed>,
+        seckey: &SecretScalar,
+        aggregated_pubkey: Point,
+    ) -> Self {
+        let sec_nonce = SecNonceBuilder::from_seckey(nonce_seed, seckey.expose())
             .with_aggregated_pubkey(aggregated_pubkey)
             .build();
-        Self { pub_nonce: sec_nonce.public_nonce(), sec_nonce: Some(sec_nonce) }
+        Self {
+            pub_nonce: sec_nonce.public_nonce(),
+            sec_nonce: Some(SecretNonce::new(&sec_nonce)),
+        }
     }
 }
 
@@ -65,7 +97,7 @@ pub struct KeyCtx {
 impl KeyCtx {
     /// Sets the trader's own secret key share. The wallet derives it from its seed and the trade
     /// ID, so that it can be derived again after a restart or a restore.
-    pub fn set_my_key_share(&mut self, prv_key: Scalar) -> &KeyPair {
+    pub fn set_my_key_share(&mut self, prv_key: SecretScalar) -> &KeyPair {
         self.my_key_share.insert(KeyPair::from_private(prv_key))
     }
 
@@ -98,27 +130,29 @@ impl KeyCtx {
         Ok(())
     }
 
+    /// The two secret key shares in the form of the signing library, for one computation.
     fn prv_key_shares(&self) -> Result<[Scalar; 2]> {
         let shares = self.key_shares()?;
-        Ok([*shares[0].prv_key()?, *shares[1].prv_key()?])
+        Ok([shares[0].prv_key()?.expose(), shares[1].prv_key()?.expose()])
     }
 
-    pub fn aggregate_prv_key_shares(&mut self) -> Result<&Scalar> {
+    pub fn aggregate_prv_key_shares(&mut self) -> Result<&SecretScalar> {
         let prv_key_shares = self.prv_key_shares()?;
         let agg_ctx = self.key_agg_ctx.as_ref()
             .ok_or(MultisigErrorKind::MissingAggPubKey)?;
         let agg_key = self.aggregated_key.as_mut()
             .ok_or(MultisigErrorKind::MissingAggPubKey)?;
-        agg_key.set_prv_key(agg_ctx.aggregated_seckey(prv_key_shares)?)
+        let aggregated: Scalar = agg_ctx.aggregated_seckey(prv_key_shares)?;
+        agg_key.set_prv_key(SecretScalar::new(aggregated))
     }
 
-    pub fn set_peers_prv_key(&mut self, prv_key: Scalar) -> Result<&Scalar> {
+    pub fn set_peers_prv_key(&mut self, prv_key: SecretScalar) -> Result<&SecretScalar> {
         self.peers_key_share.as_mut().ok_or(MultisigErrorKind::MissingKeyShare)?.set_prv_key(prv_key)
     }
 
     pub fn with_taproot_tweak(&self, merkle_root: Option<&TapNodeHash>) -> Result<TweakedKeyCtx> {
         let key_agg_ctx = self.compute_tweaked_key_agg_ctx(merkle_root)?;
-        let my_prv_key = *self.my_key_share()?.prv_key()?;
+        let my_prv_key = self.my_key_share()?.prv_key()?.clone();
         Ok(TweakedKeyCtx { my_prv_key, key_agg_ctx })
     }
 
@@ -135,7 +169,7 @@ impl KeyCtx {
 
 #[derive(Clone)]
 pub struct TweakedKeyCtx {
-    my_prv_key: Scalar,
+    my_prv_key: SecretScalar,
     key_agg_ctx: KeyAggContext,
 }
 
@@ -218,17 +252,20 @@ impl SigCtx {
     }
 
     pub fn init_my_nonce_share(&mut self) -> Result<()> {
-        let seckey = self.tweaked_key_ctx()?.my_prv_key;
-        let aggregated_pubkey = self.tweaked_key_ctx()?.key_agg_ctx.aggregated_pubkey();
+        let tweaked_key_ctx = self
+            .tweaked_key_ctx
+            .as_ref()
+            .ok_or(MultisigErrorKind::MissingAggPubKey)?;
+        let aggregated_pubkey = tweaked_key_ctx.key_agg_ctx.aggregated_pubkey();
         // TODO: Consider making the RNG configurable, to aid unit testing:
         self.my_nonce_pair_share.get_or_insert_with(||
-            NoncePair::new(&mut rand::rng(), seckey, aggregated_pubkey));
+            NoncePair::new(&mut rand::rng(), &tweaked_key_ctx.my_prv_key, aggregated_pubkey));
         Ok(())
     }
 
     /// Restores the public nonce share of a stored trade. The secret nonce is never stored, so
     /// a restored context cannot sign another message.
-    pub const fn restore_my_nonce_share(&mut self, pub_nonce: PubNonce) {
+    pub fn restore_my_nonce_share(&mut self, pub_nonce: PubNonce) {
         self.my_nonce_pair_share = Some(NoncePair { pub_nonce, sec_nonce: None });
     }
 
@@ -254,15 +291,23 @@ impl SigCtx {
         let tweaked_key_ctx = self.tweaked_key_ctx.as_ref()
             .ok_or(MultisigErrorKind::MissingAggPubKey)?;
         let key_agg_ctx = &tweaked_key_ctx.key_agg_ctx;
-        let seckey = tweaked_key_ctx.my_prv_key;
+        let seckey = tweaked_key_ctx.my_prv_key.expose();
         let aggregated_nonce = self.aggregated_nonce.as_ref()
             .ok_or(MultisigErrorKind::MissingAggNonce)?;
+        // The secret nonce leaves its place here and is wiped at the end of this function, so it
+        // cannot sign a second message.
         let secnonce = self.my_nonce_pair_share.as_mut()
             .ok_or(MultisigErrorKind::MissingNonceShare)?.sec_nonce.take()
             .ok_or(MultisigErrorKind::NonceReuse)?;
 
-        let sig = musig2::adaptor::sign_partial(key_agg_ctx, seckey, secnonce, aggregated_nonce,
-            self.adaptor_point, message.as_byte_array())?;
+        let sig = musig2::adaptor::sign_partial(
+            key_agg_ctx,
+            seckey,
+            secnonce.expose(),
+            aggregated_nonce,
+            self.adaptor_point,
+            message.as_byte_array(),
+        )?;
         self.message = Some(message);
         Ok(self.my_partial_sig.insert(sig))
     }
@@ -291,17 +336,22 @@ impl SigCtx {
         Ok(Signature::from_slice(&sig_bytes).expect("len = 64"))
     }
 
-    pub fn reveal_adaptor_secret(&self, signature: Signature) -> Result<Scalar> {
+    pub fn reveal_adaptor_secret(&self, signature: Signature) -> Result<SecretScalar> {
         let final_sig = LiftedSignature::from_bytes(&signature.serialize())?;
         let adaptor_sig = self.aggregated_sig()?;
         let adaptor_secret: MaybeScalar = adaptor_sig.reveal_secret(&final_sig)
             .ok_or(MultisigErrorKind::MismatchedSigs)?;
-        Ok(adaptor_secret.try_into()?)
+        let adaptor_secret: Scalar = adaptor_secret.try_into()?;
+        Ok(SecretScalar::new(adaptor_secret))
     }
 
-    pub fn sign_solo(&mut self, message: TapSighash, peers_prv_key: Scalar) -> Result<&AdaptorSignature> {
+    pub fn sign_solo(
+        &mut self,
+        message: TapSighash,
+        peers_prv_key: &SecretScalar,
+    ) -> Result<&AdaptorSignature> {
         let tweaked_key_ctx = self.tweaked_key_ctx()?;
-        let mut prv_key_shares = [tweaked_key_ctx.my_prv_key, peers_prv_key];
+        let mut prv_key_shares = [tweaked_key_ctx.my_prv_key.expose(), peers_prv_key.expose()];
         prv_key_shares.sort_by_key(Scalar::base_point_mul);
         let seckey: Scalar = tweaked_key_ctx.key_agg_ctx.aggregated_seckey(prv_key_shares)?;
 

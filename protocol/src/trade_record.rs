@@ -18,6 +18,7 @@
 use bdk_wallet::bitcoin::hex::{DisplayHex as _, FromHex as _};
 use bdk_wallet::serde_json;
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize as _, Zeroizing};
 
 use super::*;
 
@@ -88,6 +89,37 @@ struct PeerData {
     /// The secret key share of the peer, once received (message F or G, or read from the swap
     /// transaction).
     secret_key_share: Option<String>,
+}
+
+impl Drop for PeerData {
+    /// The text form of the secret key share is wiped with the record.
+    fn drop(&mut self) {
+        self.secret_key_share.zeroize();
+    }
+}
+
+/// Serialises a record into a buffer that has its final size from the start, and that is wiped
+/// when it is dropped. A buffer that grows would leave copies of its content, which can hold
+/// the secret key share of the peer, in memory that it gave back.
+fn serialize(record: &Record) -> Result<Zeroizing<Vec<u8>>> {
+    struct Counter(usize);
+
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, record).map_err(invalid)?;
+    let mut serialized = Zeroizing::new(Vec::with_capacity(counter.0));
+    serde_json::to_writer(&mut *serialized, record).map_err(invalid)?;
+    Ok(serialized)
 }
 
 /// The results of the trader's own steps that cannot be repeated.
@@ -181,8 +213,9 @@ fn stored_receiver<V: NetworkValidation>(receiver: &Receiver<V>) -> (String, u64
 
 impl TradeModel {
     /// The record of the trade for the trade store. It contains no secret key share of the
-    /// trader and no secret nonce.
-    pub fn to_record(&self) -> Result<Vec<u8>> {
+    /// trader and no secret nonce. It can contain the secret key share of the peer, so it is
+    /// wiped when it is dropped.
+    pub fn to_record(&self) -> Result<Zeroizing<Vec<u8>>> {
         let role = ROLES
             .iter()
             .find(|(role, _)| *role == self.my_role)
@@ -210,7 +243,7 @@ impl TradeModel {
                 .serialize()),
             setup: has_setup.then(|| self.setup_record()).transpose()?,
         };
-        serde_json::to_vec(&record).map_err(invalid)
+        serialize(&record)
     }
 
     fn setup_record(&self) -> Result<Setup> {
@@ -331,7 +364,7 @@ impl TradeModel {
                 .peers_key_share()?
                 .prv_key()
                 .ok()
-                .map(|key_share| hex(key_share.serialize())),
+                .map(|key_share| hex(key_share.to_bytes())),
         })
     }
 
@@ -651,10 +684,9 @@ impl TradeModel {
             self.received.custom_payout_request = Some((amount, fee_rate));
         }
         if let Some(key_share) = &setup.peer.secret_key_share {
-            let key_share = decode(
-                &bytes(key_share, "secret key share")?,
-                "secret key share of the peer",
-            )?;
+            let key_share = Zeroizing::new(bytes(key_share, "secret key share")?);
+            let key_share = SecretScalar::from_slice(&key_share)
+                .map_err(|error| invalid(format!("secret key share of the peer: {error}")))?;
             self.keys.my_payout_ctx_mut().set_peers_prv_key(key_share)?;
             let fee_rate = setup.params.penalty_tx_fee_rate;
             self.sign_penalty_tx(fee_rate.map(FeeRate::from_sat_per_kwu))?;

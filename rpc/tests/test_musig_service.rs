@@ -3321,7 +3321,7 @@ async fn g10_wrong_key_share_at_close() {
         // valid key share.
         for (wrong_key_share, reason) in [
             (random_scalar(), mismatch),
-            (vec![0; 32], "could not decode nonzero scalar"),
+            (vec![0; 32], "could not decode secret key share"),
         ] {
             let mut trade = Trade::at(trade_type, Stage::SellerReleased).await;
             let result = trade

@@ -13,6 +13,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 wallet = { workspace = true }
+zeroize = { workspace = true }
 
 [features]
 # Mock wallets with fixed keys and signatures, for the tests of this crate and of other crates.

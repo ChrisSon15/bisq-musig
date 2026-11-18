@@ -431,7 +431,7 @@ impl BMPWalletPersister for Connection {
 
             for key in keys {
                 statement.execute(named_params! {
-                    ":key": key.secret().serialize().to_lower_hex_string(),
+                    ":key": *Zeroizing::new(key.secret().to_bytes().to_lower_hex_string()),
                     ":descriptor": key.descriptor().to_string(),
                 })?;
             }
@@ -546,12 +546,17 @@ pub(crate) fn store_trade_record(
 }
 
 /// All trade records, in the order of their trade IDs.
-pub(crate) fn load_trade_records(db: &Connection) -> rusqlite::Result<Vec<(String, Vec<u8>)>> {
+pub(crate) fn load_trade_records(
+    db: &Connection,
+) -> rusqlite::Result<Vec<(String, Zeroizing<Vec<u8>>)>> {
     create_trade_records_table(db)?;
     let mut statement = db.prepare(&format!(
         "SELECT trade_id, record FROM {TRADE_RECORDS_TABLE_NAME} ORDER BY trade_id"
     ))?;
     statement
-        .query_map([], |row| Ok((row.get("trade_id")?, row.get("record")?)))?
+        .query_map([], |row| {
+            let record: Vec<u8> = row.get("record")?;
+            Ok((row.get("trade_id")?, Zeroizing::new(record)))
+        })?
         .collect()
 }

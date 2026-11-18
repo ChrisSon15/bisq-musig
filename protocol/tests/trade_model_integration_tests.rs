@@ -34,6 +34,7 @@ use tokio::runtime::Runtime;
 use wallet::bmp_wallet::{BMPWallet, WalletApi as _};
 use wallet::password::Password;
 use wallet::protocol_wallet_api::ProtocolWalletApi;
+use wallet::secret::SecretScalar;
 
 const TRADE_AMOUNT: Amount = Amount::from_sat(5_000_000);
 const BUYERS_SECURITY_DEPOSIT: Amount = Amount::from_sat(1_000_000);
@@ -512,13 +513,21 @@ impl Trade {
     /// Runs the cooperative close: messages E, F and G.
     fn close_cooperatively(&mut self) -> anyhow::Result<()> {
         self.start_payment_and_release()?;
-        let sellers_key_share = *self.seller.model.my_private_key_share_for_peer_output()?;
+        let sellers_key_share = self
+            .seller
+            .model
+            .my_private_key_share_for_peer_output()?
+            .clone();
         self.buyer.model.close_with_key_share(
             &mut self.buyer.wallet,
             Ok(sellers_key_share),
             None,
         )?;
-        let buyers_key_share = *self.buyer.model.my_private_key_share_for_peer_output()?;
+        let buyers_key_share = self
+            .buyer
+            .model
+            .my_private_key_share_for_peer_output()?
+            .clone();
         self.seller.model.close_with_key_share(
             &mut self.seller.wallet,
             Ok(buyers_key_share),
@@ -532,7 +541,7 @@ impl Trade {
 
     /// The buyer starts the payment (message E) and the seller confirms it. Returns the seller's
     /// key share of message F.
-    fn start_payment_and_release(&mut self) -> anyhow::Result<Scalar> {
+    fn start_payment_and_release(&mut self) -> anyhow::Result<SecretScalar> {
         self.confirm_deposit()?;
         self.buyer.model.start_payment()?;
         let swap_tx_signature = *self
@@ -1271,7 +1280,7 @@ fn imported_payout_key_matches_deposit_payout_descriptor() {
     let trade_wallet: &mut dyn ProtocolWalletApi = &mut w;
     trade_wallet
         .import_private_key(
-            agg_secret,
+            agg_secret.into(),
             Some(deposit_payout_tap_tree(buyer_pub_key, seller_pub_key).unwrap()),
         )
         .unwrap();

@@ -25,7 +25,6 @@ use bdk_wallet::{
     Update, Utxo, Wallet, WeightedUtxo,
 };
 use rand::RngCore as _;
-use secp::Scalar;
 use zeroize::Zeroizing;
 
 use crate::chain_data_source::ChainDataSource;
@@ -38,6 +37,7 @@ use crate::protocol_wallet_api::{
     ProtocolWalletApi, WalletExt, finish_standard_psbt, internal_key_at_index, seconds_since_epoch,
     sign_selected_inputs_with,
 };
+use crate::secret::SecretScalar;
 use crate::utils::{derive_key_from_password, key_verifier};
 use crate::wallet_info::{PubAddressInfo, TxInfo, TxInputInfo, TxOutputInfo, UtxoInfo};
 /// An external (non-HD) private key imported into the wallet, together with the Taproot output
@@ -50,18 +50,22 @@ use crate::wallet_info::{PubAddressInfo, TxInfo, TxInputInfo, TxOutputInfo, Utxo
 /// to recognise and tweak-sign the output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportedKey {
-    secret: Scalar,
+    secret: SecretScalar,
     descriptor: Tr<XOnlyPublicKey>,
 }
 
 impl ImportedKey {
-    pub fn new(secret: Scalar, tap_tree: Option<TapTree<XOnlyPublicKey>>) -> Result<Self> {
+    pub fn new(
+        secret: impl Into<SecretScalar>,
+        tap_tree: Option<TapTree<XOnlyPublicKey>>,
+    ) -> Result<Self> {
+        let secret = secret.into();
         let descriptor = Tr::new(Self::internal_key_of(&secret), tap_tree)?;
         Ok(Self { secret, descriptor })
     }
 
     /// Rebuild from the persisted `tr(..)` descriptor string; checks that it belongs to `secret`.
-    pub(crate) fn from_descriptor_str(secret: Scalar, descriptor: &str) -> Result<Self> {
+    pub(crate) fn from_descriptor_str(secret: SecretScalar, descriptor: &str) -> Result<Self> {
         let descriptor: Tr<XOnlyPublicKey> = descriptor.parse()?;
         if *descriptor.internal_key() != Self::internal_key_of(&secret) {
             return Err(WalletErrorKind::MismatchedDescriptor);
@@ -69,13 +73,15 @@ impl ImportedKey {
         Ok(Self { secret, descriptor })
     }
 
-    fn internal_key_of(secret: &Scalar) -> XOnlyPublicKey {
-        XOnlyPublicKey::from_slice(&secret.base_point_mul().serialize_xonly())
+    fn internal_key_of(secret: &SecretScalar) -> XOnlyPublicKey {
+        XOnlyPublicKey::from_slice(&secret.public_point().serialize_xonly())
             .expect("Should be valid xonly pubkey")
     }
 
-    pub const fn secret(&self) -> Scalar {
-        self.secret
+    /// The secret key. It stays in memory as long as the wallet is open, because the wallet
+    /// signs with it, and it is wiped when the key is dropped.
+    pub const fn secret(&self) -> &SecretScalar {
+        &self.secret
     }
 
     pub fn internal_key(&self) -> XOnlyPublicKey {
@@ -264,10 +270,10 @@ impl BMPWallet {
     /// key-path-only `tr(P)` output. After importing, a rescan should be triggered.
     pub fn import_private_key(
         &mut self,
-        pk: Scalar,
+        pk: impl Into<SecretScalar>,
         tap_tree: Option<TapTree<XOnlyPublicKey>>,
     ) -> Result<()> {
-        self.import_key(pk, tap_tree, None)
+        self.import_key(pk.into(), tap_tree, None)
     }
 
     /// Imports a key like [`Self::import_private_key`], for a key that has no confirmed output
@@ -279,16 +285,16 @@ impl BMPWallet {
     /// that any of the wallets knows.
     pub fn import_private_key_since(
         &mut self,
-        pk: Scalar,
+        pk: impl Into<SecretScalar>,
         tap_tree: Option<TapTree<XOnlyPublicKey>>,
         start_height: u32,
     ) -> Result<()> {
-        self.import_key(pk, tap_tree, Some(start_height))
+        self.import_key(pk.into(), tap_tree, Some(start_height))
     }
 
     fn import_key(
         &mut self,
-        pk: Scalar,
+        pk: SecretScalar,
         tap_tree: Option<TapTree<XOnlyPublicKey>>,
         start_height: Option<u32>,
     ) -> Result<()> {
@@ -927,7 +933,12 @@ impl BMPWallet {
         for (key_hex, descriptor) in
             Connection::load_imported_key_rows(&mut db, Self::IMPORTED_KEYS_TABLE_NAME)?
         {
-            let secret = Scalar::from_hex(&key_hex).map_err(WalletErrorKind::generic)?;
+            let key_hex = Zeroizing::new(key_hex);
+            let key_bytes = Zeroizing::new(
+                <Vec<u8> as bdk_wallet::bitcoin::hex::FromHex>::from_hex(&key_hex)
+                    .map_err(WalletErrorKind::generic)?,
+            );
+            let secret = SecretScalar::from_slice(&key_bytes).map_err(WalletErrorKind::generic)?;
             let key = ImportedKey::from_descriptor_str(secret, &descriptor)?;
             Self::insert_imported_key(&mut imported_keys, key)?;
         }
@@ -1002,7 +1013,7 @@ impl ProtocolWalletApi for BMPWallet {
 
     fn import_private_key(
         &mut self,
-        pk: Scalar,
+        pk: SecretScalar,
         tap_tree: Option<TapTree<XOnlyPublicKey>>,
     ) -> Result<()> {
         self.import_private_key(pk, tap_tree)
@@ -1010,7 +1021,7 @@ impl ProtocolWalletApi for BMPWallet {
 
     fn import_private_key_since(
         &mut self,
-        pk: Scalar,
+        pk: SecretScalar,
         tap_tree: Option<TapTree<XOnlyPublicKey>>,
         start_height: u32,
     ) -> Result<()> {
@@ -1042,8 +1053,10 @@ impl ProtocolWalletApi for BMPWallet {
     fn trade_key_shares(&self, trade_id: &str) -> Result<TradeKeyShares> {
         let mnemonic = Self::load_mnemonic(&self.db)?;
         let seed = Zeroizing::new(mnemonic.to_seed(""));
-        let master_key = Xpriv::new_master(self.network(), &seed[..])?;
-        derive_trade_key_shares(&master_key, trade_id)
+        let mut master_key = Xpriv::new_master(self.network(), &seed[..])?;
+        let key_shares = derive_trade_key_shares(&master_key, trade_id);
+        master_key.private_key.non_secure_erase();
+        key_shares
     }
 
     fn store_trade_record(&mut self, trade_id: &str, record: &[u8]) -> Result<()> {
@@ -1053,7 +1066,7 @@ impl ProtocolWalletApi for BMPWallet {
         )?)
     }
 
-    fn trade_records(&mut self) -> Result<Vec<(String, Vec<u8>)>> {
+    fn trade_records(&mut self) -> Result<Vec<(String, Zeroizing<Vec<u8>>)>> {
         Ok(crate::persisted::load_trade_records(&self.db)?)
     }
 
@@ -1261,7 +1274,7 @@ impl WalletApi for BMPWallet {
                 input.tap_internal_key = Some(signing_key.internal_key());
                 input.tap_merkle_root = signing_key.merkle_root();
                 let signer =
-                    PrivateKey::from_slice(&signing_key.secret().serialize(), self.network())
+                    PrivateKey::from_slice(&signing_key.secret().to_bytes()[..], self.network())
                         .map_err(|_e| SignerError::External("Invalid signing key".to_owned()))?;
 
                 let sw = SignerWrapper::new(

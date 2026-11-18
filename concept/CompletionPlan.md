@@ -772,16 +772,15 @@ Not done:
 - No way exists to leave the condition "a record cannot be loaded" except a copy of the wallet
   database from before the damage (open point O17 of the specification).
 - A stored drain transaction is not sent again at the next start (N5). Done in WP4.
-- Secrets in memory are not zeroised, except the ones that the wallet wiped before: the seed
-  words, the seed and the passwords. Examined on 2026-11-18, and no code was added, for this
-  reason: the libraries for the keys and nonces of a trade (`secp` 0.7.0, `musig2` 0.4.1) offer
-  no way to wipe a secret, and their scalar type is copied freely, also inside the libraries.
-  The wallet library keeps the signing keys of the seed in memory from the first signature to
-  the end of the process. A key share, the peer's secret key share and the seed keys therefore
-  stay in the memory of the process while the wallet is open, whatever the engine wipes. Wiping
-  the buffers that the engine owns (the serialised trade record) would not remove one secret
-  from the process. What would change this: key and nonce types with wiping in these libraries
-  or in a wrapper of our own, and a wallet that loads the signing keys only for a signature.
+- Secrets in memory: done on 2026-11-18 by decision of the project owner ("secrets should be
+  wiped, using zeroize or similar; create an own type"). The types `SecretScalar` and
+  `SecretBytes` (`wallet/src/secret.rs`) hold key shares, keys of payouts and secret nonces. They
+  wipe their memory when they are dropped, are not copied implicitly and hide their content in
+  debug output. The engine, the wallet (key shares, imported keys) and the service use them, and
+  the serialised trade record is wiped. Not wiped, because the libraries give no way: the plain
+  values that `secp` 0.7.0 and `musig2` 0.4.1 copy during a computation, the signing keys that
+  the wallet library keeps loaded, the buffers of the gRPC library, and the page cache of the
+  database. The specification lists these limits.
 - The stop inside a request (H3, H4) is tested with real processes, at a moment that the test
   does not control: one run covers one moment per request. No test stops the process at each
   named point of a request, for example between the storing and the response.

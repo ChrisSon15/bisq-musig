@@ -7,11 +7,12 @@
 use bdk_wallet::bitcoin::NetworkKind;
 use bdk_wallet::bitcoin::bip32::{ChildNumber, Xpriv};
 use bdk_wallet::bitcoin::hashes::{Hash as _, HashEngine as _, sha256};
-use secp::{MaybeScalar, Scalar};
+use secp::MaybeScalar;
 use zeroize::Zeroizing;
 
 use crate::error::{Result, WalletErrorKind};
 use crate::protocol_wallet_api::LIBSECP256K1_CTX;
+use crate::secret::SecretScalar;
 
 /// The tag of the tagged hash that gives a key share.
 const TAG: &[u8] = b"BisqMuSig/key-share";
@@ -27,12 +28,12 @@ const TRADE_ROOT_CHILD: u32 = 2;
 ///
 /// The shares do not depend on the role of the trader: a buyer and a seller with the same seed
 /// and the same trade ID get the same two shares.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TradeKeyShares {
     /// The trader's share of the key of the buyer's payout.
-    pub buyer_payout: Scalar,
+    pub buyer_payout: SecretScalar,
     /// The trader's share of the key of the seller's payout.
-    pub seller_payout: Scalar,
+    pub seller_payout: SecretScalar,
 }
 
 /// Derives the key shares of the trade `trade_id` from the master key of the wallet.
@@ -46,8 +47,9 @@ pub fn derive_trade_key_shares(master_key: &Xpriv, trade_id: &str) -> Result<Tra
     };
     let path = [86, coin_type, 0, TRADE_ROOT_CHILD]
         .map(|index| ChildNumber::from_hardened_idx(index).expect("index is below 2^31"));
-    let trade_root = master_key.derive_priv(&*LIBSECP256K1_CTX, &path)?;
+    let mut trade_root = master_key.derive_priv(&*LIBSECP256K1_CTX, &path)?;
     let trade_root_secret = Zeroizing::new(trade_root.private_key.secret_bytes());
+    trade_root.private_key.non_secure_erase();
 
     let trade_id_length = u32::try_from(trade_id.len())
         .map_err(|_| WalletErrorKind::InvalidTradeId("it is too long"))?;
@@ -62,7 +64,7 @@ pub fn derive_trade_key_shares(master_key: &Xpriv, trade_id: &str) -> Result<Tra
         engine.input(&[label]);
         let hash = Zeroizing::new(sha256::Hash::from_engine(engine).to_byte_array());
         match MaybeScalar::reduce_from(&hash) {
-            MaybeScalar::Valid(key_share) => Ok(key_share),
+            MaybeScalar::Valid(key_share) => Ok(SecretScalar::new(key_share)),
             // The probability of this case is about 2^-256.
             MaybeScalar::Zero => Err(WalletErrorKind::InvalidTradeId(
                 "it gives a key share of zero",
@@ -93,10 +95,10 @@ mod tests {
         Xpriv::new_master(network, &seed).expect("valid seed")
     }
 
-    fn hex(key_share: Scalar) -> (String, String) {
+    fn hex(key_share: &SecretScalar) -> (String, String) {
         (
-            key_share.serialize().to_lower_hex_string(),
-            key_share.base_point_mul().serialize().to_lower_hex_string(),
+            key_share.to_bytes().to_lower_hex_string(),
+            key_share.public_point().serialize().to_lower_hex_string(),
         )
     }
 
@@ -158,9 +160,9 @@ mod tests {
     fn assert_vectors(master_key: &Xpriv, vectors: &[Vector]) {
         for (trade_id, buyer_payout, seller_payout) in vectors {
             let key_shares = derive_trade_key_shares(master_key, trade_id).expect("valid");
-            let (secret, public) = hex(key_shares.buyer_payout);
+            let (secret, public) = hex(&key_shares.buyer_payout);
             assert_eq!([secret.as_str(), public.as_str()], *buyer_payout);
-            let (secret, public) = hex(key_shares.seller_payout);
+            let (secret, public) = hex(&key_shares.seller_payout);
             assert_eq!([secret.as_str(), public.as_str()], *seller_payout);
         }
     }

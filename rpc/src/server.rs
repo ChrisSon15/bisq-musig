@@ -13,7 +13,6 @@ use chain::client::{ChainAccess, ClientError, PeerProblem};
 use drop_stream::DropStreamExt as _;
 use futures_util::stream::{self, BoxStream, Stream, StreamExt as _, TryStream, TryStreamExt as _};
 use musig2::PartialSignature;
-use musig2::secp::Scalar;
 use protocol::chain_facts::{
     ChainFacts, DeadlineKind, TradeEvent as EngineEvent, TxKind, TxToSend, UserAction,
 };
@@ -30,6 +29,8 @@ use tokio::sync::{Notify, broadcast};
 use tonic::{Request, Response, Result, Status};
 use tracing::{Span, debug, error, info, instrument, trace, warn};
 use wallet::protocol_wallet_api::ProtocolWalletApi;
+use wallet::secret::SecretScalar;
+use zeroize::Zeroizing;
 
 use crate::pb::convert::{CheckInSignedRange as _, TryProtoInto};
 pub use crate::pb::musigrpc::musig_server::MusigServer;
@@ -476,7 +477,7 @@ impl musig_server::Musig for MusigImpl {
                 let prv_key_share = trade_model.release_payout()?;
 
                 Ok(SwapTxSignatureResponse {
-                    peer_output_prv_key_share: Some(prv_key_share.serialize().into()),
+                    peer_output_prv_key_share: Some(prv_key_share.to_bytes().to_vec()),
                 })
             } else {
                 let signature: PeerData<PartialSignature> = request
@@ -504,8 +505,10 @@ impl musig_server::Musig for MusigImpl {
                 .map(FeeRate::from_sat_per_kwu);
             if let Some(peer_prv_key_share) = request.my_output_peers_prv_key_share {
                 // Trader receives the private key share from a cooperative peer, closing our trade.
-                let peer_prv_key_share: PeerData<Scalar> =
-                    peer_prv_key_share.try_proto_into().peer_data();
+                // The bytes of the request are wiped when this block ends.
+                let peer_prv_key_share = Zeroizing::new(peer_prv_key_share);
+                let peer_prv_key_share: PeerData<SecretScalar> =
+                    (&peer_prv_key_share[..]).try_proto_into().peer_data();
                 trade_model.close_with_key_share(
                     wallet,
                     peer_prv_key_share,
@@ -533,7 +536,7 @@ impl musig_server::Musig for MusigImpl {
                 .filter(|_| swap_tx.is_none());
 
             Ok(CloseTradeResponse {
-                peer_output_prv_key_share: my_prv_key_share.map(|s| s.serialize().into()),
+                peer_output_prv_key_share: my_prv_key_share.map(|s| s.to_bytes().to_vec()),
                 swap_tx: swap_tx.map(consensus::serialize),
                 penalty_tx: penalty_tx.map(consensus::serialize),
             })

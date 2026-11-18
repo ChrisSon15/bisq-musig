@@ -17,11 +17,12 @@ use bdk_wallet::bitcoin::{
     Address, Amount, FeeRate, Network, OutPoint, Psbt, ScriptBuf, TapSighash, TapSighashType,
     Transaction, Txid, XOnlyPublicKey, taproot,
 };
-use musig2::secp::{MaybeScalar, Point, Scalar};
+use musig2::secp::{MaybeScalar, Point};
 use musig2::{PartialSignature, PubNonce};
 use thiserror::Error;
 use tracing::{error, info, instrument};
 use wallet::protocol_wallet_api::ProtocolWalletApi;
+use wallet::secret::SecretScalar;
 
 use crate::chain_facts::{
     ChainFacts, ConfirmedTradeTx, Deadline, DeadlineKind, Spend, TradeEvent, TradeStatus, TxKind,
@@ -906,7 +907,7 @@ impl TradeModel {
     }
 
     /// The seller confirms the payment. Returns his secret key share for the buyer's payout.
-    pub fn release_payout(&mut self) -> Result<Scalar> {
+    pub fn release_payout(&mut self) -> Result<SecretScalar> {
         self.atomically(|trade| {
             trade.require_seller()?;
             match trade.state() {
@@ -934,7 +935,12 @@ impl TradeModel {
                 | TradeState::TradeClosed(ClosureType::Cooperative) => {}
                 state => return Err(ProtocolErrorKind::NotAllowedInState(state).into()),
             }
-            Ok(*trade.keys.peers_payout_ctx().my_key_share()?.prv_key()?)
+            Ok(trade
+                .keys
+                .peers_payout_ctx()
+                .my_key_share()?
+                .prv_key()?
+                .clone())
         })
     }
 
@@ -943,7 +949,7 @@ impl TradeModel {
     pub fn close_with_key_share(
         &mut self,
         wallet: &mut dyn ProtocolWalletApi,
-        peers_key_share: PeerData<Scalar>,
+        peers_key_share: PeerData<SecretScalar>,
         penalty_tx_fee_rate: Option<FeeRate>,
     ) -> Result<()> {
         self.atomically(|trade| {
@@ -960,7 +966,7 @@ impl TradeModel {
             let peers_pub_key_share = *trade.keys.my_payout_ctx().peers_key_share()?.pub_key();
             if closed_before {
                 // The request was processed before.
-                if peers_key_share.base_point_mul() != peers_pub_key_share {
+                if peers_key_share.public_point() != peers_pub_key_share {
                     return Err(peer_misbehaved(format!(
                         "the secret key share of the peer differs from the one that it sent \
                          before; it does not match the public key share {peers_pub_key_share}"
@@ -1197,7 +1203,12 @@ impl TradeModel {
     /// Imports the complete key of the trader's payout into the wallet, with the script of the
     /// payout output, so that the wallet shows and can spend the payout.
     fn import_my_payout_key(&self, wallet: &mut dyn ProtocolWalletApi) -> Result<()> {
-        let payout_key = *self.keys.my_payout_ctx().aggregated_key()?.prv_key()?;
+        let payout_key = self
+            .keys
+            .my_payout_ctx()
+            .aggregated_key()?
+            .prv_key()?
+            .clone();
         let [buyer_script_key, seller_script_key] = self.keys.multisig_script_keys()?;
         let tap_tree = script_paths::deposit_payout_tap_tree(buyer_script_key, seller_script_key)?;
         // The deposit transaction cannot be confirmed at or below the height at which the trader
@@ -2249,7 +2260,7 @@ impl TradeModel {
             .collect())
     }
 
-    pub fn my_private_key_share_for_peer_output(&self) -> Result<&Scalar> {
+    pub fn my_private_key_share_for_peer_output(&self) -> Result<&SecretScalar> {
         access!(self, SellerReadyToRelease | TradeClosed(Cooperative))?;
         Ok(self.keys.peers_payout_ctx().my_key_share()?.prv_key()?)
     }
@@ -2314,12 +2325,13 @@ impl TradeModel {
             &claim_key_share.pub_key().to_public_key().into(),
             config.claim_lock_time(),
         )?;
-        let secret_key = SecretKey::from_slice(&claim_key_share.prv_key()?.serialize())
+        let mut secret_key = SecretKey::from_slice(&claim_key_share.prv_key()?.to_bytes()[..])
             .expect("a scalar is a valid secret key");
         let secp = Secp256k1::new();
-        let keypair = Keypair::from_secret_key(&secp, &secret_key);
+        let mut keypair = Keypair::from_secret_key(&secp, &secret_key);
+        secret_key.non_secure_erase();
         let my_txs = self.my_txs();
-        Ok(build_claim_tx(
+        let claim_tx = build_claim_tx(
             &my_txs.warning.builder.escrow()?,
             my_txs.payout_address()?,
             config.claim_lock_time(),
@@ -2337,7 +2349,9 @@ impl TradeModel {
                     sighash_type: TapSighashType::Default,
                 })
             },
-        )?)
+        );
+        keypair.non_secure_erase();
+        Ok(claim_tx?)
     }
 }
 
@@ -2903,7 +2917,7 @@ impl TradeModel {
     }
 
     fn compute_signed_swap_tx(&mut self) -> Result<()> {
-        let adaptor_secret = (*self.keys.adaptor_key_share()?.prv_key()?).into();
+        let adaptor_secret = self.keys.adaptor_key_share()?.prv_key()?.expose().into();
         self.swap_tx
             .builder
             .set_input_signature(
@@ -2949,7 +2963,7 @@ impl TradeModel {
         self.keys.my_payout_ctx_mut().aggregate_prv_key_shares()?;
         self.penalty_tx.input_sig_ctx.sign_solo(
             self.penalty_tx.builder.input_sighash()?,
-            *self.keys.my_payout_ctx().peers_key_share()?.prv_key()?,
+            self.keys.my_payout_ctx().peers_key_share()?.prv_key()?,
         )?;
         self.penalty_tx
             .builder
@@ -3448,7 +3462,7 @@ mod tests {
     }
 
     fn random_partial_signature() -> PartialSignature {
-        Scalar::random(&mut rand::rng()).into()
+        musig2::secp::Scalar::random(&mut rand::rng()).into()
     }
 
     /// Checks that the request terminated the trade, with a reason that contains `reason`, and

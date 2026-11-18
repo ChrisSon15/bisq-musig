@@ -146,9 +146,40 @@ also after a restart. The set of used trade IDs is part of the backup.
 ## Secrets
 
 - Secret key shares, the seed and passwords are never written to a log, at any log level.
-- Secrets in memory are erased when they are no longer needed, as far as the libraries allow it.
+- Secrets in memory are erased when they are no longer needed. The rules are in the section
+  "Secrets in memory".
 - The store contains the peer's secret key share after a close. Together with the seed this is
   the key of a payout. The store must therefore be encrypted.
+
+## Secrets in memory
+
+The secrets of a trade are: the trader's own secret key shares, the secret key share of the peer,
+the secret key of a payout, and the secret nonces of the signatures.
+
+- A secret that the engine or the wallet keeps beyond one computation is kept in a type that
+  overwrites its memory with zeros when the value is dropped.
+- Such a value is not copied without a visible copy in the code, and its debug output does not
+  show the secret.
+- A secret nonce is removed from its place when it signs, and is wiped after this one signature.
+- The serialised form of a trade record, which contains the secret key share of the peer after a
+  close, is wiped when it is dropped. Its buffer has its final size from the start, so that no
+  earlier, smaller buffer with a part of the record stays behind.
+- The seed words, the seed and the passwords are wiped by the wallet.
+
+Limits. These copies of a secret are not wiped:
+
+- the form that a cryptographic library needs for a computation. It is a plain value that the
+  library copies. The engine creates it for one computation and does not keep it;
+- the signing keys of the seed, which the wallet library keeps from the first signature to the
+  end of the process;
+- the messages of the service interface that carry a key share (the release and the close), in
+  the buffers of the gRPC library. These messages cross the loopback interface without
+  encryption ([service-interface.md](service-interface.md), security assumptions);
+- the page cache of the database.
+
+Rationale: a secret that stays in memory after its use can be read from a memory dump, from the
+swap space, or by another defect of the process. Wiping does not protect against an attacker who
+reads the memory of the running process while a trade is open: the secrets are needed then.
 
 ## Backup and restore
 

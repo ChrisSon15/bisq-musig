@@ -15,10 +15,11 @@ use bdk_wallet::bitcoin::{
     absolute, psbt,
 };
 use bdk_wallet::miniscript::descriptor::TapTree;
-use musig2::secp::Scalar;
 use wallet::error::WalletErrorKind;
 use wallet::key_shares::{TradeKeyShares, derive_trade_key_shares};
 use wallet::protocol_wallet_api::ProtocolWalletApi;
+use wallet::secret::SecretScalar;
+use zeroize::Zeroizing;
 
 use crate::psbt::Redact as _;
 use crate::transaction::{TransactionErrorKind, TxOutput};
@@ -198,7 +199,7 @@ impl<Cs: Iterator<Item = TxOutput>, As: Iterator<Item = Address>> ProtocolWallet
 
     fn import_private_key(
         &mut self,
-        _pk: Scalar,
+        _pk: SecretScalar,
         _tap_tree: Option<TapTree<XOnlyPublicKey>>,
     ) -> Result<(), WalletErrorKind> {
         // The mock holds no coins of imported keys, so the key is only accepted.
@@ -230,8 +231,12 @@ impl<Cs: Iterator<Item = TxOutput>, As: Iterator<Item = Address>> ProtocolWallet
         Ok(())
     }
 
-    fn trade_records(&mut self) -> wallet::error::Result<Vec<(String, Vec<u8>)>> {
-        Ok(self.trade_records.clone().into_iter().collect())
+    fn trade_records(&mut self) -> wallet::error::Result<Vec<(String, Zeroizing<Vec<u8>>)>> {
+        Ok(self
+            .trade_records
+            .iter()
+            .map(|(trade_id, record)| (trade_id.clone(), Zeroizing::new(record.clone())))
+            .collect())
     }
 
     fn lock_utxo(&mut self, utxo: OutPoint) -> wallet::error::Result<()> {

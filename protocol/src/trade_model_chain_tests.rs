@@ -109,7 +109,7 @@ fn assert_chain_condition<T: std::fmt::Debug>(result: &Result<T>, part_of_reason
 }
 
 /// Messages E and F: the buyer starts the payment, the seller takes the signature and releases.
-pub(super) fn start_payment_and_release(buyer: &mut Trader, seller: &mut Trader) -> Scalar {
+pub(super) fn start_payment_and_release(buyer: &mut Trader, seller: &mut Trader) -> SecretScalar {
     buyer.model.start_payment().expect("payment starts");
     let signature = *buyer
         .model
@@ -131,10 +131,11 @@ pub(super) fn close_cooperatively(buyer: &mut Trader, seller: &mut Trader) {
         .model
         .close_with_key_share(&mut *buyer.wallet, Ok(sellers_key_share), None)
         .expect("buyer closes");
-    let buyers_key_share = *buyer
+    let buyers_key_share = buyer
         .model
         .my_private_key_share_for_peer_output()
-        .expect("message G");
+        .expect("message G")
+        .clone();
     seller
         .model
         .close_with_key_share(&mut *seller.wallet, Ok(buyers_key_share), None)

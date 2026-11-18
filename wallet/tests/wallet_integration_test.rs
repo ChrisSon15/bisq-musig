@@ -20,6 +20,7 @@ use wallet::password::Password;
 use wallet::persisted::DBStorage;
 use wallet::protocol_wallet_api::ProtocolWalletApi as _;
 use wallet::utils::derive_key_from_password;
+use zeroize::Zeroizing;
 
 /// A password that follows the wallet's password rules, for tests that need some password.
 const TEST_PASSWORD: &str = "Test-Passw0rd";
@@ -1056,8 +1057,11 @@ fn trade_records_are_stored_in_the_wallet_database() -> anyhow::Result<()> {
     wallet.store_trade_record("trade-a", b"other trade")?;
     wallet.store_trade_record("trade-b", b"second")?;
     let expected = vec![
-        ("trade-a".to_owned(), b"other trade".to_vec()),
-        ("trade-b".to_owned(), b"second".to_vec()),
+        (
+            "trade-a".to_owned(),
+            Zeroizing::new(b"other trade".to_vec()),
+        ),
+        ("trade-b".to_owned(), Zeroizing::new(b"second".to_vec())),
     ];
     assert_eq!(wallet.trade_records()?, expected);
     // A new wallet knows the first block of the chain only.

@@ -8,6 +8,7 @@ pub mod key_shares;
 pub mod password;
 pub mod persisted;
 pub mod protocol_wallet_api;
+pub mod secret;
 #[cfg(test)]
 pub mod test_utils;
 pub mod wallet_info;
@@ -323,7 +324,7 @@ mod tests {
         let wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
         let key_shares = wallet.trade_key_shares("trade-1")?;
         let key_share_keys = [key_shares.buyer_payout, key_shares.seller_payout]
-            .map(|key_share| derive_public_key(&key_share));
+            .map(|key_share| derive_public_key(&key_share.expose()));
 
         let secp = Secp256k1::new();
         for keychain in [KeychainKind::External, KeychainKind::Internal] {
@@ -734,7 +735,7 @@ mod tests {
 
         let loaded_keys = loaded_wallet.imported_keys();
         let loaded = &loaded_keys[0];
-        assert_eq!(loaded.secret(), pk);
+        assert_eq!(loaded.secret().expose(), pk);
         assert_eq!(loaded.internal_key(), derive_public_key(&pk));
         assert_eq!(loaded.tap_tree(), Some(&tap_tree));
         assert_eq!(loaded.merkle_root(), Some(merkle_root));

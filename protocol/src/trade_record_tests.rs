@@ -24,8 +24,8 @@ fn restart(trader: &Trader) -> Trader {
     let model = TradeModel::from_record(&record, &*wallet).expect("the record can be loaded");
     // The record of the loaded trade is the record that was stored.
     assert_eq!(
-        String::from_utf8(model.to_record().expect("record")).unwrap(),
-        String::from_utf8(record).unwrap()
+        String::from_utf8(model.to_record().expect("record").to_vec()).unwrap(),
+        String::from_utf8(record.to_vec()).unwrap()
     );
     assert_eq!(model.state(), trader.model.state);
     Trader { model, wallet }
@@ -37,7 +37,7 @@ fn restart_both(buyer: &mut Trader, seller: &mut Trader) {
 }
 
 fn record_text(trader: &Trader) -> String {
-    String::from_utf8(trader.model.to_record().expect("record")).expect("JSON text")
+    String::from_utf8(trader.model.to_record().expect("record").to_vec()).expect("JSON text")
 }
 
 /// H2: both traders restart after every step of a cooperative close. The trade ends as without
@@ -86,7 +86,7 @@ fn h2_restart_in_every_state_of_a_cooperative_close() {
         restart_both(&mut buyer, &mut seller);
         observe_both(&mut buyer, &mut seller, &facts(3, &[]));
         assert_eq!(buyer.model.state(), closed(ClosureType::Cooperative));
-        let buyers_key_share = *buyer.model.my_private_key_share_for_peer_output().unwrap();
+        let buyers_key_share = buyer.model.my_private_key_share_for_peer_output().unwrap().clone();
         seller
             .model
             .close_with_key_share(&mut *seller.wallet, Ok(buyers_key_share), None)
@@ -258,7 +258,7 @@ fn h7_record_holds_no_own_secret() {
                 .unwrap()
                 .prv_key()
                 .unwrap()
-                .serialize()
+                .to_bytes()
                 .to_lower_hex_string()
         })
     };
@@ -279,6 +279,31 @@ fn h7_record_holds_no_own_secret() {
     // The buyer's record holds the seller's key share of the buyer's payout.
     let sellers_secret = own_secrets(&seller)[0].clone();
     assert!(record_text(&buyer).contains(&sellers_secret));
+}
+
+/// The buffer of a record has its final size when it is created. A buffer that grows would
+/// leave copies of the record, which holds the secret key share of the peer after a close, in
+/// memory that is not wiped.
+#[test]
+fn record_buffer_does_not_grow() {
+    let (mut buyer, mut seller) = trade(BUYER_SELLER_ROLES[0]);
+    observe_both(&mut buyer, &mut seller, &facts(3, &[]));
+    close_cooperatively(&mut buyer, &mut seller);
+    for trader in [&buyer, &seller] {
+        let record = trader.model.to_record().expect("record");
+        assert_eq!(record.capacity(), record.len());
+        let peers_key_share = trader
+            .model
+            .keys
+            .my_payout_ctx()
+            .peers_key_share()
+            .unwrap()
+            .prv_key()
+            .expect("received at the close")
+            .to_bytes()
+            .to_lower_hex_string();
+        assert!(record_text(trader).contains(&peers_key_share));
+    }
 }
 
 /// H13: a trade that was loaded from its record cannot sign with a nonce of the setup again. The

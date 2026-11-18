@@ -12,11 +12,12 @@ use bdk_wallet::miniscript::ToPublicKey as _;
 use bdk_wallet::miniscript::descriptor::TapTree;
 use bdk_wallet::miniscript::psbt::PsbtExt as _;
 use bdk_wallet::{KeychainKind, SignOptions, TxBuilder, TxOrdering, Wallet};
-use secp::Scalar;
+use zeroize::Zeroizing;
 
 use crate::error::WalletErrorKind::MalformedPsbt;
 use crate::error::{Result, WalletErrorKind};
 use crate::key_shares::TradeKeyShares;
+use crate::secret::SecretScalar;
 
 /// The Protocol Wallet API is used by the protocol to create and sign transactions.
 /// It's the part of functionality being exposed only to the protocol.
@@ -56,7 +57,7 @@ pub trait ProtocolWalletApi {
     /// key-path-only `tr(P)` output. After importing, a rescan should be triggered.
     fn import_private_key(
         &mut self,
-        pk: Scalar,
+        pk: SecretScalar,
         tap_tree: Option<TapTree<XOnlyPublicKey>>,
     ) -> Result<()>;
 
@@ -68,7 +69,7 @@ pub trait ProtocolWalletApi {
     /// separately for an imported key.
     fn import_private_key_since(
         &mut self,
-        pk: Scalar,
+        pk: SecretScalar,
         tap_tree: Option<TapTree<XOnlyPublicKey>>,
         start_height: u32,
     ) -> Result<()> {
@@ -106,7 +107,7 @@ pub trait ProtocolWalletApi {
     ///
     /// The wallet does not look into a record. The trade engine writes and reads it. A record
     /// can contain the secret key share of the peer, so the wallet stores it encrypted, like its
-    /// own keys. A record is never deleted: the IDs of all trades of a wallet stay known, so that
+    /// own keys, and the caller wipes its buffer. A record is never deleted: the IDs of all trades of a wallet stay known, so that
     /// no trade ID is used twice.
     ///
     /// The default implementation fits a wallet without storage and returns an error.
@@ -117,8 +118,9 @@ pub trait ProtocolWalletApi {
         ))
     }
 
-    /// All trade records of the wallet, with the IDs of their trades.
-    fn trade_records(&mut self) -> Result<Vec<(String, Vec<u8>)>> {
+    /// All trade records of the wallet, with the IDs of their trades. A record is wiped when
+    /// it is dropped.
+    fn trade_records(&mut self) -> Result<Vec<(String, Zeroizing<Vec<u8>>)>> {
         Ok(Vec::new())
     }
 
@@ -210,7 +212,7 @@ impl ProtocolWalletApi for Wallet {
 
     fn import_private_key(
         &mut self,
-        _pk: Scalar,
+        _pk: SecretScalar,
         _tap_tree: Option<TapTree<XOnlyPublicKey>>,
     ) -> Result<()> {
         Err(WalletErrorKind::Unsupported(
