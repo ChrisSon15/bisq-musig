@@ -47,7 +47,7 @@ mod tests {
     use crate::key_shares::derive_trade_key_shares;
     use crate::password::Password;
     use crate::persisted::{BMPWalletPersister as _, DBStorage};
-    use crate::protocol_wallet_api::ProtocolWalletApi as _;
+    use crate::protocol_wallet_api::ProtocolWalletApi;
     use crate::test_utils::{
         MemDbHandle, MockedBDKElectrum, MockedBDKElectrumWithCoinbase,
         MockedBDKElectrumWithEvictedSpend, MockedBDKElectrumWithPending,
@@ -345,6 +345,51 @@ mod tests {
                 assert!(!key_share_keys.contains(&output_key.to_x_only_public_key()));
             }
         }
+        Ok(())
+    }
+
+    /// I1 (F12): 100 trades in sequence from one wallet. No address and no internal key is issued
+    /// twice, also not as a receive address of the user, and also not after the wallet was closed
+    /// and loaded.
+    #[test]
+    fn i1_trade_keys_are_never_issued_twice() -> anyhow::Result<()> {
+        use std::collections::BTreeSet;
+
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(
+            mem_storage.store.clone(),
+            &test_password(),
+            Network::Regtest,
+        )?;
+        let secp = Secp256k1::new();
+        let mut trade_keys = BTreeSet::new();
+        let mut user_keys = BTreeSet::new();
+        // A trade takes one script key and four addresses from the wallet.
+        let mut run_trades = |wallet: &mut BMPWallet, count| -> anyhow::Result<()> {
+            for _ in 0..count {
+                let script_key = ProtocolWalletApi::new_internal_key(wallet)?;
+                let (output_key, _) = script_key.tap_tweak(&secp, None);
+                assert!(trade_keys.insert(Address::p2tr_tweaked(output_key, Network::Regtest)));
+                for _ in 0..4 {
+                    assert!(trade_keys.insert(ProtocolWalletApi::new_address(wallet)?));
+                }
+                // The user asks for receive addresses in between. After 50 unused addresses the
+                // wallet offers unused addresses again, but never one of a trade.
+                for _ in 0..2 {
+                    user_keys.insert(wallet.get_new_address()?.address);
+                }
+            }
+            Ok(())
+        };
+        run_trades(&mut wallet, 50)?;
+        drop(wallet);
+
+        let mut wallet =
+            BMPWallet::load_wallet(mem_storage.store, Network::Regtest, &test_password())?;
+        run_trades(&mut wallet, 50)?;
+
+        assert_eq!(trade_keys.len(), 500);
+        assert!(trade_keys.is_disjoint(&user_keys));
         Ok(())
     }
 

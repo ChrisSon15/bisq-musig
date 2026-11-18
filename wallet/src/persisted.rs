@@ -309,6 +309,12 @@ pub trait BMPWalletPersister: WalletPersister {
     fn has_seed_phrase(db: &Self::DB, seeds_table_name: &str) -> Result<bool>;
 
     fn persist_staged_changes(db: &mut Self::DB, cs: &ChangeSet) -> Result<()>;
+
+    /// Records that the key at `index` of the external keychain was issued to a trade.
+    fn persist_trade_key_index(db: &mut Self::DB, table_name: &str, index: u32) -> Result<()>;
+
+    /// The indexes of the external keychain whose keys were issued to trades.
+    fn load_trade_key_indexes(db: &mut Self::DB, table_name: &str) -> Result<Vec<u32>>;
 }
 
 impl BMPWalletPersister for Connection {
@@ -431,4 +437,34 @@ impl BMPWalletPersister for Connection {
         let mut stmt = db.prepare(&format!("SELECT 1 FROM {seeds_table_name}"))?;
         Ok(stmt.exists([])?)
     }
+
+    fn persist_trade_key_index(db: &mut Self::DB, table_name: &str, index: u32) -> Result<()> {
+        create_trade_keys_table(db, table_name)?;
+        db.execute(
+            &format!("INSERT OR IGNORE INTO {table_name} (keychain_index) VALUES (:index)"),
+            named_params! { ":index": index },
+        )?;
+        Ok(())
+    }
+
+    fn load_trade_key_indexes(db: &mut Self::DB, table_name: &str) -> Result<Vec<u32>> {
+        create_trade_keys_table(db, table_name)?;
+        let mut statement = db.prepare(&format!(
+            "SELECT keychain_index FROM {table_name} ORDER BY keychain_index"
+        ))?;
+        let indexes = statement
+            .query_map([], |row| row.get::<_, u32>("keychain_index"))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(indexes)
+    }
+}
+
+/// The table of the trade keys is created on first use, so that a wallet database that was
+/// created before the table existed can be used without a migration step.
+fn create_trade_keys_table(db: &Connection, table_name: &str) -> rusqlite::Result<()> {
+    db.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS {table_name} ( \
+            keychain_index INTEGER PRIMARY KEY NOT NULL
+        ) STRICT"
+    ))
 }

@@ -227,6 +227,25 @@ impl BMPWallet {
         Ok(addr)
     }
 
+    /// Reveals a new address of the external keychain for a trade.
+    ///
+    /// A key that was issued to a trade is never issued again, neither to another trade nor as
+    /// a receive address of the user: every pre-signed transaction of the trade pays to it or
+    /// uses it in a script, and the transactions stay valid after the trade. The index is stored
+    /// before the address leaves the wallet, and the key counts as used from then on, so
+    /// [`Self::next_address`] does not return it.
+    fn new_trade_address(&mut self) -> Result<AddressInfo> {
+        let address = self.wallet.reveal_next_address(KeychainKind::External);
+        Connection::persist_trade_key_index(
+            &mut self.db,
+            Self::TRADE_KEYS_TABLE_NAME,
+            address.index,
+        )?;
+        self.wallet.mark_used(KeychainKind::External, address.index);
+        self.persist()?;
+        Ok(address)
+    }
+
     /// Import an external private key (i.e. one not derived from the HD wallet) controlling a
     /// `tr(P, tap_tree)` output, `P` being the untweaked internal key of `pk`. `None` means a
     /// key-path-only `tr(P)` output. After importing, a rescan should be triggered.
@@ -766,6 +785,13 @@ impl BMPWallet {
         let imported_wallets =
             Self::load_imported_wallets(imported_keys.values(), &storage, network)?;
 
+        // BDK does not store which keys are marked as used, so the keys that were issued to
+        // trades are marked again.
+        let mut wallet = wallet;
+        for index in Connection::load_trade_key_indexes(&mut db, Self::TRADE_KEYS_TABLE_NAME)? {
+            wallet.mark_used(KeychainKind::External, index);
+        }
+
         Ok(Self {
             wallet,
             imported_keys,
@@ -791,13 +817,11 @@ impl ProtocolWalletApi for BMPWallet {
     }
 
     fn new_address(&mut self) -> Result<Address> {
-        Ok(self.next_address(KeychainKind::External)?.address)
+        Ok(self.new_trade_address()?.address)
     }
 
     fn new_internal_key(&mut self) -> Result<XOnlyPublicKey> {
-        // Use `next_address` (gap-filling) rather than `reveal_next_address` directly so
-        // that the internal key's index stays in step with what `new_address` would yield.
-        let index = self.next_address(KeychainKind::External)?.index;
+        let index = self.new_trade_address()?.index;
         internal_key_at_index(self, index)
     }
 
@@ -867,6 +891,7 @@ pub trait WalletApi {
     const DB_NAME: &str;
     const SEEDS_TABLE_NAME: &'static str;
     const IMPORTED_KEYS_TABLE_NAME: &'static str;
+    const TRADE_KEYS_TABLE_NAME: &'static str;
 
     /// Creates a fresh wallet in `storage`, protected by `password`.
     fn new(storage: DBStorage, password: &Password, network: Network) -> Result<Self>
@@ -904,6 +929,7 @@ pub trait WalletApi {
 impl WalletApi for BMPWallet {
     const SEEDS_TABLE_NAME: &'static str = "bmp_seeds";
     const IMPORTED_KEYS_TABLE_NAME: &'static str = "bmp_imported_keys";
+    const TRADE_KEYS_TABLE_NAME: &'static str = "bmp_trade_keys";
     const DB_NAME: &str = "bmp_bdk_wallet.db3";
 
     async fn sync_all(&mut self, s: &(impl ChainDataSource + Sync)) -> Result<()> {
