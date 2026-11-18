@@ -85,8 +85,9 @@ confirmed. The text of the files contains the rule of the column "Rule in the sp
 | O8 | When does the seller's engine publish the swap transaction on its own (D7)? | When the number of blocks before the buyer's warning becomes valid falls to the release safety margin. The caller can ask for it earlier. | [closing.md](closing.md) |
 | O9 | Values of the fee schedule: blocks between two steps, size of a step, upper limit | No values are specified. | [fees.md](fees.md) |
 | O10 | Size limits of message fields and lists | No values are specified. | [parameters.md](parameters.md) |
-| O11 | gRPC status codes and error details for the error cases | Five cases are specified, without codes. | [service-interface.md](service-interface.md) |
+| O11 | gRPC status codes and error details for the error cases | Five cases are specified. The status codes in the file are the ones that the service uses until the decision. | [service-interface.md](service-interface.md) |
 | O12 | Sanity limits of the engine for the deposit fee rate and the prepared fee rate | Not specified. | [fees.md](fees.md) |
+| O13 | Which request carries the trade parameters? The first version of this specification named the request that creates the trade (step 1). | Step 2 (`GetNonceShares`), which already carries the amounts and fee rates in the existing messages. Nothing in step 1 depends on the parameters. | [parameters.md](parameters.md), [setup-and-deposit.md](setup-and-deposit.md) |
 
 Points that were open and are decided:
 
@@ -103,5 +104,5 @@ Points that were open and are decided:
 - the state change from `SellerReadyToRelease` to `BuyersWarning` for the seller. Without it the
   seller's engine has no state for a buyer who publishes his warning transaction after the
   seller released;
-- the terminated mark. The engine has it as a field of the trade, set only by the check of the
-  peer's nonces so far.
+- the terminated mark. The engine has it as a field of the trade, with the reason. It is not
+  stored on disk yet, like the rest of the trade.

@@ -37,7 +37,7 @@ trade before the request.
 | Request | Role | State | Meaning | Defined in |
 |---|---|---|---|---|
 | `InitTrade` | Both | No trade with this ID | Creates the trade. Returns the own public key shares and script key. | [setup-and-deposit.md](setup-and-deposit.md), step 1 |
-| `GetNonceShares` | Both | `Init` | Takes the peer's key shares. Returns the own half of the deposit, addresses and nonces, and the amount to distribute to the redirection receivers. | Step 2 |
+| `GetNonceShares` | Both | `Init` | Takes the peer's key shares and the trade parameters. Returns the own half of the deposit, addresses and nonces, and the amount to distribute to the redirection receivers. | Step 2 |
 | `GetPartialSignatures` | Both | `Init` | Takes the peer's half of the deposit, addresses and nonces, and the redirection receivers. Returns the own partial signatures and the transaction IDs. | Step 3 |
 | `SignDepositTx` | Both | `Init` | Takes the peer's partial signatures. Signs the own deposit inputs. | Step 4 |
 | `PublishDepositTx` | Both | `Deposit` | Takes the deposit with the peer's signatures. Publishes it. Returns the events of the deposit. | Step 5 |
@@ -65,11 +65,28 @@ Requests that the interface needs in addition:
 
 Changes of existing messages that this specification requires:
 
-- The trade parameters, including the lock times, are part of the request that creates the trade
-  ([parameters.md](parameters.md)).
+- The lock times are added to the request of step 2 (`GetNonceShares`), which already contains
+  the other trade parameters ([parameters.md](parameters.md)). A request without lock times is
+  refused, because the value 0 is outside the limits. Which request carries the trade parameters
+  is open point O13 in [README.md](README.md).
 - The nonces and the partial signature of the claim transactions are removed
   ([transactions.md](transactions.md)). The payout address of each trader stays.
 - The block height in responses is the height of the chain as the engine sees it.
+
+## Wallet of the trade service
+
+The trade service uses the wallet of the wallet service of the same `musigd` process. It has no
+wallet of its own.
+
+- A request that needs the wallet is refused while no wallet is open. The trade is not changed,
+  and the request can be sent again when the wallet is open.
+- These requests need the wallet: `InitTrade`, `GetNonceShares`, `SignDepositTx`,
+  `SignCustomPayoutTx`, `CustomCloseTrade`.
+- A `musigd` process that was started without a wallet directory cannot start a trade.
+
+Rationale: the deposit is paid from the coins of the user, and every key and address of a trade
+comes from the wallet of the user. A second wallet for trades, or test data in place of a wallet,
+would allow a trade that the user cannot fund or cannot spend from.
 
 ## Processing of a request
 
@@ -101,7 +118,18 @@ A request never leaves the caller without a statement about the state of the tra
 error the state is the state before the request, except that the trade can be terminated.
 
 The assignment of these cases to gRPC status codes and error details is open point O11 in
-[README.md](README.md).
+[README.md](README.md). Until it is decided, the service uses these status codes, and the message
+of the status describes the reason:
+
+| Case | Status code |
+|---|---|
+| Refused: a precondition does not hold (role, state, order) | `FAILED_PRECONDITION` |
+| Refused: data of the caller is invalid (trade parameters, redirection receivers, a field that cannot be decoded) | `INVALID_ARGUMENT`; `OUT_OF_RANGE` for a number above its range; `NOT_FOUND` for a missing part of a request |
+| Terminated | `ABORTED`. The message starts with "trade was terminated" and contains the reason. |
+| Unknown trade | `NOT_FOUND` |
+| Known trade ID in `InitTrade` | `ALREADY_EXISTS` |
+| Temporary: no wallet is open | `FAILED_PRECONDITION` |
+| Internal | `INTERNAL` |
 
 ## Events and responses
 

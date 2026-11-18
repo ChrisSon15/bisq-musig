@@ -6,10 +6,10 @@ Status: plan only, no code was changed. Revision 2, written 2026-11-17 against `
 Revision 3 (same day) includes the answers to the open questions of revision 2. The questions and
 answers are kept in section 12 for a later review.
 
-The file and line references were updated on 2026-11-18 to the code after the first steps of WP1:
-`TradeModel` is now in `protocol/src/trade_model.rs`, `walletrpc.Wallet` and `mem` are removed,
-F2 and F4 are fixed. Only the references were updated. The text of the plan still describes the
-state of revision 3.
+WP1 was carried out on 2026-11-18 (branches `wp1-first-steps`, `wp1-move-trade-model`,
+`wp1-finish`). Its result is described in section 8 under WP1. The file and line references of
+the plan point to the code after WP1. The other text of the plan still describes the state of
+revision 3; sections 2 and 4.3 and the findings name what WP1 changed.
 
 The decisions D17 and D18 and the tests G13 to G15 were added on 2026-11-18.
 
@@ -58,7 +58,8 @@ The persistent wallet (`BMPWallet`) and its gRPC service are real and tested.
 
 The parts around the core are not connected yet. The main gaps are:
 
-1. **Two protocol implementations exist.** `BMPProtocol` in the `protocol` crate is the older one.
+1. **Two protocol implementations exist.** (Resolved by WP1: `BMPProtocol` is removed, and the
+   engine uses the wallet of the daemon.) `BMPProtocol` in the `protocol` crate is the older one.
    It works with real wallets in tests, but it has regtest values hard-coded and no state machine.
    `TradeModel` in `protocol/src/trade_model.rs` is the newer one that bisq2 uses. It has the state machine
    and the newer transaction design, but it runs on mock wallets.
@@ -153,8 +154,8 @@ key share of each.
 Both payout outputs also contain a 2-of-2 script leaf with one wallet key of each trader. Only the
 custom payout uses it.
 
-How the warning escrow is built today (`protocol/src/trade_model.rs:358-363`, `:897-903`,
-`protocol/src/script_paths.rs:80-89`):
+How the warning escrow is built today (`set_warning_escrow_keys` in
+`protocol/src/trade_model.rs:1285-1342`, `protocol/src/script_paths.rs:18-49`):
 
 - The escrow of the buyer's warning has `Q'` as internal key. Its only script leaf is
   `<buyer's key share of P'> CHECKSIGVERIFY <claim lock time> CSV`.
@@ -181,13 +182,18 @@ How the warning escrow is built today (`protocol/src/trade_model.rs:358-363`, `:
 D1: `TradeModel` becomes the single engine. `BMPProtocol` is removed after its integration tests
 are ported.
 
+Done in WP1. The table shows the state before WP1; the files and lines of its `BMPProtocol` column
+no longer exist. After WP1 the engine takes the wallet as a parameter of its operations, the lock
+times are trade parameters, and the mock wallets are behind the feature `test-utils`. The engine
+still does not broadcast (F3).
+
 | Topic | `BMPProtocol` (`protocol/src/protocol_musig_adaptor.rs`) | `TradeModel` (`protocol/src/trade_model.rs`) |
 |---|---|---|
 | Interface | Five rounds, `bmp_protocol.proto`, served only by a test daemon | Ten RPCs in `rpc.proto` (`musigrpc.Musig`), used by bisq2 |
-| Wallet | Real (`BMPWallet` or `MemWallet`) | Mock wallets from `protocol::mocks` (`protocol/src/trade_model.rs:206`) |
-| Broadcast | Yes, through `ChainApi` | No (`rpc/src/server.rs:148`, `:213`, `:259`) |
+| Wallet | Real (`BMPWallet` or `MemWallet`) | Mock wallets from `protocol::mocks` |
+| Broadcast | Yes, through `ChainApi` | No (`rpc/src/server.rs:280`, `:356`, `:417`) |
 | Network | `Network::Regtest` hard-coded in 9 places | Taken from the wallet |
-| Lock times | Warning 0, redirect 1, claim 2 blocks (`:385`, `:447`, `:569`) | `NetworkParams` (`protocol/src/transaction.rs:41`) |
+| Lock times | Warning 0, redirect 1, claim 2 blocks (`:385`, `:447`, `:569`) | `NetworkParams` in `protocol/src/transaction.rs` |
 | Fee rates | 10 and 20 sat/vB hard-coded | Supplied by Java per trade |
 | Warning escrow | Key spend only | Key spend plus CSV claim script leaf |
 | Swap signing by buyer | Buyer builds the swap transaction | Buyer signs the sighash only (blind) |
@@ -225,17 +231,17 @@ with a running test.
 
 | # | Finding | Evidence | Impact |
 |---|---|---|---|
-| F1 | Trade state exists only in memory. | `protocol/src/trade_model.rs:52`, FIXME at `:245` | After the deposit confirms, a restart removes every unilateral exit for that trader. Confirmed. |
-| F2 | `InitTrade` with an existing trade id replaces the stored trade. | Was `rpc/src/protocol.rs:34`. Fixed in WP1: `add_trade_model` rejects a stored trade id (`protocol/src/trade_model.rs:37`). | A repeated or hostile local call destroys the key shares of a running trade. With D10 a repeated trade id would also produce the same key shares again (N6). Confirmed. |
-| F3 | No transaction is broadcast and no confirmation is observed. | `rpc/src/server.rs:46`, `:148`, `:161`, `:213`, `:259`, `:276` | The service cannot run a real trade. Confirmed. |
-| F4 | The dispute outcomes cannot be reached. | The `todo!()` was at `rpc/src/protocol.rs:795`. Replaced by an error in WP1 (`protocol/src/trade_model.rs:815`). No RPC publishes a warning. | Half of the state machine is unused. A `todo!()` panic also poisons the trade mutex, so later calls for this trade panic too (`rpc/src/server.rs:400`). Confirmed. |
-| F5 | The payout key is checked but not imported into the wallet at close. | TODO at `protocol/src/trade_model.rs:797` | After a cooperative close the user cannot spend the payout. Confirmed. |
-| F6 | The seller can release near or after the buyer's warning lock time. | Comment at `protocol/src/trade_model.rs:779` | The buyer's warning transaction can replace the swap transaction. The seller then has no penalty transaction and can only redirect. Confirmed as a design gap. |
-| F7 | Private key shares are written to the log at debug and trace level. | `rpc/build.rs:37`, `:53`, `:56` serialise them as base64; `rpc/src/server.rs:412-420` logs requests and responses | Secrets on disk when verbose logging is on. `BMPProtocol` also logs a private key at `protocol/src/protocol_musig_adaptor.rs:208`. Confirmed. |
-| F8 | No authentication or TLS on the gRPC port. | `rpc/src/bin/musigd.rs:78-118` | Any local process can call `SignSwapTx` or `CloseTrade` for a known trade id, or use the wallet service. Confirmed. D11 accepts this risk; see section 7.2, N7. |
-| F9 | The engine does not check chain conditions before it releases secrets. | `set_buyer_ready_to_release`, `set_seller_ready_to_release` in `protocol/src/trade_model.rs:772-788` | Rust trusts Java that the deposit is confirmed. The component that holds the secrets should enforce this rule. Confirmed. D6 defines the rule: 3 confirmations. |
-| F10 | The claim script leaf of the warning escrow is never used or tested on chain. | `protocol/src/script_paths.rs:19`, `protocol/src/trade_model.rs:358` | With D3 this leaf becomes the only claim path, so it must be implemented and tested on chain (WP4, tests E3, E4, E11). Confirmed. |
-| F11 | Mock wallets are part of the production build. | `protocol/src/lib.rs:1` (`pub mod mocks`) | Fixed keys and signatures are reachable from production code. Confirmed. |
+| F1 | Trade state exists only in memory. | `MemoryTradeStore` in `protocol/src/trade_model.rs:48`, FIXME at `:478` | After the deposit confirms, a restart removes every unilateral exit for that trader. Confirmed. |
+| F2 | `InitTrade` with an existing trade id replaces the stored trade. | Was `rpc/src/protocol.rs:34`. Fixed in WP1: `add_trade_model` rejects a stored trade id (`protocol/src/trade_model.rs:55`). | A repeated or hostile local call destroys the key shares of a running trade. With D10 a repeated trade id would also produce the same key shares again (N6). Confirmed. |
+| F3 | No transaction is broadcast and no confirmation is observed. | `rpc/src/server.rs:146`, `:280`, `:299`, `:356`, `:417`, `:434` | The service cannot run a real trade. Confirmed. |
+| F4 | The dispute outcomes cannot be reached. | The `todo!()` was at `rpc/src/protocol.rs:795`. Replaced by an error in WP1 (`protocol/src/trade_model.rs:1783`). No RPC publishes a warning. | Half of the state machine is unused. A `todo!()` panic also poisons the trade mutex, so later calls for this trade panic too (`rpc/src/server.rs:121`). Confirmed. |
+| F5 | The payout key is checked but not imported into the wallet at close. | TODO at `protocol/src/trade_model.rs:1765` | After a cooperative close the user cannot spend the payout. Confirmed. |
+| F6 | The seller can release near or after the buyer's warning lock time. | Comment at `protocol/src/trade_model.rs:758-762` | The buyer's warning transaction can replace the swap transaction. The seller then has no penalty transaction and can only redirect. Confirmed as a design gap. |
+| F7 | Private key shares are written to the log at debug and trace level. | `rpc/build.rs:37`, `:53`, `:56` serialise them as base64; `rpc/src/server.rs:591-623` logs requests and responses | Secrets on disk when verbose logging is on. `BMPProtocol` also logged a private key; it was removed in WP1. Confirmed. |
+| F8 | No authentication or TLS on the gRPC port. | `rpc/src/bin/musigd.rs:80-132` | Any local process can call `SignSwapTx` or `CloseTrade` for a known trade id, or use the wallet service. Confirmed. D11 accepts this risk; see section 7.2, N7. |
+| F9 | The engine does not check chain conditions before it releases secrets. | `start_payment`, `receive_swap_tx_signature`, `release_payout` in `protocol/src/trade_model.rs:709-777` | Rust trusts Java that the deposit is confirmed. The component that holds the secrets should enforce this rule. Confirmed. D6 defines the rule: 3 confirmations. |
+| F10 | The claim script leaf of the warning escrow is never used or tested on chain. | `protocol/src/script_paths.rs:18`, `protocol/src/trade_model.rs:1285` | With D3 this leaf becomes the only claim path, so it must be implemented and tested on chain (WP4, tests E3, E4, E11). Confirmed. |
+| F11 | Mock wallets are part of the production build. | Was `protocol/src/lib.rs:1` (`pub mod mocks`). Fixed in WP1: the module is behind the feature `test-utils`, and `musigd` uses the wallet of the wallet service. | Fixed keys and signatures are reachable from production code. Confirmed. |
 
 ### 6.2 Wallet and chain
 
@@ -252,7 +258,7 @@ with a running test.
 | F20 | No fee bumping: no CPFP for anchors, no replace-by-fee. | No code; upstream issue #187 | A pre-signed transaction with a low fee cannot be accelerated. |
 | F21 | No code watches a transaction id or an outpoint. | No code; upstream issue #61 | Required for every reaction of the protocol. |
 | F22 | `CBFScanner::from_hostnames` panics on malformed input. | `chain/src/lib.rs:113`, `:116` | Start-up crash on a configuration error. Upstream issue #193. Confirmed. |
-| F27 | `musigd` broadcasts wallet transactions through Bitcoin Core RPC. | `BitcoinCoreChainApi` in `rpc/src/bmp_wallet_service.rs:498-512`, used in `rpc/src/bin/musigd.rs:87` | D2 forbids this path. Broadcast must move to the peer-to-peer network (`submit_package` of the `bip157` client). After that and D16, `musigd` needs no Bitcoin Core RPC options. Confirmed. |
+| F27 | `musigd` broadcasts wallet transactions through Bitcoin Core RPC. | `BitcoinCoreChainApi` in `rpc/src/bmp_wallet_service.rs:512-526`, used in `rpc/src/bin/musigd.rs:86` | D2 forbids this path. Broadcast must move to the peer-to-peer network (`submit_package` of the `bip157` client). After that and D16, `musigd` needs no Bitcoin Core RPC options. Confirmed. |
 | F28 | Every wallet sync builds a new CBF client and stops it after the first update. | `sync_cbf` in `chain/src/lib.rs:160-184` | Nothing observes the chain between two syncs, and each sync opens new peer connections. The engine needs one long-running client that the wallet sync shares. Confirmed. |
 
 ### 6.3 Tests and CI
@@ -260,7 +266,7 @@ with a running test.
 | # | Finding | Evidence |
 |---|---|---|
 | F23 | The `musigrpc.Musig` service has no Rust test. Its only driver is a Java `main` program without assertions. | `rpc/tests/`; `rpc/src/main/java/bisq/TradeProtocolClient.java` |
-| F24 | The protocol integration tests do not check results. They publish transactions but do not check balances, states or confirmations. `test_swap` passes the swap transaction directly instead of reading it from the chain. | `protocol/tests/protocol_integration_tests.rs:150-281` |
+| F24 | The protocol integration tests do not check results. They publish transactions but do not check balances, states or confirmations. `test_swap` passes the swap transaction directly instead of reading it from the chain. | Was `protocol/tests/protocol_integration_tests.rs:150-281`. Fixed in WP1 for the ported scenarios: `protocol/tests/trade_model_integration_tests.rs` checks confirmations, amounts and states, and the buyer reads the swap transaction from the block. Balances of the wallets are not checked yet. |
 | F25 | CI starts only for changes in `wallet/**` or `protocol/**`. A change in `rpc`, `chain` or `testenv` alone is not built or tested. | `.github/workflows/cont_integration.yml:22-26` |
 | F26 | No formatting check, no dependency audit, no Java tests in CI. One Rust test is ignored as broken. | Workflow file. The ignored test was `rpc/tests/test_wallet_service.rs:12`; the file was removed in WP1 with the test wallet (D16). |
 
@@ -276,7 +282,7 @@ The decisions D1 to D16 were taken by the project owner on 2026-11-17, D17 and D
 | D2 | How does the engine observe the chain? | Compact block filters over the peer-to-peer network only. No direct use of Bitcoin Core RPC. Reason: privacy. | One implementation of the chain interface. The engine sees confirmed transactions only. Broadcast goes to peers and returns no acceptance result. `musigd` loses its Bitcoin Core options (F27). The tests still start bitcoind, as the peer that the client connects to and for assertions. Points N1 to N4. |
 | D3 | Claim by pre-signed transaction or by script? | By script spend. | The claim transaction leaves the set of pre-signed transactions: two signing sessions and three protobuf fields less. The claimer builds and signs it alone, with a current fee rate, and can replace it with a higher fee. The escrow output does not change (section 4.1). |
 | D4 | Redirect lock time of 1 block? | Yes. | Constant of the protocol, not a trade parameter. A redirect can be sent when the warning has 1 confirmation. |
-| D5 | Final lock times; values per payment method? | Explicit trade parameters that both peers agree on and that are part of the contract. `NetworkParams for Network` is removed. | Java passes the parameters at trade start. The engine checks limits and that both peers use the same values. Tests can use any value. The values per payment method are still open (N9). |
+| D5 | Final lock times; values per payment method? | Explicit trade parameters that both peers agree on and that are part of the contract. `NetworkParams for Network` is removed. | Java passes the parameters at trade start: since WP1 with `GetNonceShares` (open point O13 of the specification). The engine checks limits and that both peers use the same values. Tests can use any value. The values per payment method are still open (N9). |
 | D6 | Confirmations before the payment may start? | A constant with the value 3. | `MIN_CONFIRMATIONS = 3` in the `protocol` crate. The engine refuses to sign the swap transaction and to release a key share below this depth (F9). The handling of reorganisations is specified in WP0 (N8). |
 | D7 | Who starts time-critical reactions? | The engine, automatically, while `musigd` runs. `musigd` runs only while bisq2 runs (section 12, answer 7). | Penalty, redirect after the peer's warning, claim, and the swap transaction before the warning lock time are started by the engine. Java receives events and decides only where the protocol allows a choice. |
 | D8 | Protection after the trade is closed. | `musigd` keeps watching closed trades. When the wallet closes, all imported coins are moved to the seed wallet with `drain_imported_balance`. "The wallet closes" means: Java calls a new method `close` of `BmpWalletService` when the user ends the program (section 12, answer 1). Spending imported coins first stays mandatory. | Watching in WP4. A new `close` method and a `Close` RPC that build, sign, store and send the drain transaction (WP2, WP4, WP7). F15 stays as it is. Point N5. |
@@ -382,12 +388,30 @@ Done when: every state transition and every chain event has a specified reaction
 Done when: one engine exists, the ported tests pass with `BMPWallet`, no production path uses a
 mock wallet, and the workspace contains neither `walletrpc` nor `mem`.
 
+Status on 2026-11-18: done, with these differences to the list above.
+
+- The engine has no chain interface yet. No operation of the engine uses the chain before WP3,
+  so the parameter is added there, together with the first use (broadcast of the deposit).
+  The ported tests send the transactions to the node themselves.
+- The trade parameters arrive with `GetNonceShares`, not with `InitTrade`. `rpc.proto` got the
+  fields `warningLockTime` and `claimLockTime`. bisq2 must send them (WP7).
+- `musigd` uses the wallet of the wallet service for trades. A trade needs `--wallet-dir` and an
+  open, funded wallet. The development flow of bisq2 with mock data no longer works.
+- The values of `EngineConfig` (deposit timeout 144 blocks, release safety margin 6 blocks) are
+  placeholders until N9 is decided, and `musigd` has no option for them yet.
+- The confirmation depth (D6) and the release safety margin (F6) are constants and configuration
+  values now, but nothing enforces them before the engine sees the chain (WP3, WP4).
+- The signatures of the peer in a custom payout PSBT are not verified yet. A PSBT without valid
+  signatures is refused, not treated as proof of a modified client (TODO in
+  `finalize_custom_payout`).
+- `TradeProtocolClient.java` was changed to talk to two daemons. It was compiled, not run.
+
 ### WP2 Wallet integration for trades (estimate: 3 to 4 weeks; issues #59, #185, #186, #187, #202, #229, #230, #232)
 
 - One shared `BMPWallet` in `musigd` for the wallet service and the trade engine (#185).
 - Key shares from the seed (D10): a method on `ProtocolWalletApi` that returns the key shares for
   a trade id, following `key-derivation.md`. The seed does not leave the `wallet` crate. The
-  random key share in `protocol/src/multisig.rs:71` is removed; nonce generation stays random.
+  random key share in `protocol/src/multisig.rs:73` is removed; nonce generation stays random.
 - Reserve the deposit inputs when the half PSBT is created. Release them when the trade is
   abandoned. Record the deposit transaction in the wallet at broadcast (F13, F14).
 - Never issue a trade key or trade address twice (F12). Persist what was issued.
@@ -461,8 +485,8 @@ any Bitcoin Core RPC connection.
   `sellersClaimTxInputNonceShare` and `peersClaimTxInputPartialSignature` from `rpc.proto`. Build
   the claim transaction at claim time: script path witness, own key share as signing key, input
   sequence equal to the claim lock time, current fee rate. `claimTxPayoutAddress` stays, because
-  the penalty transaction and the custom payout use this address (`protocol/src/trade_model.rs:393`,
-  `:833`). The protobuf change should reach bisq2 together with the changes of WP7.
+  the penalty transaction and the custom payout use this address (`protocol/src/trade_model.rs:1364`,
+  `:1794`). The protobuf change should reach bisq2 together with the changes of WP7.
 - The engine enforces chain preconditions before it releases a signature or a key share (F9, D6).
 - Protection after close (D8): watch closed trades while a payout is unspent; penalty when the
   peer publishes a warning. New method `close` on `BmpWalletService`
@@ -481,7 +505,7 @@ roles, and the claim confirms through the script path.
 ### WP5 Persistence and recovery (estimate: 3 to 4 weeks)
 
 - Durable, encrypted trade store. Rule: the new state is on disk before any signature, key share
-  or signed transaction leaves the engine. The comment at `protocol/src/trade_model.rs:688` already
+  or signed transaction leaves the engine. The comment at `protocol/src/trade_model.rs:1688` already
   demands this for the deposit.
 - Stored per trade: trade id, peer data, parameters, pre-signed transactions, adaptor signature,
   the peer's key share after close, state, reserved outpoints, sent transactions, drain
@@ -551,11 +575,11 @@ The fixed fee rate (N1) is a placeholder; the work for the real source is not in
 
 | Area | Tests | Limits |
 |---|---|---|
-| Builders, PSBT merge, scripts, state model, shuffle | 25 unit tests in `protocol/src` | No tests for malformed input from the peer |
-| Protocol with real chain | 10 tests in `protocol/tests/protocol_integration_tests.rs` | 9 of them use `BMPProtocol`; no assertions on balances or state; lock times of 0 to 2 blocks |
+| Builders, PSBT merge, scripts, state model, shuffle, engine operations | 44 unit tests in `protocol/src` (25 before WP1) | No tests for malformed input from the peer |
+| Protocol with real chain | 8 tests in `protocol/tests/trade_model_integration_tests.rs` (since WP1; before: 10 tests of `BMPProtocol` without assertions on results) | The tests broadcast and mine themselves, because the engine has no chain access; no assertions on wallet balances; no reorganisation |
 | Wallet | About 60 unit tests and 16 integration tests, including 4 tests of `drain_imported_balance` | No reorganisation, no replaced transaction, no fee bumping, no trade use |
 | `wallet.Wallet` gRPC | Rust and Java tests | Not related to trades |
-| `musigrpc.Musig` gRPC | None in Rust; a Java `main` without assertions | See F23 |
+| `musigrpc.Musig` gRPC | 28 tests in `rpc/tests/test_musig_service.rs` with mock wallets, 1 smoke test of the `musigd` binary (since WP1); a Java `main` without assertions | No chain; see F23 |
 
 ### 9.2 Test levels
 
@@ -600,7 +624,7 @@ Additions to `testenv`:
 
 Derived key shares (D10) make the keys of a test reproducible from the test seed. A deterministic
 random source for nonces makes L1 tests fully reproducible. The TODO comment in
-`protocol/src/multisig.rs:225` already asks for it.
+`protocol/src/multisig.rs:227` already asks for it.
 
 Scenarios marked "both roles" run once with the buyer and once with the seller as the acting
 party. L3 tests also cover maker and taker.
@@ -625,7 +649,7 @@ reason. "Engine refuses" means: the engine returns an error and sends nothing.
 | A9 | Trade with a fee receiver output (D9) | Output exists with the exact amount; paid by the seller's half |
 | A10 | Amount below the minimum (D14) | Rejected before any coin is reserved |
 | A11 | Peers use different fee rates, lock times or amounts (D5) | Setup fails with an error before the deposit is signed |
-| A12 | Trade parameters outside the limits: redirect lock time not 1, warning lock time not larger than `MIN_CONFIRMATIONS` plus margin, zero claim lock time | Rejected in `InitTrade` |
+| A12 | Trade parameters outside the limits: redirect lock time not 1, warning lock time not larger than `MIN_CONFIRMATIONS` plus margin, zero claim lock time | Rejected in the request that carries the parameters, before a coin is reserved. Since WP1 this is `GetNonceShares` (open point O13 of the specification). |
 | A13 | The peer's deposit input does not exist or is already spent (D12: not checked) | Deposit never confirms; abort as in A3; own coins are free again |
 | A14 | Swap signature or key share requested at 0, 1 and 2 confirmations (both roles) | Engine refuses; succeeds at 3 (D6, F9) |
 | A15 | Deposit timeout and release safety margin set to other values in the configuration | The engine uses the configured values; without configuration it uses the defaults (N9) |

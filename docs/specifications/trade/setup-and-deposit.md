@@ -38,9 +38,9 @@ The messages travel through bisq2. The engine sees them as data of the requests 
 
 | Step | Input | The engine does | Output |
 |---|---|---|---|
-| 1. Create the trade | Trade ID, role, trade parameters | Checks the parameters ([parameters.md](parameters.md)). Derives the key shares. Takes a script key from the wallet. | Own public key shares and script key |
-| 2. Key shares of the peer | Message A or B (keys) | Checks the keys. Aggregates `P'` and `Q'`. Computes all output scripts. Takes the addresses from the wallet. Selects and reserves coins and builds the own half of the deposit. Creates the nonces. | Own half of the deposit, addresses, nonces |
-| 3. Half deposit, addresses and nonces of the peer | Message B or C | Checks all data. Builds the deposit transaction and all pre-signed transactions. Creates the partial signatures. | Own partial signatures; the five transaction IDs of deposit, warnings and redirects |
+| 1. Create the trade | Trade ID, role | Derives the key shares. Takes a script key from the wallet. | Own public key shares and script key |
+| 2. Key shares of the peer | Message A or B (keys), trade parameters | Checks the parameters ([parameters.md](parameters.md)), then the keys. Aggregates `P'` and `Q'`. Computes all output scripts. Takes the addresses from the wallet. Selects and reserves coins and builds the own half of the deposit. Creates the nonces. | Own half of the deposit, addresses, nonces |
+| 3. Half deposit, addresses and nonces of the peer | Message B or C, redirection receivers | Checks all data. Builds the deposit transaction and all pre-signed transactions. Creates the partial signatures. | Own partial signatures; the five transaction IDs of deposit, warnings and redirects |
 | 4. Partial signatures of the peer | Message C or D | Checks every signature. Completes the own warning and redirect transaction. The buyer completes and checks the adaptor signature of the swap transaction. Stores the trade. Signs the own inputs of the deposit. State becomes `Deposit`. | Deposit transaction with the own signatures |
 | 5. Publish | Deposit transaction with the peer's signatures | Checks that it is the same transaction and that every input is signed. Records it in the wallet. Sends it to the network. | Events about the confirmation |
 

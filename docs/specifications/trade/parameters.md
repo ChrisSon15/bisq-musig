@@ -7,7 +7,14 @@ engine enforces.
 ## Trade parameters
 
 The trade parameters are part of the trade contract of the two traders. The caller (bisq2) passes
-them to the engine at trade start. Both traders must use the same values.
+them to the engine with the key shares of the peer, in step 2 of the setup
+([setup-and-deposit.md](setup-and-deposit.md)). This is the first step that uses them. The engine
+checks them before it reserves a coin or creates a nonce. Both traders must use the same values.
+The redirection receivers follow in step 3, because their amounts depend on a value that step 2
+returns.
+
+A repeated request of step 2 with other parameters is refused. The parameters of a trade never
+change.
 
 | Parameter | Unit | Meaning |
 |---|---|---|
