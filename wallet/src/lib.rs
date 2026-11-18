@@ -429,6 +429,53 @@ mod tests {
         Ok(())
     }
 
+    /// F17: the database file of an imported key is encrypted. It cannot be read without its
+    /// key, the wallet reads it after a load, and a password change does not affect it.
+    #[test]
+    fn f17_imported_key_database_is_encrypted() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = DBStorage::from(dir.path());
+        let mut wallet = BMPWallet::new(storage.clone(), &test_password(), Network::Regtest)?;
+        let key = new_private_key();
+        wallet.import_private_key(key, None)?;
+        let internal_key = derive_public_key(&key);
+        drop(wallet);
+
+        let file = dir.path().join(format!("bmp_{internal_key}.db3"));
+        let content = std::fs::read(&file)?;
+        assert!(content.len() > 100, "the wallet of the key is stored");
+        // A plain SQLite file starts with this text and contains the descriptor of the key.
+        assert!(!content.starts_with(b"SQLite format 3"));
+        let internal_key_text = internal_key.to_string();
+        assert!(
+            !content
+                .windows(internal_key_text.len())
+                .any(|window| window == internal_key_text.as_bytes()),
+            "the descriptor is not readable in the file"
+        );
+        // Without the key the file is no database.
+        let plain = Connection::open(&file)?;
+        assert!(
+            plain
+                .query_row("SELECT count(*) FROM sqlite_master", (), |row| row
+                    .get::<_, i64>(0))
+                .is_err()
+        );
+
+        // The wallet reads the file, also after a password change.
+        let mut wallet =
+            BMPWallet::load_wallet(storage.clone(), Network::Regtest, &test_password())?;
+        assert_eq!(wallet.imported_keys().len(), 1);
+        let new_password: Password = "Another-Passw0rd".parse().expect("valid password");
+        wallet.change_password(&test_password(), &new_password)?;
+        wallet.import_private_key(new_private_key(), None)?;
+        drop(wallet);
+        let wallet = BMPWallet::load_wallet(storage, Network::Regtest, &new_password)?;
+        assert_eq!(wallet.imported_keys().len(), 2);
+        assert_eq!(wallet.imported_wallet_tip_heights(), vec![0, 0]);
+        Ok(())
+    }
+
     /// F16: a PSBT input without the output that it spends does not stop the process. The wallet
     /// signs what it can.
     #[test]
@@ -880,7 +927,7 @@ mod tests {
         tx_builder.add_recipient(to_address, to_spend);
 
         let imported_wallets =
-            BMPWallet::load_imported_wallets(&keys, &mem_storage.store, Network::Regtest)?;
+            BMPWallet::load_imported_wallets(&keys, &mem_storage.store, Network::Regtest, "")?;
         let first_key_unspents = imported_wallets[0]
             .wallet
             .list_unspent()

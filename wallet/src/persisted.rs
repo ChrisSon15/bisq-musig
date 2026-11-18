@@ -8,8 +8,9 @@ use base64::engine::general_purpose;
 use bdk_wallet::bitcoin::hex::DisplayHex as _;
 use bdk_wallet::{ChangeSet, WalletPersister};
 use rand::RngCore as _;
-use rusqlite::{Connection, named_params};
+use rusqlite::{Connection, OptionalExtension as _, named_params};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::bmp_wallet::ImportedKey;
 
@@ -96,6 +97,18 @@ impl DBStorage {
                     | rusqlite::OpenFlags::SQLITE_OPEN_URI,
             ),
         }
+    }
+
+    /// Opens the database of an imported key. A database file is encrypted with the raw
+    /// `SQLCipher` key `key` (64 hex digits). An in-memory database of a test is not encrypted.
+    pub fn open_with_raw_key(&self, db_name: &str, key: &str) -> rusqlite::Result<Connection> {
+        let db = self.open(db_name)?;
+        if self.base_path().is_some() {
+            // The form x'..' passes the key as it is, without the slow key derivation that a
+            // passphrase needs. The databases of imported keys are opened for every write.
+            db.pragma_update(None, "key", format!("x'{key}'"))?;
+        }
+        Ok(db)
     }
 
     pub fn base_path(&self) -> Option<PathBuf> {
@@ -310,6 +323,10 @@ pub trait BMPWalletPersister: WalletPersister {
 
     fn persist_staged_changes(db: &mut Self::DB, cs: &ChangeSet) -> Result<()>;
 
+    /// Returns the key that encrypts the databases of the imported keys: 64 hex digits. The key
+    /// is random, it is created on first use, and it is stored in this (encrypted) database.
+    fn load_or_create_imported_db_key(db: &mut Self::DB) -> Result<Zeroizing<String>>;
+
     /// Records that the key at `index` of the external keychain was issued to a trade.
     fn persist_trade_key_index(db: &mut Self::DB, table_name: &str, index: u32) -> Result<()>;
 
@@ -436,6 +453,33 @@ impl BMPWalletPersister for Connection {
     fn has_seed_phrase(db: &Self::DB, seeds_table_name: &str) -> Result<bool> {
         let mut stmt = db.prepare(&format!("SELECT 1 FROM {seeds_table_name}"))?;
         Ok(stmt.exists([])?)
+    }
+
+    fn load_or_create_imported_db_key(db: &mut Self::DB) -> Result<Zeroizing<String>> {
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS bmp_settings ( \
+                name TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL
+            ) STRICT",
+        )?;
+        let stored = db
+            .query_row(
+                "SELECT value FROM bmp_settings WHERE name = 'imported_db_key'",
+                (),
+                |row| row.get::<_, String>("value"),
+            )
+            .optional()?;
+        if let Some(key) = stored {
+            return Ok(Zeroizing::new(key));
+        }
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        rand::rng().fill_bytes(&mut bytes[..]);
+        let key = Zeroizing::new(bytes.to_lower_hex_string());
+        db.execute(
+            "INSERT INTO bmp_settings (name, value) VALUES ('imported_db_key', :key)",
+            named_params! { ":key": key.as_str() },
+        )?;
+        Ok(key)
     }
 
     fn persist_trade_key_index(db: &mut Self::DB, table_name: &str, index: u32) -> Result<()> {

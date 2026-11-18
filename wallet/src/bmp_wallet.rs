@@ -115,7 +115,7 @@ pub(crate) struct ImportedWallet {
 }
 
 impl ImportedWallet {
-    fn persist(&mut self, storage: &DBStorage) -> Result<bool> {
+    fn persist(&mut self, storage: &DBStorage, db_key: &str) -> Result<bool> {
         if self.wallet.staged().is_none() {
             return Ok(false);
         }
@@ -125,7 +125,9 @@ impl ImportedWallet {
             return Ok(self.wallet.persist(db)?);
         }
 
-        let mut db = storage.sibling(&self.db_name).open(&self.db_name)?;
+        let mut db = storage
+            .sibling(&self.db_name)
+            .open_with_raw_key(&self.db_name, db_key)?;
         Ok(self.wallet.persist(&mut db)?)
     }
 }
@@ -136,6 +138,11 @@ pub struct BMPWallet {
     imported_wallets: Vec<ImportedWallet>,
     signers_loaded: bool,
     db: BMPDatabase<Connection>,
+    /// The key that encrypts the database files of the imported keys. It is random, stored in
+    /// the main database, and independent of the password, so a password change does not touch
+    /// these files. It stays in memory while the wallet is open, because the files are opened
+    /// for every write.
+    imported_db_key: Zeroizing<String>,
     last_unused_address: Option<String>,
     /// Argon2 salt backing the current database key, mirrored on disk as `<db_path>.salt`.
     salt: Vec<u8>,
@@ -291,8 +298,12 @@ impl BMPWallet {
             return Err(WalletErrorKind::DuplicateKey);
         }
 
-        let mut imported_wallet =
-            Self::load_imported_wallet(&key_to_import, self.db.storage(), self.network())?;
+        let mut imported_wallet = Self::load_imported_wallet(
+            &key_to_import,
+            self.db.storage(),
+            self.network(),
+            &self.imported_db_key,
+        )?;
         // Only a wallet that knows nothing but the genesis block gets a start: a wallet that was
         // loaded from an earlier import of the same key has seen the chain already.
         if imported_wallet.wallet.latest_checkpoint().height() == 0
@@ -800,10 +811,11 @@ impl BMPWallet {
         key: &ImportedKey,
         storage: &DBStorage,
         network: Network,
+        db_key: &str,
     ) -> Result<ImportedWallet> {
         let db_name = format!("bmp_{}.db3", key.internal_key());
         let imported_storage = storage.sibling(&db_name);
-        let mut db = imported_storage.open(&db_name)?;
+        let mut db = imported_storage.open_with_raw_key(&db_name, db_key)?;
         let descriptor = key.descriptor().to_string();
 
         let imported_wallet = if let Some(wallet) = Wallet::load()
@@ -836,10 +848,11 @@ impl BMPWallet {
         imported_keys: impl IntoIterator<Item = &'a ImportedKey>,
         storage: &DBStorage,
         network: Network,
+        db_key: &str,
     ) -> Result<Vec<ImportedWallet>> {
         imported_keys
             .into_iter()
-            .map(|key| Self::load_imported_wallet(key, storage, network))
+            .map(|key| Self::load_imported_wallet(key, storage, network, db_key))
             .collect()
     }
 
@@ -891,8 +904,13 @@ impl BMPWallet {
             Self::insert_imported_key(&mut imported_keys, key)?;
         }
 
-        let imported_wallets =
-            Self::load_imported_wallets(imported_keys.values(), &storage, network)?;
+        let imported_db_key = Connection::load_or_create_imported_db_key(&mut db)?;
+        let imported_wallets = Self::load_imported_wallets(
+            imported_keys.values(),
+            &storage,
+            network,
+            &imported_db_key,
+        )?;
 
         // BDK does not store which keys are marked as used, so the keys that were issued to
         // trades are marked again.
@@ -907,6 +925,7 @@ impl BMPWallet {
             imported_wallets,
             signers_loaded: false,
             db: BMPDatabase::new(storage, db),
+            imported_db_key,
             last_unused_address: None,
             salt,
             key_verifier: key_verifier(&key),
@@ -1123,6 +1142,7 @@ impl WalletApi for BMPWallet {
         Connection::persist_seed_phrase(&mut db, Self::SEEDS_TABLE_NAME, &phrase)?;
 
         let wallet = Self::create_wallet_from_seed(&mut db, network, &mnemonic)?;
+        let imported_db_key = Connection::load_or_create_imported_db_key(&mut db)?;
 
         Ok(Self {
             wallet,
@@ -1130,6 +1150,7 @@ impl WalletApi for BMPWallet {
             imported_wallets: Vec::new(),
             signers_loaded: true,
             db: BMPDatabase::new(storage, db),
+            imported_db_key,
             last_unused_address: None,
             salt,
             key_verifier: key_verifier(&key),
@@ -1156,7 +1177,7 @@ impl WalletApi for BMPWallet {
 
         let storage = self.db.storage().clone();
         for imported in &mut self.imported_wallets {
-            persisted |= imported.persist(&storage)?;
+            persisted |= imported.persist(&storage, &self.imported_db_key)?;
         }
 
         Ok(persisted)
