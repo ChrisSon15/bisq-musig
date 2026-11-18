@@ -789,6 +789,35 @@ impl BMPWallet {
         Ok(Some(tx))
     }
 
+    /// The unconfirmed transactions that spend a coin of the seed wallet or of an imported key:
+    /// payments, drain transactions and transactions of trades that the wallet recorded and that
+    /// are in no block yet. The owner of the wallet sends them to the network again until they
+    /// are confirmed.
+    ///
+    /// A transaction that can no longer confirm is not in the list, as far as the wallet knows:
+    /// it leaves the list when the wallet sees a confirmed transaction that spends one of the
+    /// same coins, or when it is forgotten.
+    pub fn unconfirmed_outgoing_transactions(&self) -> Vec<Arc<Transaction>> {
+        let mut outgoing: Vec<Arc<Transaction>> = Vec::new();
+        let wallets = std::iter::once(&self.wallet).chain(
+            self.imported_wallets
+                .iter()
+                .map(|imported| &imported.wallet),
+        );
+        for wallet in wallets {
+            for tx in wallet.transactions() {
+                let (sent, _) = wallet.sent_and_received(&tx.tx_node.tx);
+                let known = outgoing
+                    .iter()
+                    .any(|other| other.compute_txid() == tx.tx_node.txid);
+                if !tx.chain_position.is_confirmed() && sent > Amount::ZERO && !known {
+                    outgoing.push(Arc::clone(&tx.tx_node.tx));
+                }
+            }
+        }
+        outgoing
+    }
+
     /// Records a signed transaction as unconfirmed in the main wallet and in the wallets of the
     /// imported keys, and stores it. Its inputs count as spent from here on.
     pub fn record_unconfirmed_transaction(&mut self, tx: &Transaction) -> Result<()> {

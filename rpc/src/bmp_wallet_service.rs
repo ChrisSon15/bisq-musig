@@ -38,7 +38,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::{self, JoinHandle};
 use tokio::time::{self, Duration, MissedTickBehavior};
 use tonic::{Request, Response, Result, Status};
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 use zeroize::Zeroizing;
 
 use crate::observable::ObservableHashMap;
@@ -323,6 +323,49 @@ impl<S: ChainDataSource + Sync> BMPWalletServiceImpl<S> {
     }
 }
 
+impl<S: Send + Sync> BMPWalletServiceImpl<S> {
+    /// Sends the unconfirmed transactions that spend coins of the wallet to the network again,
+    /// once for every height of the chain that the wallet has seen. `resent_at` is the height
+    /// of the last sending.
+    ///
+    /// A broadcast has no result, and a transaction can be lost: the program can end before a
+    /// peer took the transaction, as after the drain at the close of the wallet (N5), and a node
+    /// can drop it. A transaction that is confirmed, or that lost its coins to another confirmed
+    /// transaction, is no longer in the list of the wallet, so the sending ends on its own.
+    async fn resend_unconfirmed_transactions(&self, resent_at: &mut Option<u32>) {
+        let Some(broadcaster) = self.broadcaster.as_ref() else {
+            return;
+        };
+        // The wallet is not locked while the transactions are sent. A sending waits for a peer.
+        let (height, transactions) = {
+            let guard = self.wallet.lock().await;
+            let Some(wallet) = guard.as_ref() else {
+                return;
+            };
+            (
+                wallet.latest_checkpoint().height(),
+                wallet.unconfirmed_outgoing_transactions(),
+            )
+        };
+        if *resent_at == Some(height) {
+            return;
+        }
+        *resent_at = Some(height);
+        for tx in transactions {
+            let txid = tx.compute_txid();
+            match task::block_in_place(|| broadcaster.transaction_broadcast(&tx)) {
+                Ok(_) => {
+                    info!(%txid, height, "Sent an unconfirmed transaction of the wallet again.")
+                }
+                // For example: no peer asked for it, because the peer holds it already.
+                Err(error) => {
+                    debug!(%txid, height, %error, "Unconfirmed transaction not sent again.")
+                }
+            }
+        }
+    }
+}
+
 impl<S: ChainDataSource + Send + Sync + 'static> BMPWalletServiceImpl<S> {
     /// Periodically re-syncs the wallet through its [`ChainDataSource`].
     ///
@@ -361,6 +404,10 @@ impl<S: ChainDataSource + Send + Sync + 'static> BMPWalletServiceImpl<S> {
             }
         }
         self.ready.store(true, Ordering::Release);
+        // The start of the program: transactions that an earlier run stored and that are not
+        // confirmed, for example the drain transaction of the last close, are sent again.
+        let mut resent_at = None;
+        self.resend_unconfirmed_transactions(&mut resent_at).await;
         let total = self
             .wallet
             .lock()
@@ -377,7 +424,10 @@ impl<S: ChainDataSource + Send + Sync + 'static> BMPWalletServiceImpl<S> {
         loop {
             interval.tick().await;
             match self.sync_once(chain_data_source).await {
-                Ok(_) => retry_delay = FIRST_SYNC_RETRY_DELAY,
+                Ok(_) => {
+                    retry_delay = FIRST_SYNC_RETRY_DELAY;
+                    self.resend_unconfirmed_transactions(&mut resent_at).await;
+                }
                 Err(error) => {
                     warn!(%error, ?retry_delay, "The wallet sync failed. Trying again.");
                     time::sleep(retry_delay).await;
@@ -592,8 +642,7 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
         let txid = drain_tx.compute_txid();
         // The transaction is stored in the wallet at this point. A failure to send it must not
         // fail the close: the wallet still knows the transaction and its coins count as spent.
-        // TODO: Send stored unconfirmed transactions again at the next start (point N5 of the
-        //  plan).
+        // The service sends it again after the next start (`resend_unconfirmed_transactions`).
         let sent = self.broadcaster.as_ref().map_or_else(
             || Err("no chain backend is configured".to_owned()),
             |broadcaster| {
@@ -1161,6 +1210,112 @@ mod tests {
                 "nothing should have been broadcast",
             )))
         }
+    }
+
+    /// A broadcaster that records what it is given.
+    #[derive(Default)]
+    struct RecordingBroadcaster(Mutex<Vec<Txid>>);
+
+    impl ChainApi for RecordingBroadcaster {
+        fn transaction_broadcast(&self, tx: &Transaction) -> Result<Txid, ChainApiError> {
+            let txid = tx.compute_txid();
+            self.0.lock().unwrap().push(txid);
+            Ok(txid)
+        }
+    }
+
+    /// N5, M4, M8: a transaction of the wallet that an earlier run of the program stored and
+    /// that is in no block, like the drain transaction of the last close, is sent again: once
+    /// after the start, and once after every new block, until it is confirmed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn n5_unconfirmed_transactions_of_the_wallet_are_sent_again() {
+        use bdk_wallet::bitcoin::BlockHash;
+        use bdk_wallet::bitcoin::hashes::Hash as _;
+        use bdk_wallet::chain::{BlockId, ConfirmationBlockTime};
+        use bdk_wallet::test_utils::{
+            ReceiveTo, insert_anchor, insert_checkpoint, receive_output_to_address,
+        };
+
+        let block = |height: u32| BlockId {
+            height,
+            hash: BlockHash::from_byte_array([u8::try_from(height).unwrap(); 32]),
+        };
+        let anchor = |height: u32| ConfirmationBlockTime {
+            block_id: block(height),
+            confirmation_time: 1,
+        };
+        let (dir, service) = open_service().await;
+        let payment = {
+            let mut guard = service.wallet.lock().await;
+            let wallet = guard.as_mut().unwrap();
+            let address = wallet.get_new_address().unwrap().address;
+            insert_checkpoint(wallet, block(1));
+            receive_output_to_address(
+                wallet,
+                address,
+                Amount::from_sat(100_000),
+                ReceiveTo::Block(anchor(1)),
+            );
+            // An incoming transaction that is not confirmed. It is not the wallet's to send.
+            let address = wallet.get_new_address().unwrap().address;
+            receive_output_to_address(
+                wallet,
+                address,
+                Amount::from_sat(50_000),
+                ReceiveTo::Mempool(1),
+            );
+            let to = REGTEST_ADDRESS
+                .parse::<Address<NetworkUnchecked>>()
+                .unwrap()
+                .assume_checked();
+            let fee_rate = FeeRate::from_sat_per_kwu(500);
+            let payment = wallet
+                .send_to_address(&to, Amount::from_sat(10_000), fee_rate)
+                .unwrap();
+            wallet.persist().unwrap();
+            payment.compute_txid()
+        };
+        // The program ends before a peer took the payment, and starts again.
+        drop(service);
+        let broadcaster = Arc::new(RecordingBroadcaster::default());
+        let service =
+            BMPWalletServiceImpl::<NoopChainDataSource>::new(dir.path(), Network::Regtest)
+                .with_broadcaster(Arc::clone(&broadcaster) as _);
+        service.open_or_create_wallet(PASSWORD).await.unwrap();
+        let sent = || broadcaster.0.lock().unwrap().clone();
+
+        let mut resent_at = None;
+        service
+            .resend_unconfirmed_transactions(&mut resent_at)
+            .await;
+        assert_eq!(sent(), vec![payment], "sent again after the start");
+        service
+            .resend_unconfirmed_transactions(&mut resent_at)
+            .await;
+        assert_eq!(sent(), vec![payment], "once for a height of the chain");
+
+        // A block without the payment.
+        insert_checkpoint(service.wallet.lock().await.as_mut().unwrap(), block(2));
+        service
+            .resend_unconfirmed_transactions(&mut resent_at)
+            .await;
+        assert_eq!(sent(), vec![payment, payment]);
+
+        // A block with the payment.
+        {
+            let mut guard = service.wallet.lock().await;
+            let wallet = guard.as_mut().unwrap();
+            insert_checkpoint(wallet, block(3));
+            insert_anchor(wallet, payment, anchor(3));
+        }
+        service
+            .resend_unconfirmed_transactions(&mut resent_at)
+            .await;
+        assert_eq!(
+            sent(),
+            vec![payment, payment],
+            "a confirmed payment is not sent"
+        );
     }
 
     const REGTEST_ADDRESS: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";

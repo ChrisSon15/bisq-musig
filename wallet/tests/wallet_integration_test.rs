@@ -591,9 +591,21 @@ async fn m1_drain_imported_coins() -> anyhow::Result<()> {
     // M9: a second call finds nothing more to move.
     assert!(wallet.drain_imported_coins(fee_rate)?.is_none());
 
+    // M4, M8: until the drain transaction is confirmed, the wallet names it as a transaction
+    // that must be sent again.
+    let to_send_again = || {
+        let outgoing = wallet.unconfirmed_outgoing_transactions();
+        outgoing
+            .iter()
+            .map(|tx| tx.compute_txid())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(to_send_again(), vec![drain_tx.compute_txid()]);
+
     env.broadcast(&drain_tx)?;
     env.mine_block()?;
     sync_to_tip(&mut wallet, &chain, &env).await?;
+    assert_eq!(wallet.unconfirmed_outgoing_transactions(), vec![]);
     // Only the locked coin is left with the imported keys.
     assert_eq!(wallet.imported_balance().total(), amount);
     assert_eq!(wallet.balance(), amount * 2 - fee);

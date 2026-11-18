@@ -32,6 +32,8 @@ clap = { workspace = true }
 tonic-prost-build = "0.14.6"
 
 [dev-dependencies]
+# The wallet service tests give a wallet coins without a chain.
+bdk_wallet = { workspace = true, features = ["test-utils"] }
 # The service tests use the mock wallets of the protocol crate.
 protocol = { workspace = true, features = ["test-utils"] }
 rand = { workspace = true }
