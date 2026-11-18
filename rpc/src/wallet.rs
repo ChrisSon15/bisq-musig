@@ -1,131 +1,13 @@
-#![cfg_attr(
-    feature = "unimock",
-    expect(clippy::ignored_unit_patterns, reason = "macro-generated code")
-)]
+//! Transaction confidence data of a wallet, and the error type of the wallet sync. Both are used
+//! by the `wallet.Wallet` service in [`crate::bmp_wallet_service`].
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 
-use bdk_bitcoind_rpc::Emitter;
-use bdk_bitcoind_rpc::bitcoincore_rpc::{Client, RpcApi as _};
-use bdk_wallet::bitcoin::{Network, Transaction, Txid};
-use bdk_wallet::chain::{ChainPosition, CheckPoint, ConfirmationBlockTime};
-use bdk_wallet::{AddressInfo, Balance, KeychainKind, LocalOutput, Wallet};
-use drop_stream::DropStreamExt as _;
-use futures_util::never::Never;
-use futures_util::stream::{BoxStream, StreamExt as _};
+use bdk_wallet::Wallet;
+use bdk_wallet::bitcoin::{Transaction, Txid};
+use bdk_wallet::chain::{ChainPosition, ConfirmationBlockTime};
 use thiserror::Error;
-use tokio::task::{self, JoinHandle};
-use tokio::time::{self, Duration, MissedTickBehavior};
-use tracing::{debug, error, info, trace};
-
-use crate::observable::ObservableHashMap;
-
-//noinspection SpellCheckingInspection
-const EXTERNAL_DESCRIPTOR: &str = "tr(tprv8ZgxMBicQKsPdrjwWCyXqqJ4YqcyG4DmKtjjsRt29v1PtD3r3PuFJAj\
-    WytzcvSTKnZAGAkPSmnrdnuHWxCAwy3i1iPhrtKAfXRH7dVCNGp6/86'/1'/0'/0/*)#g9xn7wf9";
-//noinspection SpellCheckingInspection
-const INTERNAL_DESCRIPTOR: &str = "tr(tprv8ZgxMBicQKsPdrjwWCyXqqJ4YqcyG4DmKtjjsRt29v1PtD3r3PuFJAj\
-    WytzcvSTKnZAGAkPSmnrdnuHWxCAwy3i1iPhrtKAfXRH7dVCNGp6/86'/1'/0'/1/*)#e3rjrmea";
-const BITCOIND_POLLING_PERIOD: Duration = Duration::from_secs(1);
-
-#[cfg_attr(feature = "unimock", unimock::unimock(api = WalletServiceMock))]
-#[expect(
-    clippy::double_must_use,
-    reason = "tonic::async_trait marks generated futures as must-use"
-)]
-#[tonic::async_trait]
-pub trait WalletService {
-    /// # Errors
-    /// Will return `Err` if connection or continual sync fails at any point
-    async fn connect(&self, rpc: Arc<Client>) -> Result<Never>;
-
-    fn balance(&self) -> Balance;
-    fn reveal_next_address(&self) -> AddressInfo;
-    fn list_unspent(&self) -> Vec<LocalOutput>;
-    fn get_tx_confidence_stream(&self, txid: Txid) -> BoxStream<'static, Option<TxConfidence>>;
-
-    /// # Panics
-    /// Will panic if called outside the context of a Tokio runtime
-    fn spawn_connection(self: Arc<Self>, client: Arc<Client>) -> JoinHandle<Result<Never>>
-        where Self: Send + Sync + 'static
-    {
-        task::spawn(async move {
-            self.connect(client).await
-                .inspect_err(|e| error!("Wallet connection error: {e}"))
-        })
-    }
-}
-
-pub struct WalletServiceImpl {
-    // NOTE: To avoid deadlocks, must be careful to acquire these locks in consistent order. At
-    //  present, the lock on 'wallet' is acquired first, then the lock on 'tx_confidence_map'.
-    // TODO: Consider using async locks here, as wallet operations have nontrivial cost:
-    wallet: RwLock<Wallet>,
-    tx_confidence_map: Mutex<ObservableHashMap<Txid, TxConfidence>>,
-
-    // Make the following RPC parameters configurable for testing:
-    poll_period: Duration,
-}
-
-impl Default for WalletServiceImpl {
-    fn default() -> Self { Self::new() }
-}
-
-impl WalletServiceImpl {
-    // TODO: Make wallet setup properly configurable, not just the RPC authentication method and polling period.
-    pub fn new() -> Self {
-        let wallet = Wallet::create(EXTERNAL_DESCRIPTOR, INTERNAL_DESCRIPTOR)
-            .network(Network::Regtest)
-            .create_wallet_no_persist()
-            .expect("hardcoded descriptors should be valid");
-
-        let mut tx_confidence_map = ObservableHashMap::new();
-        tx_confidence_map.sync(tx_confidence_entries(&wallet));
-
-        Self {
-            wallet: RwLock::new(wallet),
-            tx_confidence_map: Mutex::new(tx_confidence_map),
-            poll_period: BITCOIND_POLLING_PERIOD,
-        }
-    }
-
-    #[must_use]
-    pub fn with_poll_period(self, poll_period: Duration) -> Self { Self { poll_period, ..self } }
-
-    fn sync_tx_confidence_map(&self) {
-        let wallet = self.wallet.read().unwrap();
-        self.tx_confidence_map.lock().unwrap().sync(tx_confidence_entries(&wallet));
-    }
-
-    fn sync_from_rpc_emitter(&self, emitter: &mut Emitter<&Client>) -> Result<()> {
-        trace!("Syncing blocks...");
-        while let Some(block) = task::block_in_place(|| emitter.next_block())? {
-            let height = block.block_height();
-            debug!(hash = %block.block_hash(), height, "New block.");
-            self.wallet.write().unwrap()
-                .apply_block_connected_to(&block.block, height, block.connected_to())?;
-        }
-
-        trace!("Syncing mempool...");
-        {
-            let mempool_emissions = task::block_in_place(|| emitter.mempool())?;
-            let mut wallet = self.wallet.write().unwrap();
-            wallet.apply_evicted_txs(mempool_emissions.evicted);
-            wallet.apply_unconfirmed_txs(mempool_emissions.update);
-        }
-
-        trace!("Syncing tx confidence map with wallet.");
-        // TODO: Skip needless cache/map updates if the wallet hasn't actually changed:
-        self.sync_tx_confidence_map();
-
-        Ok(())
-    }
-}
-
-fn unconfirmed_txs(wallet: &Wallet) -> impl Iterator<Item = Arc<Transaction>> + '_ {
-    tx_confidence_entries(wallet)
-        .filter_map(|(_, conf)| (conf.num_confirmations == 0).then_some(conf.wallet_tx.tx))
-}
+use tracing::trace;
 
 pub(crate) fn tx_confidence_entries(
     wallet: &Wallet,
@@ -141,51 +23,6 @@ pub(crate) fn tx_confidence_entries(
             trace!(%num_confirmations, %wallet_tx.txid, "New transaction confirmations.");
             (wallet_tx.txid, TxConfidence { wallet_tx, num_confirmations })
         })
-}
-
-#[tonic::async_trait]
-impl WalletService for WalletServiceImpl {
-    async fn connect(&self, rpc: Arc<Client>) -> Result<Never> {
-        let blockchain_info = task::block_in_place(|| rpc.get_blockchain_info())?;
-        info!(chain = %blockchain_info.chain, best_block_hash = %blockchain_info.best_block_hash,
-            blocks = blockchain_info.blocks, "Connected to Bitcoin Core RPC.");
-
-        let wallet_tip: CheckPoint = self.wallet.read().unwrap().latest_checkpoint();
-        let start_height = wallet_tip.height();
-        info!(start_hash = %wallet_tip.hash(), start_height, "Fetched latest wallet checkpoint.");
-
-        let mut emitter = Emitter::new(rpc.as_ref(), wallet_tip, start_height,
-            unconfirmed_txs(&self.wallet.read().unwrap()));
-        self.sync_from_rpc_emitter(&mut emitter)?;
-        info!(wallet_balance_total = %self.balance().total(), "Finished initial sync.");
-
-        info!("Polling for further blocks and mempool txs...");
-        let mut interval = time::interval(self.poll_period);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            self.sync_from_rpc_emitter(&mut emitter)?;
-        }
-    }
-
-    fn balance(&self) -> Balance {
-        self.wallet.read().unwrap().balance()
-    }
-
-    fn reveal_next_address(&self) -> AddressInfo {
-        self.wallet.write().unwrap().reveal_next_address(KeychainKind::External)
-    }
-
-    fn list_unspent(&self) -> Vec<LocalOutput> {
-        self.wallet.read().unwrap().list_unspent().collect()
-    }
-
-    fn get_tx_confidence_stream(&self, txid: Txid) -> BoxStream<'static, Option<TxConfidence>> {
-        self.tx_confidence_map.lock().unwrap().observe(txid)
-            .on_drop(move || debug!(%txid, "Confidence stream has been dropped."))
-            .boxed()
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -213,9 +50,7 @@ pub type Result<T, E = WalletErrorKind> = std::result::Result<T, E>;
 #[error(transparent)]
 #[non_exhaustive]
 pub enum WalletErrorKind {
-    BitcoindRpc(#[from] bdk_bitcoind_rpc::bitcoincore_rpc::Error),
-    ApplyHeader(#[from] bdk_wallet::chain::local_chain::ApplyHeaderError),
-    /// Raised by wallet impls that sync through a `ChainDataSource` rather than a bitcoind
-    /// emitter, where the underlying failure is not usefully typed.
+    /// Raised by wallet impls that sync through a `ChainDataSource`, where the underlying failure
+    /// is not usefully typed.
     ChainSync(#[from] anyhow::Error),
 }

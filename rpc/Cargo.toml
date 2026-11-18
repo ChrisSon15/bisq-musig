@@ -26,7 +26,6 @@ tonic-prost = "0.14.6"
 tracing = { workspace = true }
 wallet = { workspace = true }
 zeroize = { workspace = true }
-unimock = { version = "0.6.8", optional = true }
 # Dependencies used only by the binary target(s):
 # TODO: Consider making a workspace of separate packages to avoid pulling these into the library:
 bmp_tracing = { workspace = true }
@@ -36,12 +35,9 @@ clap = { workspace = true }
 tonic-prost-build = "0.14.6"
 
 [dev-dependencies]
-rpc = { path = ".", features = ["unimock"] }
 tempfile = { workspace = true }
 bdk_electrum = { workspace = true }
 testenv = { workspace = true }
-# Pin transitive 'unimock' dependency, as v0.2.3 replaces 'paste' with less reputable 'pastey' to fix a bogus advisory:
-macro_rules_attribute = "=0.2.2"
 
 [lints]
 workspace = true

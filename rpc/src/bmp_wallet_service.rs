@@ -1,18 +1,17 @@
 //! The user-facing wallet service, backed by [`BMPWallet`].
 //!
-//! Layering mirrors [`crate::wallet`]/[`crate::server`]:
+//! Layering:
 //!
 //! * [`BMPWalletServiceImpl`] owns the wallet — once the `OpenOrCreateWallet` RPC has opened or
 //!   created it — and forwards every operation to [`BMPWallet`]. It implements
-//!   [`BmpWalletService`], the GUI-oriented operations bisq2 needs, which deliberately does not
-//!   depend on the bitcoind-oriented [`crate::wallet::WalletService`] trait.
+//!   [`BmpWalletService`], the GUI-oriented operations bisq2 needs.
 //! * [`BmpWalletImpl`] is the thin gRPC adapter over `BmpWalletService`, serving the
 //!   `wallet.Wallet` service defined in `bmp_wallet.proto` — the contract derived from bisq2's own
 //!   `wallet.proto`, with the divergences from it listed at the top of that file.
 //!
-//! Unlike `WalletServiceImpl`, which drives a `bdk_bitcoind_rpc` emitter, this service syncs by
-//! periodically calling [`WalletApi::sync_all`] against a [`ChainDataSource`] (compact block
-//! filters by default), which is how `BMPWallet` is designed to see the chain.
+//! This service syncs by periodically calling [`WalletApi::sync_all`] against a
+//! [`ChainDataSource`] (compact block filters by default), which is how `BMPWallet` is designed to
+//! see the chain.
 
 use std::fs;
 use std::path::PathBuf;
@@ -73,9 +72,7 @@ pub struct WalletNotOpen;
 ///
 /// Every method maps one-to-one onto an RPC of the `wallet.Wallet` service and, in turn, onto a
 /// method of [`BMPWallet`]. Kept as a trait (rather than inherent methods) so the gRPC adapter
-/// can hold `Arc<dyn BmpWalletService>` and be exercised against a stub in tests. Deliberately
-/// *not* a subtrait of [`crate::wallet::WalletService`]: that trait models the bitcoind-backed
-/// trade wallet, which this user-facing wallet no longer depends on.
+/// can hold `Arc<dyn BmpWalletService>` and be exercised against a stub in tests.
 #[expect(
     clippy::double_must_use,
     reason = "tonic::async_trait marks generated futures as must-use"
@@ -171,7 +168,7 @@ pub struct BMPWalletServiceImpl<S> {
     /// called.
     ///
     /// NOTE: to avoid deadlocks, acquire this before `tx_confidence_map`, never the other way
-    /// round — the same ordering `WalletServiceImpl` uses.
+    /// round.
     wallet: AsyncMutex<Option<BMPWallet>>,
     /// Directory holding (or to hold) the wallet database.
     wallet_dir: PathBuf,
@@ -269,11 +266,9 @@ impl<S: ChainDataSource + Sync> BMPWalletServiceImpl<S> {
 }
 
 impl<S: ChainDataSource + Send + Sync + 'static> BMPWalletServiceImpl<S> {
-    /// Periodically re-syncs the wallet through its [`ChainDataSource`], mirroring what
-    /// [`crate::wallet::WalletService::connect`] does for the bitcoind-backed wallet without
-    /// this type having to implement that trait.
+    /// Periodically re-syncs the wallet through its [`ChainDataSource`].
     ///
-    /// Unlike that method it takes no Bitcoin Core client: `BMPWallet` reaches the chain only
+    /// It takes no Bitcoin Core client: `BMPWallet` reaches the chain only
     /// through the chain data source (compact block filters by default), and the node used to
     /// publish transactions is the broadcaster's business (see [`Self::with_broadcaster`]).
     ///
@@ -313,8 +308,7 @@ impl<S: ChainDataSource + Send + Sync + 'static> BMPWalletServiceImpl<S> {
         }
     }
 
-    /// Spawns [`Self::connect`] onto the Tokio runtime, mirroring
-    /// [`crate::wallet::WalletService::spawn_connection`].
+    /// Spawns [`Self::connect`] onto the Tokio runtime.
     ///
     /// # Panics
     /// Will panic if called outside the context of a Tokio runtime.
