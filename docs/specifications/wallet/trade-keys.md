@@ -40,5 +40,6 @@ trades. Most keys of a trade never receive funds, so the rule "offer an unused a
 would hand them out again after a few trades. This was finding F12.
 
 Consequence: the keys of trades form long rows of keys without funds in the seed wallet. A wallet
-that is restored from its seed words must still find funds behind such a row. This is open point
-W1 in [README.md](README.md).
+that is restored from its seed words must still find funds behind such a row. This rule is not
+specified yet: restoring is designed after the work packages of the plan are finished (point W1
+in [README.md](README.md)).

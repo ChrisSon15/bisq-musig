@@ -23,15 +23,17 @@ use ::wallet::bmp_wallet::{BMPWallet, WalletApi as _};
 use ::wallet::chain_data_source::ChainDataSource;
 use ::wallet::error::WalletErrorKind;
 use ::wallet::password::{InvalidPassword, Password, WeakPassword};
+use ::wallet::protocol_wallet_api::ProtocolWalletApi as _;
 use ::wallet::wallet_info::{PubAddressInfo, TxInfo, TxOutputInfo, UtxoInfo};
 use bdk_bitcoind_rpc::bitcoincore_rpc::{Client, RpcApi as _};
 use bdk_wallet::Balance;
 use bdk_wallet::bitcoin::address::{NetworkUnchecked, ParseError};
-use bdk_wallet::bitcoin::{Address, Amount, FeeRate, Network, Transaction, Txid};
+use bdk_wallet::bitcoin::{Address, Amount, FeeRate, Network, OutPoint, Transaction, Txid};
 use chain::{ChainApi, ChainApiError};
 use futures_util::never::Never;
 use futures_util::stream::{BoxStream, StreamExt as _};
 use protocol::params::engine_fee_rate;
+use protocol::trade_model::TradeModelStore;
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::{self, JoinHandle};
@@ -48,8 +50,8 @@ use crate::pb::bmp_wallet::{
     GetUnusedAddressRequest, GetUnusedAddressResponse, GetWalletAddressesRequest,
     GetWalletAddressesResponse, IsWalletReadyRequest, IsWalletReadyResponse,
     ListTransactionsRequest, ListTransactionsResponse, ListUtxosRequest, ListUtxosResponse,
-    OpenOrCreateWalletRequest, OpenOrCreateWalletResponse, SendToAddressRequest,
-    SendToAddressResponse, wallet_server,
+    OpenOrCreateWalletRequest, OpenOrCreateWalletResponse, ReleaseUtxoRequest, ReleaseUtxoResponse,
+    SendToAddressRequest, SendToAddressResponse, wallet_server,
 };
 use crate::server::handle_request_async;
 use crate::wallet::{Result as WalletResult, TxConfidence, tx_confidence_entries};
@@ -69,6 +71,17 @@ const DEFAULT_FEE_RATE: FeeRate = FeeRate::from_sat_per_kwu(500);
 #[derive(Debug, Error)]
 #[error("wallet is not open; call OpenOrCreateWallet first")]
 pub struct WalletNotOpen;
+
+/// A coin that a trade has reserved for its deposit cannot be released in the wallet. Reported to
+/// gRPC clients as `FAILED_PRECONDITION`.
+#[derive(Debug, Error)]
+#[error(
+    "the coin is reserved for the deposit of the trade {trade_id}; a trade releases its coins \
+     when it is abandoned (AbandonTrade)"
+)]
+pub struct ReservedByTrade {
+    pub trade_id: String,
+}
 
 /// The GUI-facing wallet operations.
 ///
@@ -154,6 +167,14 @@ pub trait BmpWalletService {
     /// than revealing anything. A stored seed that is not a valid BIP39 mnemonic also fails.
     async fn seed_words(&self, password: &str) -> anyhow::Result<Vec<String>>;
 
+    /// Releases the reservation of the coin `utxo`, so that the wallet can select it again.
+    /// Returns whether the coin was reserved.
+    ///
+    /// This is for coins that stayed reserved although no trade uses them any more, for example
+    /// after the program stopped during the setup of a trade. A coin that a trade known to the
+    /// engine has reserved is refused with [`ReservedByTrade`].
+    async fn release_utxo(&self, utxo: OutPoint) -> anyhow::Result<bool>;
+
     /// Prepares the wallet for the end of the program: moves the coins of all imported keys,
     /// which are payouts of closed trades, to an address of the seed wallet. Returns the ID of
     /// the drain transaction, or `None` if there was nothing to move.
@@ -187,6 +208,8 @@ pub struct BMPWalletServiceImpl<S> {
     tx_confidence_map: Mutex<ObservableHashMap<Txid, TxConfidence>>,
     chain_data_source: Option<S>,
     broadcaster: Option<Arc<dyn ChainApi>>,
+    /// The trades of the engine, to protect the coins that they have reserved.
+    trade_store: Option<Arc<dyn TradeModelStore>>,
     /// Set once `wallet` holds an open wallet (it is never closed again), so that the status
     /// can be read without waiting on the wallet lock, which a sync may hold for a long time.
     open: AtomicBool,
@@ -215,6 +238,7 @@ impl<S> BMPWalletServiceImpl<S> {
             tx_confidence_map: Mutex::new(ObservableHashMap::new()),
             chain_data_source: None,
             broadcaster: None,
+            trade_store: None,
             open: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             poll_period: DEFAULT_POLL_PERIOD,
@@ -236,6 +260,16 @@ impl<S> BMPWalletServiceImpl<S> {
     pub fn with_broadcaster(self, broadcaster: Arc<dyn ChainApi>) -> Self {
         Self {
             broadcaster: Some(broadcaster),
+            ..self
+        }
+    }
+
+    /// Supplies the trades of the engine. With it, [`BmpWalletService::release_utxo`] refuses
+    /// to release a coin that one of these trades has reserved.
+    #[must_use]
+    pub fn with_trade_store(self, trade_store: Arc<dyn TradeModelStore>) -> Self {
+        Self {
+            trade_store: Some(trade_store),
             ..self
         }
     }
@@ -480,6 +514,26 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
         let txid = task::block_in_place(|| broadcaster.transaction_broadcast(&tx))?;
         info!(%txid, "Broadcast wallet payment.");
         Ok(txid)
+    }
+
+    async fn release_utxo(&self, utxo: OutPoint) -> anyhow::Result<bool> {
+        // The wallet lock is taken first. Every request of a trade holds it while it works on
+        // its trade, so no trade can reserve the coin between the check and the release.
+        let mut guard = self.wallet.lock().await;
+        let wallet = require_open(&mut guard)?;
+        if let Some(trade_id) = self
+            .trade_store
+            .as_ref()
+            .and_then(|trades| trades.trade_reserving(&utxo))
+        {
+            return Err(ReservedByTrade { trade_id }.into());
+        }
+        if !wallet.is_utxo_locked(utxo) {
+            return Ok(false);
+        }
+        wallet.unlock_utxo(utxo)?;
+        info!(%utxo, "Released the reservation of a coin on request.");
+        Ok(true)
     }
 
     async fn close(&self) -> anyhow::Result<Option<Txid>> {
@@ -778,6 +832,27 @@ impl wallet_server::Wallet for BmpWalletImpl {
     }
 
     #[instrument(skip_all)]
+    async fn release_utxo(
+        &self,
+        request: Request<ReleaseUtxoRequest>,
+    ) -> Result<Response<ReleaseUtxoResponse>> {
+        handle_request_async(request, |request| async move {
+            let txid = request
+                .tx_id
+                .parse::<Txid>()
+                .map_err(|e| Status::invalid_argument(format!("invalid transaction ID: {e}")))?;
+            let released = self
+                .wallet_service
+                .release_utxo(OutPoint::new(txid, request.vout))
+                .await
+                .map_err(|e| status_from(&e))?;
+
+            Ok(ReleaseUtxoResponse { released })
+        })
+        .await
+    }
+
+    #[instrument(skip_all)]
     async fn close(&self, request: Request<CloseRequest>) -> Result<Response<CloseResponse>> {
         handle_request_async(request, |_request| async move {
             let drain_tx_id = self
@@ -803,7 +878,9 @@ fn status_from(error: &anyhow::Error) -> Status {
     // The alternate form includes the causes, e.g. "failed to open the existing wallet at …:
     // invalid wallet password", where `to_string()` would stop at the context.
     let message = format!("{error:#}");
-    if error.downcast_ref::<WalletNotOpen>().is_some() {
+    if error.downcast_ref::<WalletNotOpen>().is_some()
+        || error.downcast_ref::<ReservedByTrade>().is_some()
+    {
         Status::failed_precondition(message)
     } else if is_invalid_password(error) {
         Status::permission_denied(message)
@@ -942,6 +1019,7 @@ mod tests {
     use bdk_wallet::PersistedWallet;
     use bdk_wallet::bitcoin::Network;
     use bdk_wallet::rusqlite::Connection;
+    use protocol::trade_model::{ProtocolErrorKind, TradeModel};
     use tempfile::tempdir;
 
     use super::*;
@@ -1003,6 +1081,76 @@ mod tests {
         let (dir, service) = service();
         service.open_or_create_wallet(PASSWORD).await.unwrap();
         (dir, service)
+    }
+
+    /// A trade store in which one trade has reserved one coin.
+    struct StoreWithReservedCoin(OutPoint);
+
+    impl TradeModelStore for StoreWithReservedCoin {
+        fn contains_trade(&self, _trade_id: &str) -> bool {
+            false
+        }
+
+        fn add_trade_model(&self, trade_model: TradeModel) -> Result<(), ProtocolErrorKind> {
+            Err(ProtocolErrorKind::DuplicateTradeId(
+                trade_model.trade_id().to_owned(),
+            ))
+        }
+
+        fn get_trade_model(&self, _trade_id: &str) -> Option<Arc<Mutex<TradeModel>>> {
+            None
+        }
+
+        fn trade_reserving(&self, coin: &OutPoint) -> Option<String> {
+            (*coin == self.0).then(|| "trade-1".to_owned())
+        }
+    }
+
+    fn coin(vout: u32) -> OutPoint {
+        OutPoint::new(
+            "658654575bbbeb46e965bd9eb37fd3be550a7e0fa2d64bc5f218763155602300"
+                .parse()
+                .unwrap(),
+            vout,
+        )
+    }
+
+    /// W3: a reserved coin can be released by hand, and the release is stored. A coin that a
+    /// trade of the engine has reserved is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn release_utxo_releases_only_coins_without_a_trade() {
+        let (dir, service) = service();
+        let err = service.release_utxo(coin(0)).await.unwrap_err();
+        assert!(err.downcast_ref::<WalletNotOpen>().is_some());
+
+        let service = service.with_trade_store(Arc::new(StoreWithReservedCoin(coin(1))));
+        service.open_or_create_wallet(PASSWORD).await.unwrap();
+        for vout in [0, 1] {
+            let mut guard = service.wallet.lock().await;
+            guard.as_mut().unwrap().lock_utxo(coin(vout)).unwrap();
+        }
+
+        // The coin of the trade stays reserved.
+        let err = service.release_utxo(coin(1)).await.unwrap_err();
+        let reserved = err.downcast_ref::<ReservedByTrade>().expect("refused");
+        assert_eq!(reserved.trade_id, "trade-1");
+        assert_eq!(status_from(&err).code(), tonic::Code::FailedPrecondition);
+
+        // The other coin is released, once.
+        assert!(service.release_utxo(coin(0)).await.unwrap());
+        assert!(!service.release_utxo(coin(0)).await.unwrap());
+        // A coin that was never reserved is no error.
+        assert!(!service.release_utxo(coin(2)).await.unwrap());
+        drop(service);
+
+        // The release is stored in the wallet database.
+        let service =
+            BMPWalletServiceImpl::<NoopChainDataSource>::new(dir.path(), Network::Regtest);
+        service.open_or_create_wallet(PASSWORD).await.unwrap();
+        let guard = service.wallet.lock().await;
+        let wallet = guard.as_ref().unwrap();
+        assert!(!wallet.is_utxo_locked(coin(0)));
+        assert!(wallet.is_utxo_locked(coin(1)));
     }
 
     #[tokio::test(flavor = "multi_thread")]

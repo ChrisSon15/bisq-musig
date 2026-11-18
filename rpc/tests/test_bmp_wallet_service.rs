@@ -24,7 +24,7 @@ use rpc::pb::bmp_wallet::wallet_client::WalletClient;
 use rpc::pb::bmp_wallet::{
     ChangePasswordRequest, CloseRequest, GetBalanceRequest, GetSeedWordsRequest,
     GetUnusedAddressRequest, GetWalletAddressesRequest, IsWalletReadyRequest,
-    OpenOrCreateWalletRequest, PubAddressInfo, SendToAddressRequest,
+    OpenOrCreateWalletRequest, PubAddressInfo, ReleaseUtxoRequest, SendToAddressRequest,
 };
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -178,9 +178,36 @@ async fn operations_before_open_are_refused_over_grpc() -> anyhow::Result<()> {
         .ready;
     assert!(!ready, "an unopened wallet must not report itself ready");
 
+    // W3: ReleaseUtxo needs an open wallet, too.
+    let release_request = |tx_id: &str| ReleaseUtxoRequest {
+        tx_id: tx_id.to_owned(),
+        vout: 0,
+    };
+    let tx_id = "658654575bbbeb46e965bd9eb37fd3be550a7e0fa2d64bc5f218763155602300";
+    let err = fixture
+        .client
+        .release_utxo(release_request(tx_id))
+        .await
+        .expect_err("nothing to release before the wallet is opened");
+    assert_eq!(err.code(), Code::FailedPrecondition, "got: {err}");
+
     // M7: with an open wallet and no coin of an imported key, Close succeeds without a
     // transaction, and the wallet stays open.
     fixture.open(PASSWORD).await?;
+    // W3: a coin that is not reserved is no error, and a malformed transaction ID is refused.
+    let released = fixture
+        .client
+        .release_utxo(release_request(tx_id))
+        .await?
+        .into_inner()
+        .released;
+    assert!(!released);
+    let err = fixture
+        .client
+        .release_utxo(release_request("no transaction ID"))
+        .await
+        .expect_err("a malformed transaction ID");
+    assert_eq!(err.code(), Code::InvalidArgument, "got: {err}");
     let closed = fixture.client.close(CloseRequest {}).await?.into_inner();
     assert_eq!(closed.drain_tx_id, None);
     fixture.client.get_balance(GetBalanceRequest {}).await?;

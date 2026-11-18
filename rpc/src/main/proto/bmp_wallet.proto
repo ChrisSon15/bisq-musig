@@ -66,6 +66,12 @@ service Wallet {
     // rules (INVALID_ARGUMENT otherwise). The wallet is always password-protected: a password can
     // only be replaced, never removed.
     rpc ChangePassword (ChangePasswordRequest) returns (ChangePasswordResponse);
+    // Releases the reservation of an unspent output, so that the wallet can select it again. The
+    // reserved outputs are the ones that ListUtxos reports with isLocked. This is for outputs that
+    // stayed reserved although no trade uses them any more, for example after the program stopped
+    // during the setup of a trade. An output that a trade known to the server has reserved is
+    // refused with FAILED_PRECONDITION; such a trade releases its outputs with AbandonTrade.
+    rpc ReleaseUtxo (ReleaseUtxoRequest) returns (ReleaseUtxoResponse);
     // To be called when the user ends the program. Moves the coins of all imported keys, which
     // are payouts of closed trades, to an address of the seed wallet with one drain transaction.
     // The transaction is stored in the wallet before it is sent. Coins that are locked for an
@@ -190,6 +196,16 @@ message ChangePasswordRequest {
 
 message ChangePasswordResponse {
     bool success = 1;
+}
+
+message ReleaseUtxoRequest {
+    string txId = 1;
+    uint32 vout = 2;
+}
+
+message ReleaseUtxoResponse {
+    // Whether the output was reserved before the call.
+    bool released = 1;
 }
 
 message CloseRequest {

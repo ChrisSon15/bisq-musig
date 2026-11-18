@@ -453,11 +453,13 @@ Not done:
 - Sending the stored drain transaction again at the next start, and replacing it (N5, test M4,
   M8). This needs the rebroadcast of pull request #235 and WP3.
 - Coins that stay reserved when `musigd` stops during a setup (test H1 after a restart, H8).
-  This needs the trade store of WP5.
+  This needs the trade store of WP5; the project owner accepted to wait for it (point W2 of the
+  wallet specification). Until then the request `ReleaseUtxo` of `wallet.Wallet` releases such a
+  coin by hand (W3).
 - The swap transaction and the custom payout transaction are not recorded in the wallet, because
   the service does not send them yet (WP3).
-- A restore of the wallet from its seed words that finds funds behind the keys of trades (open
-  point W1 of the wallet specification).
+- A restore of the wallet from its seed words that finds funds behind the keys of trades.
+  Postponed until the work packages are finished (section 12, row 9).
 
 ### WP3 Chain access for the engine (estimate: 4 to 6 weeks; issues #61, #188, #190, #196)
 
@@ -893,8 +895,8 @@ implementation exists as a first step (D2).
 
 ## 12. Questions and answers, to be reviewed later
 
-These were the open questions of revision 2. The project owner answered them on 2026-11-17. Row 8
-was added on 2026-11-18. The questions stay here so that the answers can be reviewed later. The column "Review later" names
+These were the open questions of revision 2. The project owner answered them on 2026-11-17. Rows 8
+and 9 were added on 2026-11-18. The questions stay here so that the answers can be reviewed later. The column "Review later" names
 what should be checked at that review.
 
 | # | Question | Answer (2026-11-17) | Where it is in the plan | Review later |
@@ -907,6 +909,7 @@ what should be checked at that review.
 | 6 | Is the reorganisation rule of N8 acceptable: reactions at 1 confirmation, final at 3? | Yes. | N8; WP4; tests A14, J1 to J4 | Nothing specific. |
 | 7 | Does `musigd` keep running when bisq2 is closed? | No. | D7 and the paragraph after the table in section 7.1; N5; WP8 | Nothing is watched while bisq2 is closed. For closed trades the drain at `close` is the only protection in that time. For open trades the user must start the program before the claim lock time ends after a peer warning. Is this acceptable for mainnet, or is a watching process needed later? |
 | 8 | Which actions does a terminated trade (D17) keep after the deposit is signed? Its funds are then locked in the deposit outputs. | Postponed on 2026-11-18. To be decided later. | D17; open point O1 of `docs/specifications/trade/README.md`; `trade-states.md`, section "Terminated trades" | The decision itself. Until then the specification states: the cooperative steps end, and the engine keeps every action that the trader can perform alone (warning, redirect, penalty, claim, swap transaction, reading the key from a spend, deposit abort). Without such a rule a terminated trade would lose its funds. |
+| 9 | How does a wallet that is restored from its seed words find funds on keys of trades that lie behind a long row of unused keys, and how is a trade restored after a crash in the middle of it? | Postponed on 2026-11-18. Restoring, in particular after crashes in the middle of a trade, is made after the work packages are finished. | Point W1 of `docs/specifications/wallet/README.md`; `trade-keys.md`; tests H11, H12; F12 | The scan range of a restored wallet (trade keys are issued in rows without funds), and the restore of trades from the seed and the trade store. |
 
 Points of section 7.2 that were not part of the questions and still need a decision in WP0: N2
 (broadcast without result), N4 (peers and the visible IP address), N7 (wording of the security

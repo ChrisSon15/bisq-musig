@@ -14,17 +14,15 @@ Findings and decisions refer to `concept/CompletionPlan.md` (F12 to F19, D8, D10
 
 ## Open points
 
-Each of these points is a rule that this specification states, but that the project owner has not
-confirmed.
+No point is open.
 
-| # | Question | Rule in the specification | File |
+## Decided points
+
+These points were open. The project owner decided them on 2026-11-18.
+
+| # | Question | Decision | File |
 |---|---|---|---|
-| W1 | A wallet that is restored from its seed words must find funds on keys of trades that lie behind a long row of unused keys. | Not specified. The wallet has no restore from seed words yet. The rule belongs to that function. | [trade-keys.md](trade-keys.md) |
-| W2 | Coins that stay reserved when `musigd` stops during the setup of a trade. | They stay reserved until the trade store exists (work package WP5 of the plan). Then the engine releases them at the next start. | [coin-reservation.md](coin-reservation.md) |
-| W3 | Should the wallet service offer requests to list and release reserved coins by hand? | No such request exists. | [coin-reservation.md](coin-reservation.md) |
-
-Points that were open and are decided:
-
-| # | Question | Decision of the project owner | File |
-|---|---|---|---|
-| W4 | May the caller select the coins of a payment by hand? | 2026-11-18: no. The wallet selects the coins of every transaction, so the rule "imported coins first" has no exception. | [imported-keys.md](imported-keys.md) |
+| W1 | A wallet that is restored from its seed words must find funds on keys of trades that lie behind a long row of unused keys. | Postponed. Restoring, in particular after a crash in the middle of a trade, is designed after the work packages of the plan are finished. Listed in `concept/CompletionPlan.md`, section 12, row 9. | [trade-keys.md](trade-keys.md) |
+| W2 | Coins that stay reserved when `musigd` stops during the setup of a trade. | Accepted until the trade store exists (work package WP5 of the plan). Then the engine releases them at the next start. Until then the user can release them by hand (W3). | [coin-reservation.md](coin-reservation.md) |
+| W3 | Should the wallet service offer a way to list and release reserved coins by hand? | Yes. `ListUtxos` marks the reserved coins, and `ReleaseUtxo` releases one. A coin that a trade known to the engine has reserved is refused. | [coin-reservation.md](coin-reservation.md) |
+| W4 | May the caller select the coins of a payment by hand? | No. The wallet selects the coins of every transaction, so the rule "imported coins first" has no exception. | [imported-keys.md](imported-keys.md) |

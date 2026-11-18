@@ -15,7 +15,8 @@ of the wallet service: every request of a trade needs `musigd` to run with `--wa
 The engine takes the key shares, keys, addresses and coins of a trade from this wallet. It reserves the coins of the
 deposit, and `AbandonTrade` releases them for a trade whose deposit is not signed yet. At the close of a trade the key
 of the payout is imported into the wallet. `Close` of `wallet.Wallet` moves the payouts of closed trades to the seed
-wallet; bisq2 calls it when the user ends the program. The rules are in
+wallet; bisq2 calls it when the user ends the program. `ReleaseUtxo` of `wallet.Wallet` releases a coin that stayed
+reserved without a trade, for example after `musigd` stopped during a setup; `ListUtxos` marks the reserved coins. The rules are in
 [docs/specifications/wallet](../docs/specifications/wallet/README.md).
 
 The lock times of the trades are configuration values of `musigd`, not fields of a request. `musigd` reads them from

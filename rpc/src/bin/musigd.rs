@@ -9,7 +9,7 @@ use bmp_tracing::tracing::{info, warn};
 use chain::CBFScanner;
 use clap::Parser;
 use protocol::params::{EngineConfig, EngineConfigError};
-use protocol::trade_model::MemoryTradeStore;
+use protocol::trade_model::{MemoryTradeStore, TradeModelStore};
 use rpc::bmp_wallet_service::{
     BMPWalletServiceImpl, BitcoinCoreChainApi, BmpWalletImpl, BmpWalletServer,
 };
@@ -133,9 +133,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // The bisq2-facing wallet service is optional: without --wallet-dir there is no BMPWallet to
     // serve.
+    let trades: Arc<dyn TradeModelStore> = Arc::new(MemoryTradeStore::default());
     let bmp_wallet = if let Some(dir) = &cli.wallet_dir {
+        // The wallet service knows the trades, so that it does not release a coin that a trade
+        // has reserved.
         let mut service = BMPWalletServiceImpl::new(dir.clone(), cli.wallet_network)
-            .with_broadcaster(Arc::new(BitcoinCoreChainApi::new(Arc::clone(&rpc_client))));
+            .with_broadcaster(Arc::new(BitcoinCoreChainApi::new(Arc::clone(&rpc_client))))
+            .with_trade_store(Arc::clone(&trades));
 
         if let Some(secs) = cli.wallet_poll_secs {
             service = service.with_poll_period(Duration::from_secs(secs));
@@ -167,11 +171,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         warn!("No --wallet-dir given: the trade service has no wallet and cannot start a trade.");
         Arc::new(NoTradeWallet)
     };
-    let musig = MusigImpl::new(
-        Arc::new(MemoryTradeStore::default()),
-        trade_wallet,
-        engine_config,
-    );
+    let musig = MusigImpl::new(trades, trade_wallet, engine_config);
 
     let mut server = Server::builder().add_service(MusigServer::new(musig));
     if let Some(service) = bmp_wallet {

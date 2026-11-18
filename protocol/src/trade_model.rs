@@ -42,6 +42,11 @@ pub trait TradeModelStore: Send + Sync {
     fn add_trade_model(&self, trade_model: TradeModel) -> Result<()>;
 
     fn get_trade_model(&self, trade_id: &str) -> Option<Arc<Mutex<TradeModel>>>;
+
+    /// The ID of the trade that has reserved the coin `coin` of the wallet for its deposit, if
+    /// there is one. A coin of such a trade must be released through the trade
+    /// ([`TradeModel::abandon`]), never directly in the wallet.
+    fn trade_reserving(&self, coin: &OutPoint) -> Option<String>;
 }
 
 /// A trade store that keeps the trades in memory. They are lost when the process ends.
@@ -51,6 +56,19 @@ pub struct MemoryTradeStore(Mutex<BTreeMap<String, Arc<Mutex<TradeModel>>>>);
 impl TradeModelStore for MemoryTradeStore {
     fn contains_trade(&self, trade_id: &str) -> bool {
         self.0.lock().unwrap().contains_key(trade_id)
+    }
+
+    fn trade_reserving(&self, coin: &OutPoint) -> Option<String> {
+        // The trades are copied first, so that the lock of the store is not held while the lock
+        // of a trade is taken.
+        let trades = self.0.lock().unwrap().values().cloned().collect::<Vec<_>>();
+        trades.into_iter().find_map(|trade| {
+            let trade = trade.lock().unwrap();
+            trade
+                .reserved_coins
+                .contains(coin)
+                .then(|| trade.trade_id.clone())
+        })
     }
 
     fn add_trade_model(&self, trade_model: TradeModel) -> Result<()> {
@@ -2421,6 +2439,34 @@ mod tests {
             let claim_tx = me.model.my_signed_claim_tx().expect("signed");
             assert_eq!(claim_tx.input[0].sequence.0, 10);
         }
+    }
+
+    /// The trade store names the trade that has reserved a coin, as long as the trade holds the
+    /// reservation. The wallet service uses this to refuse a release of such a coin by hand.
+    #[test]
+    fn store_names_the_trade_that_reserved_a_coin() {
+        let (me, _peer) = traders_before_nonce_exchange(ROLE_PAIRS[0]);
+        let coins = me.model.reserved_coins().to_vec();
+        assert!(!coins.is_empty(), "the half deposit reserves coins");
+        let Trader { model, mut wallet } = me;
+        let trade_id = model.trade_id().to_owned();
+
+        let store = MemoryTradeStore::default();
+        store.add_trade_model(model).expect("new trade");
+        for coin in &coins {
+            assert_eq!(store.trade_reserving(coin), Some(trade_id.clone()));
+        }
+        let other_coin = OutPoint::new(coins[0].txid, coins[0].vout + 7);
+        assert_eq!(store.trade_reserving(&other_coin), None);
+
+        // An abandoned trade has released its coins.
+        let trade = store.get_trade_model(&trade_id).expect("stored");
+        trade
+            .lock()
+            .unwrap()
+            .abandon(&mut *wallet)
+            .expect("in Init");
+        assert_eq!(store.trade_reserving(&coins[0]), None);
     }
 
     /// H9: the key shares of a trade come from the wallet (D10). The same wallet seed and the same

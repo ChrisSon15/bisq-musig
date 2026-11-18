@@ -26,12 +26,29 @@ learns about a transaction that it did not build itself.
 Rationale: without a reservation two trades, or a trade and a payment, can select the same coin.
 One of the two transactions then never confirms. This was finding F13.
 
-### What is not covered yet
+### Coins that stay reserved without a trade
 
 The trade store is in memory only. If `musigd` stops while a trade is in its setup, the trade is
-gone but its coins stay reserved in the wallet database. No request releases them. This is open
-point W2 in [README.md](README.md); the specification of the trade store defines the release at
-the next start ([../trade/persistence-and-recovery.md](../trade/persistence-and-recovery.md)).
+gone but its coins stay reserved in the wallet database. This is accepted until the trade store
+exists; then the engine releases such coins at the next start
+([../trade/persistence-and-recovery.md](../trade/persistence-and-recovery.md)).
+
+Until then, and for any other reservation without a trade, the wallet service offers a release by
+hand:
+
+1. **The reserved coins can be listed.** The list of the unspent coins of the wallet marks every
+   reserved coin.
+2. **A reserved coin can be released by a request that names the coin.** The release is stored.
+   A request for a coin that is not reserved succeeds and reports that nothing was released.
+3. **A coin that a trade known to the engine has reserved is refused.** Such a coin is released
+   only through its trade, by abandoning the trade, and only while rule 5 above allows it.
+
+Limit that the user must know: the engine knows only the trades of the running program. If
+`musigd` stopped after the trader signed a deposit transaction, the engine has forgotten that
+trade, and a release by hand is not refused, although the peer can still publish the deposit.
+A payment with the released coin then competes with the deposit: one of the two transactions
+confirms. No funds are lost by this, but the trade can fail. This limit ends with the trade
+store.
 
 ## Recording a transaction
 
