@@ -107,8 +107,7 @@ Consequences:
 - The requests see the derived state. For example, a trader cannot start the payment after the
   warning transaction of the peer confirmed.
 
-This section states rules that the project owner has not confirmed. It is open point O16 in
-[README.md](README.md).
+The project owner accepted this section on 2026-11-18 (D22 in `concept/CompletionPlan.md`).
 
 ## Order of checks for a request
 
