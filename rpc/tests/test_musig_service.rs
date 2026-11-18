@@ -17,7 +17,7 @@
 //! `concept/CompletionPlan.md`, the F numbers to its findings.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bdk_wallet::bitcoin::hashes::Hash as _;
@@ -33,7 +33,9 @@ use chain::client::{
 };
 use futures_util::StreamExt as _;
 use musig2::secp::{Point, Scalar};
-use protocol::mocks::{mock_buyer_trade_wallet, mock_seller_trade_wallet};
+use protocol::mocks::{
+    mock_buyer_trade_wallet_with_store_switch, mock_seller_trade_wallet_with_store_switch,
+};
 use protocol::params::EngineConfig;
 use protocol::state::{ClosureType, TradeState};
 use protocol::trade_model::{MemoryTradeStore, TradeModelStore as _};
@@ -367,10 +369,18 @@ struct RunningService {
 }
 
 fn mock_wallet(is_buyer: bool) -> Arc<MockWalletProvider> {
+    mock_wallet_with_store_switch(is_buyer, Arc::default())
+}
+
+/// A wallet that cannot store a trade record while `store_fails` is set.
+fn mock_wallet_with_store_switch(
+    is_buyer: bool,
+    store_fails: Arc<AtomicBool>,
+) -> Arc<MockWalletProvider> {
     let wallet: Box<dyn ProtocolWalletApi + Send> = if is_buyer {
-        Box::new(mock_buyer_trade_wallet())
+        Box::new(mock_buyer_trade_wallet_with_store_switch(store_fails))
     } else {
-        Box::new(mock_seller_trade_wallet())
+        Box::new(mock_seller_trade_wallet_with_store_switch(store_fails))
     };
     Arc::new(MockWalletProvider(tokio::sync::Mutex::new(wallet)))
 }
@@ -463,6 +473,8 @@ struct Party {
     /// The wallet of the trader. It holds the records of his trades and outlives a restart of
     /// the service.
     wallet: Arc<MockWalletProvider>,
+    /// While this is set, the wallet of the trader cannot store a trade record.
+    store_fails: Arc<AtomicBool>,
     server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
     trade_id: String,
     role: Role,
@@ -478,7 +490,8 @@ impl Party {
     async fn new(trade_id: String, role: Role) -> Self {
         let is_buyer = matches!(role, Role::BuyerAsMaker | Role::BuyerAsTaker);
         let chain = FakeChain::new();
-        let wallet = mock_wallet(is_buyer);
+        let store_fails = Arc::new(AtomicBool::new(false));
+        let wallet = mock_wallet_with_store_switch(is_buyer, Arc::clone(&store_fails));
         let service =
             start_service_with_wallet(Arc::clone(&wallet), Some(Arc::clone(&chain))).await;
         Self {
@@ -486,6 +499,7 @@ impl Party {
             trades: service.trades,
             chain,
             wallet,
+            store_fails,
             server: service.server,
             trade_id,
             role,
@@ -2431,6 +2445,46 @@ async fn h6_damaged_record_stops_the_trade_service() {
         })
         .await;
     assert_refused(result, Code::DataLoss, "could not be loaded");
+}
+
+/// H4: the trade cannot be stored. The request fails, and no key share and no signature of it
+/// is handed out. After a restart the trade is in the state before the request, and the request
+/// is processed as a new request.
+#[tokio::test]
+async fn h4_nothing_leaves_when_the_trade_cannot_be_stored() {
+    // The seller's key share (message F).
+    let mut trade = Trade::at(TradeType::TakerIsBuyer, Stage::PaymentStarted).await;
+    let state_before = trade.seller.state();
+    trade.seller.store_fails.store(true, Ordering::Relaxed);
+    let result = trade.seller.release_payout().await;
+    assert_refused(result, Code::Internal, "could not be stored");
+    trade.seller.restart().await;
+    assert_eq!(trade.seller.state(), state_before);
+    trade.seller.store_fails.store(false, Ordering::Relaxed);
+    trade.release_payout().await;
+
+    // The buyer's signature for the swap transaction (message E).
+    let mut trade = Trade::at(TradeType::TakerIsBuyer, Stage::DepositSigned).await;
+    trade.buyer.store_fails.store(true, Ordering::Relaxed);
+    let result = trade.buyer.start_payment().await;
+    assert_refused(result, Code::Internal, "could not be stored");
+    trade.buyer.restart().await;
+    assert_eq!(trade.buyer.state(), TradeState::Deposit);
+    trade.buyer.store_fails.store(false, Ordering::Relaxed);
+    trade.buyer_starts_payment().await;
+
+    // A new trade is not created without a stored record.
+    let mut party = Party::new("trade-x".to_owned(), Role::BuyerAsTaker).await;
+    party.store_fails.store(true, Ordering::Relaxed);
+    let request = PubKeySharesRequest {
+        trade_id: party.trade_id.clone(),
+        my_role: Role::BuyerAsTaker.into(),
+    };
+    let result = party.client.init_trade(request).await;
+    assert_refused(result, Code::Internal, "could not be stored");
+    assert!(party.trades.get_trade_model(&party.trade_id).is_none());
+    let records = party.wallet.0.lock().await.trade_records();
+    assert_eq!(records.expect("records"), vec![]);
 }
 
 /// H8: after a restart the reservations in the wallet agree with the trades. A coin that no

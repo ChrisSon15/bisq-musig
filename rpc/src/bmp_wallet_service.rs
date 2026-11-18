@@ -87,6 +87,15 @@ pub struct ReservedByTrade {
     pub trade_id: String,
 }
 
+/// Returned by [`BmpWalletService::release_utxo`] while the trades of the wallet could not be
+/// loaded: the engine then does not know which reserved coins belong to a trade. Surfaced to
+/// gRPC clients as `FAILED_PRECONDITION`.
+#[derive(Debug, Error)]
+#[error("the trades of the wallet could not be loaded, so no reserved coin is released: {reason}")]
+pub struct TradesNotLoaded {
+    pub reason: String,
+}
+
 /// The GUI-facing wallet operations.
 ///
 /// Every method maps one-to-one onto an RPC of the `wallet.Wallet` service and, in turn, onto a
@@ -552,6 +561,13 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
         // its trade, so no trade can reserve the coin between the check and the release.
         let mut guard = self.wallet.lock().await;
         let wallet = require_open(&mut guard)?;
+        if let Some(reason) = self
+            .trade_store
+            .as_ref()
+            .and_then(|trades| trades.unusable())
+        {
+            return Err(TradesNotLoaded { reason }.into());
+        }
         if let Some(trade_id) = self
             .trade_store
             .as_ref()
@@ -894,6 +910,7 @@ fn status_from(error: &anyhow::Error) -> Status {
     let message = format!("{error:#}");
     if error.downcast_ref::<WalletNotOpen>().is_some()
         || error.downcast_ref::<ReservedByTrade>().is_some()
+        || error.downcast_ref::<TradesNotLoaded>().is_some()
     {
         Status::failed_precondition(message)
     } else if is_invalid_password(error) {
@@ -1216,6 +1233,36 @@ mod tests {
         )
     }
 
+    /// H6: a wallet with a trade record that cannot be loaded. The wallet opens, no trade is
+    /// loaded, the reserved coins stay reserved, and none of them is released by hand.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wallet_with_a_damaged_trade_record_keeps_its_reserved_coins() {
+        let (dir, service) = service();
+        service.open_or_create_wallet(PASSWORD).await.unwrap();
+        {
+            let mut guard = service.wallet.lock().await;
+            let wallet = guard.as_mut().unwrap();
+            wallet.lock_utxo(coin(0)).unwrap();
+            wallet.store_trade_record("trade-1", b"no record").unwrap();
+        }
+        drop(service);
+
+        let trades = Arc::new(protocol::trade_model::MemoryTradeStore::default());
+        let service =
+            BMPWalletServiceImpl::<NoopChainDataSource>::new(dir.path(), Network::Regtest)
+                .with_trade_store(Arc::clone(&trades) as _);
+        service.open_or_create_wallet(PASSWORD).await.unwrap();
+        let reason = trades.unusable().expect("the trades are not loaded");
+        assert!(reason.contains("trade-1"), "{reason}");
+        assert!(trades.trade_models().is_empty());
+
+        let err = service.release_utxo(coin(0)).await.unwrap_err();
+        assert!(err.downcast_ref::<TradesNotLoaded>().is_some());
+        assert_eq!(status_from(&err).code(), tonic::Code::FailedPrecondition);
+        let mut guard = service.wallet.lock().await;
+        assert!(guard.as_mut().unwrap().is_utxo_locked(coin(0)));
+    }
+
     /// W3: a reserved coin can be released by hand, and the release is stored. A coin that a
     /// trade of the engine has reserved is refused.
     #[tokio::test(flavor = "multi_thread")]
@@ -1275,7 +1322,7 @@ mod tests {
                 .change_password(PASSWORD, NEW_PASSWORD)
                 .await
                 .is_err()
-        );    
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

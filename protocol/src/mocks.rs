@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bdk_wallet::bitcoin::bip32::Xpriv;
 use bdk_wallet::bitcoin::taproot::Signature;
@@ -30,6 +32,9 @@ struct MockTradeWallet<Cs: Iterator<Item = TxOutput>, As: Iterator<Item = Addres
     seed: [u8; 32],
     locked_utxos: BTreeSet<OutPoint>,
     trade_records: BTreeMap<String, Vec<u8>>,
+    /// While this is set, the wallet cannot store a trade record, like a wallet with a full or
+    /// failing disk.
+    store_fails: Arc<AtomicBool>,
 }
 
 impl<Cs: Iterator<Item = TxOutput>, As: Iterator<Item = Address>> ProtocolWalletApi
@@ -182,6 +187,9 @@ impl<Cs: Iterator<Item = TxOutput>, As: Iterator<Item = Address>> ProtocolWallet
     }
 
     fn store_trade_record(&mut self, trade_id: &str, record: &[u8]) -> wallet::error::Result<()> {
+        if self.store_fails.load(Ordering::Relaxed) {
+            return Err(WalletErrorKind::Unsupported("the mock wallet was told to fail"));
+        }
         self.trade_records.insert(trade_id.to_owned(), record.to_vec());
         Ok(())
     }
@@ -209,8 +217,20 @@ impl<Cs: Iterator<Item = TxOutput>, As: Iterator<Item = Address>> ProtocolWallet
     }
 }
 
-//noinspection SpellCheckingInspection
 pub fn mock_buyer_trade_wallet() -> impl ProtocolWalletApi {
+    mock_buyer_trade_wallet_with_store_switch(Arc::default())
+}
+
+pub fn mock_seller_trade_wallet() -> impl ProtocolWalletApi {
+    mock_seller_trade_wallet_with_store_switch(Arc::default())
+}
+
+/// As [`mock_buyer_trade_wallet`]. While `store_fails` is set, the wallet cannot store a trade
+/// record.
+//noinspection SpellCheckingInspection
+pub fn mock_buyer_trade_wallet_with_store_switch(
+    store_fails: Arc<AtomicBool>,
+) -> impl ProtocolWalletApi {
     let funding_coins = [
         "658654575bbbeb46e965bd9eb37fd3be550a7e0fa2d64bc5f218763155602300:0",
     ].map(TxOutput::mock_1_btc_coin).into_iter();
@@ -243,11 +263,16 @@ pub fn mock_buyer_trade_wallet() -> impl ProtocolWalletApi {
         seed: [1; 32],
         locked_utxos: BTreeSet::new(),
         trade_records: BTreeMap::new(),
+        store_fails,
     }
 }
 
+/// As [`mock_seller_trade_wallet`]. While `store_fails` is set, the wallet cannot store a trade
+/// record.
 //noinspection SpellCheckingInspection
-pub fn mock_seller_trade_wallet() -> impl ProtocolWalletApi {
+pub fn mock_seller_trade_wallet_with_store_switch(
+    store_fails: Arc<AtomicBool>,
+) -> impl ProtocolWalletApi {
     let funding_coins = [
         "4a5ecc72ec8db78f11c6785f560a13f6f32eac66d160a8157d30956695ccf523:0",
         "373b3ca0b9135e9649672772d4659bb5597d06b4694f1fbdbece285823fde0a3:1",
@@ -284,6 +309,7 @@ pub fn mock_seller_trade_wallet() -> impl ProtocolWalletApi {
         seed: [2; 32],
         locked_utxos: BTreeSet::new(),
         trade_records: BTreeMap::new(),
+        store_fails,
     }
 }
 
