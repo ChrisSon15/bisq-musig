@@ -39,8 +39,12 @@ public class MusigdProcess implements AutoCloseable {
     /**
      * Launches musigd on {@code port} with a fresh, throwaway wallet directory.
      *
-     * @param p2pAddr bitcoind's P2P address for compact-block-filter syncing, or {@code null} to
-     *                run without chain syncing
+     * <p>musigd reaches the chain only through the peer-to-peer network. It has no options for
+     * the RPC interface of a node any more, so {@code rpcUrl}, {@code rpcUser} and
+     * {@code rpcPass} are not used. They are kept so that the callers do not change.
+     *
+     * @param p2pAddr bitcoind's P2P address for compact-block-filter syncing and for sending
+     *                transactions, or {@code null} to run without access to the chain
      * @param pollSeconds how often the wallet re-syncs; keep it short so tests don't crawl
      */
     public static MusigdProcess start(int port,
@@ -79,10 +83,7 @@ public class MusigdProcess implements AutoCloseable {
                 "--port", String.valueOf(port),
                 "--wallet-dir", walletDir.toString(),
                 "--wallet-network", "regtest",
-                "--wallet-poll-secs", String.valueOf(pollSeconds),
-                "--bitcoin-rpc-url", rpcUrl,
-                "--bitcoin-rpc-user", rpcUser,
-                "--bitcoin-rpc-pass", rpcPass));
+                "--wallet-poll-secs", String.valueOf(pollSeconds)));
         if (p2pAddr != null && !p2pAddr.isBlank()) {
             command.add("--wallet-peer");
             command.add(p2pAddr);

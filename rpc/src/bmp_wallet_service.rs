@@ -25,11 +25,12 @@ use ::wallet::error::WalletErrorKind;
 use ::wallet::password::{InvalidPassword, Password, WeakPassword};
 use ::wallet::protocol_wallet_api::ProtocolWalletApi as _;
 use ::wallet::wallet_info::{PubAddressInfo, TxInfo, TxOutputInfo, UtxoInfo};
-use bdk_bitcoind_rpc::bitcoincore_rpc::{Client, RpcApi as _};
 use bdk_wallet::Balance;
 use bdk_wallet::bitcoin::address::{NetworkUnchecked, ParseError};
-use bdk_wallet::bitcoin::{Address, Amount, FeeRate, Network, OutPoint, Transaction, Txid};
-use chain::{ChainApi, ChainApiError};
+use bdk_wallet::bitcoin::{
+    Address, Amount, BlockHash, FeeRate, Network, OutPoint, Transaction, Txid,
+};
+use chain::ChainApi;
 use futures_util::never::Never;
 use futures_util::stream::{BoxStream, StreamExt as _};
 use protocol::params::engine_fee_rate;
@@ -65,6 +66,9 @@ const WALLET_OPEN_POLL_PERIOD: Duration = Duration::from_millis(500);
 
 /// Fee rate used when the client doesn't specify one. 2 sat/vB == 500 sat/kwu.
 const DEFAULT_FEE_RATE: FeeRate = FeeRate::from_sat_per_kwu(500);
+
+/// The number of known blocks below the chain tip of the wallet at which a chain client starts.
+const CHAIN_START_DEPTH: usize = 10;
 
 /// A wallet operation was attempted before `OpenOrCreateWallet` opened the wallet. Reported to
 /// gRPC clients as `FAILED_PRECONDITION`.
@@ -272,6 +276,22 @@ impl<S> BMPWalletServiceImpl<S> {
             trade_store: Some(trade_store),
             ..self
         }
+    }
+
+    /// The block at which a chain client that starts now should begin: the block that lies
+    /// [`CHAIN_START_DEPTH`] known blocks below the chain tip of the wallet. `None` if no wallet
+    /// is open, or if the wallet knows only the first block of the chain.
+    ///
+    /// The distance to the tip keeps the client correct if the last blocks of the wallet are
+    /// replaced by a reorganisation.
+    pub async fn chain_start_point(&self) -> Option<(u32, BlockHash)> {
+        let guard = self.wallet.lock().await;
+        let start = guard
+            .as_ref()?
+            .checkpoints()
+            .take(CHAIN_START_DEPTH + 1)
+            .last()?;
+        (start.height() > 0).then(|| (start.height(), start.hash()))
     }
 
     #[must_use]
@@ -599,23 +619,6 @@ impl<S: Send + Sync> crate::server::TradeWalletProvider for BMPWalletServiceImpl
             }
             None => false,
         }
-    }
-}
-
-/// Publishes transactions through a Bitcoin Core node.
-pub struct BitcoinCoreChainApi(Arc<Client>);
-
-impl BitcoinCoreChainApi {
-    pub const fn new(client: Arc<Client>) -> Self {
-        Self(client)
-    }
-}
-
-impl ChainApi for BitcoinCoreChainApi {
-    fn transaction_broadcast(&self, tx: &Transaction) -> std::result::Result<Txid, ChainApiError> {
-        self.0
-            .send_raw_transaction(tx)
-            .map_err(ChainApiError::backend)
     }
 }
 
@@ -1019,6 +1022,7 @@ mod tests {
     use bdk_wallet::PersistedWallet;
     use bdk_wallet::bitcoin::Network;
     use bdk_wallet::rusqlite::Connection;
+    use chain::ChainApiError;
     use protocol::trade_model::{ProtocolErrorKind, TradeModel};
     use tempfile::tempdir;
 

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use bdk_wallet::bitcoin::address::{NetworkChecked, NetworkUnchecked, NetworkValidation};
 use bdk_wallet::bitcoin::{
-    Address, Amount, FeeRate, Network, OutPoint, Psbt, TapSighash, Transaction, Txid,
+    Address, Amount, FeeRate, Network, OutPoint, Psbt, ScriptBuf, TapSighash, Transaction, Txid,
     XOnlyPublicKey,
 };
 use musig2::secp::{MaybeScalar, Point, Scalar};
@@ -1200,6 +1200,31 @@ impl TradeModel {
     pub fn signed_deposit_tx(&self) -> Result<Transaction> {
         access!(self, _ if self.state >= Deposit)?;
         Ok(self.deposit_tx.builder.signed_tx()?)
+    }
+
+    /// The ID of the deposit transaction. It is known as soon as the trader has signed the
+    /// deposit, also for the trader who does not publish it.
+    pub fn deposit_txid(&self) -> Result<Txid> {
+        access!(self, _ if self.state >= Deposit)?;
+        Ok(self.deposit_tx.builder.psbt()?.unsigned_tx.compute_txid())
+    }
+
+    /// The outputs that must be watched on the chain for this trade, from the moment the trader
+    /// signed the deposit transaction: the payouts of the buyer and of the seller in the deposit
+    /// transaction, and the escrow outputs of the buyer's and of the seller's warning
+    /// transaction. Every transaction that can end the trade spends one of them.
+    pub fn outputs_to_watch(&self) -> Result<Vec<(OutPoint, ScriptBuf)>> {
+        access!(self, _ if self.state >= Deposit)?;
+        let outputs = [
+            self.deposit_tx.builder.buyer_payout()?.clone(),
+            self.deposit_tx.builder.seller_payout()?.clone(),
+            self.buyer_txs.warning.builder.escrow()?,
+            self.seller_txs.warning.builder.escrow()?,
+        ];
+        Ok(outputs
+            .into_iter()
+            .map(|output| (output.outpoint, output.prevout.script_pubkey))
+            .collect())
     }
 
     pub fn my_private_key_share_for_peer_output(&self) -> Result<&Scalar> {

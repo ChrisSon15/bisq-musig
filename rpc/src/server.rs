@@ -5,22 +5,24 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use bdk_wallet::bitcoin::{Amount, FeeRate, Psbt, Transaction, consensus};
+use bdk_wallet::bitcoin::{Amount, FeeRate, Psbt, Transaction, Txid, consensus};
 use bdk_wallet::serde_json;
+use chain::client::ChainAccess;
 use drop_stream::DropStreamExt as _;
 use futures_util::stream::{self, BoxStream, Stream, TryStream, TryStreamExt as _};
 use musig2::PartialSignature;
 use musig2::secp::Scalar;
 use protocol::params::{EngineConfig, TradeParams};
+use protocol::state::TradeState;
 use protocol::storage::ByVal;
 use protocol::trade_model::{
     ExchangedKeys, ExchangedSigs, PeerData, ProtocolErrorKind, TradeModel, TradeModelStore,
     UndecodablePeerData,
 };
 use serde::Serialize;
-use tokio::time::{self, Duration};
+use tokio::sync::broadcast::error::RecvError;
 use tonic::{Request, Response, Result, Status};
-use tracing::{Span, debug, error, info, instrument, trace};
+use tracing::{Span, debug, error, info, instrument, trace, warn};
 use wallet::protocol_wallet_api::ProtocolWalletApi;
 
 use crate::pb::convert::{CheckInSignedRange as _, TryProtoInto};
@@ -64,6 +66,9 @@ pub struct MusigImpl {
     trades: Arc<dyn TradeModelStore>,
     wallet: Arc<dyn TradeWalletProvider>,
     config: EngineConfig,
+    /// The access to the chain. Without it the service can set up a trade, but it cannot
+    /// publish or observe the deposit transaction.
+    chain: Option<Arc<dyn ChainAccess>>,
 }
 
 impl MusigImpl {
@@ -76,7 +81,34 @@ impl MusigImpl {
             trades,
             wallet,
             config,
+            chain: None,
         }
+    }
+
+    /// Supplies the access to the chain.
+    #[must_use]
+    pub fn with_chain(mut self, chain: Arc<dyn ChainAccess>) -> Self {
+        self.chain = Some(chain);
+        self
+    }
+
+    /// The access to the chain, or the status for a request that needs it.
+    fn chain(&self) -> Result<Arc<dyn ChainAccess>> {
+        self.chain.clone().ok_or_else(|| {
+            Status::failed_precondition(
+                "the trade service has no access to the chain; start musigd with a peer",
+            )
+        })
+    }
+
+    /// Watches the outputs of a trade whose deposit transaction the trader has signed.
+    fn watch_trade(&self, trade_model: &TradeModel) -> Result<(), HandlerError> {
+        if let Some(chain) = &self.chain {
+            for (outpoint, script) in trade_model.outputs_to_watch()? {
+                chain.watch_output(outpoint, script);
+            }
+        }
+        Ok(())
     }
 
     /// Runs `operation` with the wallet of the trader, or returns an error if no wallet is open.
@@ -162,7 +194,12 @@ impl musig_server::Musig for MusigImpl {
                     buyer_output_pub_key_share: my_key_shares.buyer_payout.serialize().into(),
                     seller_output_pub_key_share: my_key_shares.seller_payout.serialize().into(),
                     multisig_script_key: my_key_shares.multisig_script.serialize().into(),
-                    current_block_height: 900_000,
+                    // The height 0 means that the chain is not known (yet).
+                    current_block_height: self
+                        .chain
+                        .as_ref()
+                        .and_then(|chain| chain.tip_height())
+                        .unwrap_or(0),
                 };
                 self.trades.add_trade_model(trade_model)?;
 
@@ -265,6 +302,8 @@ impl musig_server::Musig for MusigImpl {
             let peers_partial_signatures: PeerData<ExchangedSigs<ByVal>> =
                 peers_partial_signatures.try_proto_into().peer_data();
             trade_model.receive_partial_signatures(wallet, peers_partial_signatures)?;
+            // From now on the peer can publish the deposit transaction.
+            self.watch_trade(trade_model)?;
             let deposit_psbt = trade_model.deposit_psbt()?;
 
             Ok(DepositPsbt {
@@ -281,19 +320,31 @@ impl musig_server::Musig for MusigImpl {
         &self,
         request: Request<PublishDepositTxRequest>,
     ) -> Result<Response<Self::PublishDepositTxStream>> {
-        self.handle_trade_request(request, |request, trade_model, wallet| {
+        // Checked first: without access to the chain the request changes nothing.
+        let chain = self.chain()?;
+        let deposit_timeout = self.config.deposit_timeout();
+        self.handle_trade_request(request, move |request, trade_model, wallet| {
             let peers_deposit_psbt = request
                 .peers_deposit_psbt
                 .ok_or_else(|| Status::not_found("missing request.peers_deposit_psbt"))?;
             let peers_deposit_psbt: PeerData<Psbt> =
                 peers_deposit_psbt.deposit_psbt.try_proto_into().peer_data();
             let deposit_tx = trade_model.receive_deposit_psbt(wallet, peers_deposit_psbt)?;
+            for (outpoint, script) in trade_model.outputs_to_watch()? {
+                chain.watch_output(outpoint, script);
+            }
+            // The sending continues when the caller drops the stream of this response.
+            tokio::spawn(send_until_confirmed(
+                Arc::clone(&chain),
+                deposit_tx.clone(),
+                u32::from(deposit_timeout),
+            ));
 
-            info!("*** BROADCAST DEPOSIT TX ***"); // TODO: Implement broadcast.
-
-            Ok(mock_tx_confirmation_status_stream(
+            Ok(tx_confirmation_status_stream(
+                chain,
                 request.trade_id,
-                consensus::serialize(&deposit_tx),
+                deposit_tx.compute_txid(),
+                Some(consensus::serialize(&deposit_tx)),
             )
             .box_traced())
         })
@@ -307,9 +358,19 @@ impl musig_server::Musig for MusigImpl {
         &self,
         request: Request<SubscribeTxConfirmationStatusRequest>,
     ) -> Result<Response<Self::SubscribeTxConfirmationStatusStream>> {
-        self.handle_trade_request(request, |request, _trade_model, _wallet| {
+        let chain = self.chain()?;
+        self.handle_trade_request(request, move |request, trade_model, _wallet| {
+            // Before the trader has signed the deposit transaction there is nothing to observe.
+            if trade_model.state() == TradeState::Init {
+                return Err(ProtocolErrorKind::NotAllowedInState(TradeState::Init).into());
+            }
+            let deposit_txid = trade_model.deposit_txid()?;
+            for (outpoint, script) in trade_model.outputs_to_watch()? {
+                chain.watch_output(outpoint, script);
+            }
+
             Ok(
-                mock_tx_confirmation_status_stream(request.trade_id, b"signed_deposit_tx".into())
+                tx_confirmation_status_stream(chain, request.trade_id, deposit_txid, None)
                     .box_traced(),
             )
         })
@@ -454,19 +515,95 @@ impl musig_server::Musig for MusigImpl {
     }
 }
 
-fn mock_tx_confirmation_status_stream(
+/// The number of confirmations at which a transaction counts as confirmed.
+const MIN_CONFIRMATIONS: u32 = protocol::params::MIN_CONFIRMATIONS as u32;
+
+/// Sends a transaction to the network, and again after every new block in which it was not
+/// confirmed, because a broadcast has no result: the engine does not learn whether a node
+/// accepted the transaction. The sending ends when the transaction counts as confirmed, or after
+/// `max_blocks` blocks without that.
+async fn send_until_confirmed(chain: Arc<dyn ChainAccess>, tx: Transaction, max_blocks: u32) {
+    let txid = tx.compute_txid();
+    let mut events = chain.subscribe();
+    let start_height = chain.tip_height();
+    let mut last_sent_at = None;
+    loop {
+        let height = chain.tip_height();
+        let confirmations = chain.confirmations(&txid);
+        if confirmations >= MIN_CONFIRMATIONS {
+            info!(%txid, "The transaction is confirmed.");
+            return;
+        }
+        let blocks_passed = start_height
+            .zip(height)
+            .map_or(0, |(start, height)| height.saturating_sub(start));
+        if blocks_passed > max_blocks {
+            warn!(%txid, max_blocks, "The transaction is not confirmed. Sending ends.");
+            return;
+        }
+        if confirmations == 0 && last_sent_at != Some(height) {
+            match chain.broadcast(tx.clone()).await {
+                // "Sent" does not mean that a node accepted the transaction.
+                Ok(_) => info!(%txid, ?height, "Sent the transaction to the network."),
+                Err(error) => warn!(%txid, %error, "Could not send the transaction."),
+            }
+            last_sent_at = Some(height);
+        }
+        match events.recv().await {
+            Ok(_) | Err(RecvError::Lagged(_)) => {}
+            Err(RecvError::Closed) => return,
+        }
+    }
+}
+
+/// The events about the confirmation of a transaction: one event for every change of its number
+/// of confirmations that the service observes, from the first confirmation on. Blocks that arrive
+/// together can give one event, so a number can be left out. The stream ends when the transaction
+/// counts as confirmed. After a reorganisation the number can fall, also to 0.
+///
+/// `signed_tx` is the transaction, if the caller holds it. Otherwise the events contain the
+/// transaction as it was found in a block.
+fn tx_confirmation_status_stream(
+    chain: Arc<dyn ChainAccess>,
     trade_id: String,
-    tx: Vec<u8>,
+    txid: Txid,
+    signed_tx: Option<Vec<u8>>,
 ) -> impl Stream<Item = Result<TxConfirmationStatus>> {
-    let confirmation_event = TxConfirmationStatus {
-        tx,
-        current_block_height: 900_001,
-        num_confirmations: 1,
-    };
-    stream::once(async {
-        time::sleep(Duration::from_secs(5)).await;
-        Ok(confirmation_event)
-    })
+    let events = chain.subscribe();
+    let state = (chain, events, None::<u32>, signed_tx);
+    stream::unfold(
+        state,
+        move |(chain, mut events, reported, signed_tx)| async move {
+            if reported.is_some_and(|confirmations| confirmations >= MIN_CONFIRMATIONS) {
+                return None;
+            }
+            loop {
+                let confirmations = chain.confirmations(&txid);
+                let changed = match reported {
+                    Some(reported) => reported != confirmations,
+                    None => confirmations > 0,
+                };
+                if changed {
+                    let tx = signed_tx.clone().unwrap_or_else(|| {
+                        chain
+                            .transaction(&txid)
+                            .map(|found| consensus::serialize(&*found.tx))
+                            .unwrap_or_default()
+                    });
+                    let status = TxConfirmationStatus {
+                        tx,
+                        current_block_height: chain.tip_height().unwrap_or(0),
+                        num_confirmations: confirmations,
+                    };
+                    return Some((Ok(status), (chain, events, Some(confirmations), signed_tx)));
+                }
+                match events.recv().await {
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return None,
+                }
+            }
+        },
+    )
     .on_drop(move || {
         debug!(
             trade_id,

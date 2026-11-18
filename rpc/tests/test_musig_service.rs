@@ -16,17 +16,19 @@
 //! The test IDs in the comments (B1, C1, K1, ...) refer to section 9.4 of
 //! `concept/CompletionPlan.md`, the F numbers to its findings.
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bdk_wallet::bitcoin::hashes::Hash as _;
 use bdk_wallet::bitcoin::secp256k1::{Message, Secp256k1};
 use bdk_wallet::bitcoin::sighash::{Prevouts, SighashCache};
 use bdk_wallet::bitcoin::transaction::Version;
 use bdk_wallet::bitcoin::{
-    Address, Amount, Network, OutPoint, Psbt, ScriptBuf, Sequence, TapSighashType, Transaction,
-    TxIn, TxOut, Txid, XOnlyPublicKey, absolute, consensus, taproot,
+    Address, Amount, BlockHash, Network, OutPoint, Psbt, ScriptBuf, Sequence, TapSighashType,
+    Transaction, TxIn, TxOut, Txid, XOnlyPublicKey, absolute, consensus, taproot,
 };
+use chain::client::{BroadcastFuture, ChainAccess, ChainEvent, ConfirmedTx};
 use futures_util::StreamExt as _;
 use musig2::secp::{Point, Scalar};
 use protocol::mocks::{mock_buyer_trade_wallet, mock_seller_trade_wallet};
@@ -45,6 +47,7 @@ use rpc::pb::musigrpc::{
 };
 use rpc::server::{MusigImpl, MusigServer, TradeWalletProvider, WalletOperation};
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Channel, Server};
 use tonic::{Code, Response, Status, Streaming};
@@ -169,20 +172,156 @@ impl TradeWalletProvider for MockWalletProvider {
     }
 }
 
+/// A chain without a network, for the service of one trader. The test decides which transactions
+/// a new block contains.
+struct FakeChain {
+    state: Mutex<FakeChainState>,
+    events: broadcast::Sender<ChainEvent>,
+}
+
+struct FakeChainState {
+    height: u32,
+    /// The transactions that the service sent, in the order of sending.
+    sent: Vec<Transaction>,
+    confirmed: HashMap<Txid, ConfirmedTx>,
+    watched_outputs: Vec<OutPoint>,
+}
+
+impl FakeChain {
+    const START_HEIGHT: u32 = 100;
+
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(FakeChainState {
+                height: Self::START_HEIGHT,
+                sent: Vec::new(),
+                confirmed: HashMap::new(),
+                watched_outputs: Vec::new(),
+            }),
+            events: broadcast::channel(64).0,
+        })
+    }
+
+    fn sent(&self) -> Vec<Transaction> {
+        self.state.lock().unwrap().sent.clone()
+    }
+
+    fn watched_outputs(&self) -> Vec<OutPoint> {
+        self.state.lock().unwrap().watched_outputs.clone()
+    }
+
+    /// Adds a block with the transactions `txs` to the chain.
+    fn mine(&self, txs: &[Transaction]) {
+        let height = {
+            let mut state = self.state.lock().unwrap();
+            state.height += 1;
+            let height = state.height;
+            for tx in txs {
+                let confirmed = ConfirmedTx {
+                    tx: Arc::new(tx.clone()),
+                    height,
+                    block_hash: BlockHash::all_zeros(),
+                };
+                state.confirmed.insert(tx.compute_txid(), confirmed);
+            }
+            height
+        };
+        for tx in txs {
+            let _ = self.events.send(ChainEvent::Confirmed {
+                txid: tx.compute_txid(),
+                height,
+            });
+        }
+        let _ = self.events.send(ChainEvent::Synced { height });
+    }
+}
+
+impl ChainAccess for FakeChain {
+    fn watch_script(&self, _script: ScriptBuf) {}
+
+    fn watch_output(&self, outpoint: OutPoint, _script: ScriptBuf) {
+        let mut state = self.state.lock().unwrap();
+        if !state.watched_outputs.contains(&outpoint) {
+            state.watched_outputs.push(outpoint);
+        }
+    }
+
+    fn tip_height(&self) -> Option<u32> {
+        Some(self.state.lock().unwrap().height)
+    }
+
+    fn synced_height(&self) -> Option<u32> {
+        self.tip_height()
+    }
+
+    fn transaction(&self, txid: &Txid) -> Option<ConfirmedTx> {
+        self.state.lock().unwrap().confirmed.get(txid).cloned()
+    }
+
+    fn confirmations(&self, txid: &Txid) -> u32 {
+        let state = self.state.lock().unwrap();
+        state
+            .confirmed
+            .get(txid)
+            .map_or(0, |found| state.height - found.height + 1)
+    }
+
+    fn spending_tx(&self, outpoint: &OutPoint) -> Option<ConfirmedTx> {
+        let state = self.state.lock().unwrap();
+        state
+            .confirmed
+            .values()
+            .find(|found| {
+                found
+                    .tx
+                    .input
+                    .iter()
+                    .any(|input| input.previous_output == *outpoint)
+            })
+            .cloned()
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<ChainEvent> {
+        self.events.subscribe()
+    }
+
+    fn broadcast(&self, tx: Transaction) -> BroadcastFuture {
+        let txid = tx.compute_txid();
+        self.state.lock().unwrap().sent.push(tx);
+        Box::pin(async move { Ok(txid) })
+    }
+}
+
 /// Starts a `musigrpc.Musig` service for one trader on a free loopback port. Returns a connected
-/// client and the trade store of the service, from which the tests read the state of a trade.
-async fn start_service(is_buyer: bool) -> (MusigClient<Channel>, Arc<MemoryTradeStore>) {
+/// client, the trade store of the service, from which the tests read the state of a trade, and
+/// the chain of the service.
+async fn start_service(
+    is_buyer: bool,
+) -> (MusigClient<Channel>, Arc<MemoryTradeStore>, Arc<FakeChain>) {
+    let chain = FakeChain::new();
+    let (client, trades) = start_service_with_chain(is_buyer, Some(Arc::clone(&chain))).await;
+    (client, trades, chain)
+}
+
+/// As [`start_service`], for a service with the given chain, or without access to a chain.
+async fn start_service_with_chain(
+    is_buyer: bool,
+    chain: Option<Arc<FakeChain>>,
+) -> (MusigClient<Channel>, Arc<MemoryTradeStore>) {
     let wallet: Box<dyn ProtocolWalletApi + Send> = if is_buyer {
         Box::new(mock_buyer_trade_wallet())
     } else {
         Box::new(mock_seller_trade_wallet())
     };
     let trades = Arc::new(MemoryTradeStore::default());
-    let service = MusigImpl::new(
+    let mut service = MusigImpl::new(
         Arc::clone(&trades) as _,
         Arc::new(MockWalletProvider(tokio::sync::Mutex::new(wallet))),
         EngineConfig::new(WARNING_LOCK_TIME, CLAIM_LOCK_TIME, 144, 6).expect("valid configuration"),
     );
+    if let Some(chain) = chain {
+        service = service.with_chain(chain as _);
+    }
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -227,6 +366,7 @@ fn mock_redirection_receivers() -> Vec<ReceiverAddressAndAmount> {
 struct Party {
     client: MusigClient<Channel>,
     trades: Arc<MemoryTradeStore>,
+    chain: Arc<FakeChain>,
     trade_id: String,
     role: Role,
     key_shares: Option<PubKeySharesResponse>,
@@ -240,10 +380,11 @@ struct Party {
 impl Party {
     async fn new(trade_id: String, role: Role) -> Self {
         let is_buyer = matches!(role, Role::BuyerAsMaker | Role::BuyerAsTaker);
-        let (client, trades) = start_service(is_buyer).await;
+        let (client, trades, chain) = start_service(is_buyer).await;
         Self {
             client,
             trades,
+            chain,
             trade_id,
             role,
             key_shares: None,
@@ -1367,8 +1508,17 @@ async fn check_setup_messages(trade: &mut Trade) {
     );
 }
 
-/// Signs and publishes the deposit transaction and checks it. The confirmation events are mock
-/// data of the service (F3), so only the transaction of the publisher's event is checked.
+/// Reads the next event of a confirmation stream, with a limit for the waiting time.
+async fn next_event(events: &mut Streaming<TxConfirmationStatus>) -> Option<TxConfirmationStatus> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), events.next())
+        .await
+        .expect("the stream answers in time")
+        .map(|event| event.expect("event without error"))
+}
+
+/// Signs and publishes the deposit transaction and checks it and the confirmation events (F3):
+/// the publisher sends the transaction to the network, both traders watch the outputs of the
+/// trade, and both get one event for each of the first three confirmations.
 async fn check_deposit(trade: &mut Trade) {
     trade.sign_deposit_tx().await;
     let deposit_tx = trade.deposit_tx();
@@ -1381,20 +1531,39 @@ async fn check_deposit(trade: &mut Trade) {
         trade_fee_output.script_pubkey,
         address(TRADE_FEE_RECEIVER.0).script_pubkey()
     );
+    // From the moment a trader has signed the deposit, the two payouts and the escrow outputs
+    // of both warning transactions are watched.
+    let expected_watch_list = vec![
+        trade.buyer_payout().0,
+        trade.seller_payout().0,
+        OutPoint::new(txid(&ids.buyers_warning_tx_id), 0),
+        OutPoint::new(txid(&ids.sellers_warning_tx_id), 0),
+    ];
+    for party in [&trade.buyer, &trade.seller] {
+        assert_eq!(party.chain.watched_outputs(), expected_watch_list);
+    }
 
+    let (maker_side, taker_side) = (trade.maker_side(), trade.taker_side());
     let mut makers_events = trade
-        .party_mut(trade.maker_side())
+        .party_mut(maker_side)
         .subscribe_tx_confirmation_status()
         .await
         .expect("SubscribeTxConfirmationStatus succeeds");
     let mut takers_events = trade.publish_deposit_tx().await;
 
-    let event = takers_events
-        .next()
-        .await
-        .expect("one event")
-        .expect("event without error");
-    let signed_deposit_tx = tx(&event.tx);
+    // The publisher sent the signed transaction to the network. The maker sent nothing.
+    let takers_chain = Arc::clone(&trade.party(taker_side).chain);
+    let makers_chain = Arc::clone(&trade.party(maker_side).chain);
+    let mut sent = Vec::new();
+    for _ in 0..100 {
+        sent = takers_chain.sent();
+        if !sent.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(sent.len(), 1, "the deposit transaction is sent once");
+    let signed_deposit_tx = sent.remove(0);
     assert_eq!(signed_deposit_tx.compute_txid(), deposit_tx.compute_txid());
     assert!(
         signed_deposit_tx
@@ -1402,10 +1571,7 @@ async fn check_deposit(trade: &mut Trade) {
             .iter()
             .all(|input| !input.witness.is_empty())
     );
-    assert!(
-        takers_events.next().await.is_none(),
-        "the stream ends after one event"
-    );
+    assert_eq!(makers_chain.sent(), vec![]);
 
     // Every coin of the mock wallets holds 1 BTC.
     let input_amount = Amount::ONE_BTC.to_sat() * signed_deposit_tx.input.len() as u64;
@@ -1421,15 +1587,90 @@ async fn check_deposit(trade: &mut Trade) {
         "paid {paid_fee} sat, target {minimum_fee} sat"
     );
 
-    makers_events
-        .next()
+    // N2: a block without the transaction gives no event, and the publisher sends the
+    // transaction again, because it does not know whether a node accepted it.
+    takers_chain.mine(&[]);
+    makers_chain.mine(&[]);
+    for _ in 0..100 {
+        if takers_chain.sent().len() == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(takers_chain.sent().len(), 2, "sent again after a block");
+
+    // The block with the transaction, and two more blocks: one event per confirmation, for both
+    // traders, with the height of the chain. The stream ends at 3 confirmations (D6).
+    let deposit_height = FakeChain::START_HEIGHT + 2;
+    for chain in [&takers_chain, &makers_chain] {
+        chain.mine(std::slice::from_ref(&signed_deposit_tx));
+    }
+    for confirmations in 1..=3 {
+        for events in [&mut takers_events, &mut makers_events] {
+            let event = next_event(events).await.expect("an event");
+            assert_eq!(tx(&event.tx), signed_deposit_tx);
+            assert_eq!(event.num_confirmations, confirmations);
+            assert_eq!(
+                event.current_block_height,
+                deposit_height + confirmations - 1
+            );
+        }
+        for chain in [&takers_chain, &makers_chain] {
+            chain.mine(&[]);
+        }
+    }
+    for events in [&mut takers_events, &mut makers_events] {
+        assert!(
+            next_event(events).await.is_none(),
+            "the stream ends when the deposit counts as confirmed"
+        );
+    }
+    // The confirmed transaction is not sent again.
+    assert_eq!(takers_chain.sent().len(), 2);
+}
+
+/// F3: `InitTrade` reports the height of the chain as the service sees it. A service without
+/// access to the chain reports the height 0, can still set up a trade, and refuses to publish or
+/// to observe the deposit transaction without a change of the trade.
+#[tokio::test]
+async fn chain_height_and_missing_chain_access() {
+    let mut trade = Trade::new(TradeType::TakerIsBuyer).await;
+    trade.init_trades().await;
+    for party in [&trade.buyer, &trade.seller] {
+        let key_shares = party.key_shares.as_ref().expect("message A/B");
+        assert_eq!(key_shares.current_block_height, FakeChain::START_HEIGHT);
+    }
+
+    let (mut client, trades) = start_service_with_chain(true, None).await;
+    let trade_id = format!("no-chain-{}", next_trade_number());
+    let key_shares = client
+        .init_trade(PubKeySharesRequest {
+            trade_id: trade_id.clone(),
+            my_role: Role::BuyerAsTaker.into(),
+        })
         .await
-        .expect("one event")
-        .expect("event without error");
-    assert!(
-        makers_events.next().await.is_none(),
-        "the stream ends after one event"
-    );
+        .expect("a trade can be set up without the chain")
+        .into_inner();
+    assert_eq!(key_shares.current_block_height, 0);
+
+    let message = "no access to the chain";
+    let result = client
+        .publish_deposit_tx(PublishDepositTxRequest {
+            trade_id: trade_id.clone(),
+            peers_deposit_psbt: Some(DepositPsbt::default()),
+        })
+        .await;
+    assert_refused(result, Code::FailedPrecondition, message);
+    let result = client
+        .subscribe_tx_confirmation_status(SubscribeTxConfirmationStatusRequest {
+            trade_id: trade_id.clone(),
+        })
+        .await;
+    assert_refused(result, Code::FailedPrecondition, message);
+    let trade = trades.get_trade_model(&trade_id).expect("stored");
+    let trade = trade.lock().unwrap();
+    assert_eq!(trade.state(), TradeState::Init);
+    assert_eq!(trade.termination_reason(), None);
 }
 
 #[tokio::test]
@@ -2381,15 +2622,13 @@ fn expected_outcome(side: Side, stage: Stage, call: Call) -> Outcome {
 
     match (call, side) {
         // These calls have no state check. They return the stored data again.
-        (
-            Call::GetNonceShares | Call::GetPartialSignatures | Call::SubscribeTxConfirmationStatus,
-            _,
-        ) => Accepted,
+        (Call::GetNonceShares | Call::GetPartialSignatures, _) => Accepted,
         (Call::SignDepositTx, _) => match stage {
             Stage::SignaturesExchanged => MovedTo(Deposit),
             _ => Accepted,
         },
-        (Call::PublishDepositTx, _) => match stage {
+        // The deposit transaction can be published and observed when the trader has signed it.
+        (Call::PublishDepositTx | Call::SubscribeTxConfirmationStatus, _) => match stage {
             Stage::SignaturesExchanged => Refused,
             _ => Accepted,
         },
@@ -2543,7 +2782,7 @@ async fn k1_every_call_in_every_stage() {
 /// K1 for `InitTrade`: an unknown role is rejected and no trade is stored.
 #[tokio::test]
 async fn k1_init_trade_with_unknown_role() {
-    let (mut client, trades) = start_service(true).await;
+    let (mut client, trades, _chain) = start_service(true).await;
     let trade_id = format!("unknown-role-{}", next_trade_number());
     let request = PubKeySharesRequest {
         trade_id: trade_id.clone(),

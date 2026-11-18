@@ -6,7 +6,6 @@ edition = "2021"
 
 [dependencies]
 anyhow = { workspace = true }
-bdk_bitcoind_rpc = { workspace = true }
 bdk_wallet = { workspace = true }
 chain = { workspace = true }
 drop-stream = "0.3.2"
@@ -37,6 +36,7 @@ tonic-prost-build = "0.14.6"
 protocol = { workspace = true, features = ["test-utils"] }
 rand = { workspace = true }
 tempfile = { workspace = true }
+testenv = { workspace = true }
 
 [lints]
 workspace = true

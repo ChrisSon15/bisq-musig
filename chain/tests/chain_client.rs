@@ -28,7 +28,7 @@ fn test_env() -> anyhow::Result<TestEnv> {
 
 fn start_client(env: &TestEnv) -> ChainClient {
     let peer = TrustedPeer::from_socket_addr(env.p2p_socket_addr().expect("peer address"));
-    ChainClient::start(Network::Regtest, vec![peer], None)
+    ChainClient::started(Network::Regtest, vec![peer], None)
 }
 
 async fn synced_to_tip(client: &ChainClient, env: &TestEnv) -> u32 {

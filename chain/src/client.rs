@@ -8,14 +8,15 @@
 //! The rules are specified in `docs/specifications/trade/chain-observation.md`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use bdk_kyoto::bip157::chain::{BlockHeaderChanges, ChainState};
 use bdk_kyoto::bip157::{Builder, Event, Network, Package};
-use bdk_kyoto::{
-    HashCheckpoint, Info, Receiver, Requester, TrustedPeer, UnboundedReceiver, Warning,
-};
+pub use bdk_kyoto::{HashCheckpoint, TrustedPeer};
+use bdk_kyoto::{Info, Receiver, Requester, UnboundedReceiver, Warning};
 use bdk_wallet::bitcoin::{Block, BlockHash, OutPoint, ScriptBuf, Transaction, Txid};
 use tokio::sync::broadcast;
 
@@ -151,40 +152,117 @@ pub enum PeerProblem {
     NoCompactFilters,
 }
 
+/// The future of a broadcast.
+pub type BroadcastFuture = Pin<Box<dyn Future<Output = Result<Txid, ChainApiError>> + Send>>;
+
+/// The access to the chain that the trade engine and its service need: watching scripts and
+/// outputs, reading what was found, events, and sending transactions.
+///
+/// [`ChainClient`] implements it with compact block filters. A test can implement it without a
+/// network.
+pub trait ChainAccess: Send + Sync {
+    /// Watches a script: every transaction with an output to it, and every transaction that
+    /// spends such an output of a transaction that was found.
+    fn watch_script(&self, script: ScriptBuf);
+
+    /// Watches an output that is known to the caller, with its script.
+    fn watch_output(&self, outpoint: OutPoint, script: ScriptBuf);
+
+    /// The height of the last block of the chain with the most work, if the chain is known.
+    fn tip_height(&self) -> Option<u32>;
+
+    /// The height up to which all blocks are evaluated.
+    fn synced_height(&self) -> Option<u32>;
+
+    /// A relevant transaction that was found in a block.
+    fn transaction(&self, txid: &Txid) -> Option<ConfirmedTx>;
+
+    /// The number of confirmations of a transaction that was found, or 0.
+    fn confirmations(&self, txid: &Txid) -> u32;
+
+    /// The confirmed transaction that spends a watched output.
+    fn spending_tx(&self, outpoint: &OutPoint) -> Option<ConfirmedTx>;
+
+    /// Subscribes to the events of the chain.
+    fn subscribe(&self) -> broadcast::Receiver<ChainEvent>;
+
+    /// Sends a transaction to the network. A success means that the transaction was sent, not
+    /// that a node accepted it.
+    fn broadcast(&self, tx: Transaction) -> BroadcastFuture;
+}
+
 struct Shared {
     index: Mutex<ChainIndex>,
     peer_problem: Mutex<Option<PeerProblem>>,
     events: broadcast::Sender<ChainEvent>,
+    /// Set when the client was started.
+    requester: OnceLock<Requester>,
 }
+
+/// The error of a request that needs the running client.
+#[derive(Debug, thiserror::Error)]
+#[error("the compact block filter client is not started yet")]
+pub struct NotStarted;
 
 /// The long-running compact block filter client. Cloning gives another handle to the same
 /// client.
+///
+/// A client is created without network access, so that scripts can be watched and events can be
+/// subscribed to at once. [`Self::start`] connects it to the peers.
 #[derive(Clone)]
 pub struct ChainClient {
-    requester: Requester,
+    network: Network,
+    peers: Vec<TrustedPeer>,
     shared: Arc<Shared>,
 }
 
 impl ChainClient {
-    /// Starts the client on the current Tokio runtime. It connects to `peers` and follows the
+    /// Creates a client for `network` that will connect to `peers`. It does nothing until
+    /// [`Self::start`] is called.
+    pub fn new(network: Network, peers: Vec<TrustedPeer>) -> Self {
+        let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        Self {
+            network,
+            peers,
+            shared: Arc::new(Shared {
+                index: Mutex::new(ChainIndex::default()),
+                peer_problem: Mutex::new(None),
+                events,
+                requester: OnceLock::new(),
+            }),
+        }
+    }
+
+    /// Creates a client and starts it at once. See [`Self::start`].
+    pub fn started(
+        network: Network,
+        peers: Vec<TrustedPeer>,
+        start: Option<HashCheckpoint>,
+    ) -> Self {
+        let client = Self::new(network, peers);
+        client.start(start);
+        client
+    }
+
+    /// Starts the client on the current Tokio runtime. It connects to the peers and follows the
     /// chain strictly after `start`, or from the first block of the chain if `start` is `None`.
+    /// A second call does nothing.
     ///
     /// # Panics
     /// If it is called outside of a Tokio runtime.
-    pub fn start(network: Network, peers: Vec<TrustedPeer>, start: Option<HashCheckpoint>) -> Self {
-        let mut builder = Builder::new(network).add_peers(peers);
+    pub fn start(&self, start: Option<HashCheckpoint>) {
+        if self.is_started() {
+            return;
+        }
+        let mut builder = Builder::new(self.network).add_peers(self.peers.iter().cloned());
         if let Some(start) = start {
             builder = builder.chain_state(ChainState::Checkpoint(start));
         }
         let (node, client) = builder.build();
-        let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let shared = Arc::new(Shared {
-            index: Mutex::new(ChainIndex::default()),
-            peer_problem: Mutex::new(None),
-            events,
-        });
-        let requester = client.requester.clone();
-
+        if self.shared.requester.set(client.requester.clone()).is_err() {
+            // Another caller started the client in the meantime.
+            return;
+        }
         tokio::spawn(async move {
             if let Err(error) = node.run().await {
                 tracing::error!(%error, "The compact block filter client stopped.");
@@ -193,14 +271,25 @@ impl ChainClient {
         tokio::spawn(log_and_track_peers(
             client.info_rx,
             client.warn_rx,
-            Arc::clone(&shared),
+            Arc::clone(&self.shared),
         ));
         tokio::spawn(process_events(
             client.event_rx,
-            requester.clone(),
-            Arc::clone(&shared),
+            client.requester,
+            Arc::clone(&self.shared),
         ));
-        Self { requester, shared }
+    }
+
+    /// Whether [`Self::start`] was called.
+    pub fn is_started(&self) -> bool {
+        self.shared.requester.get().is_some()
+    }
+
+    fn requester(&self) -> Result<&Requester, ChainApiError> {
+        self.shared
+            .requester
+            .get()
+            .ok_or_else(|| ChainApiError::backend(NotStarted))
     }
 
     /// Watches a script: every transaction with an output to it, and every transaction that
@@ -230,7 +319,7 @@ impl ChainClient {
                 index.synced_height = Some(height);
             }
         }
-        self.requester
+        self.requester()?
             .rescan_from(height)
             .map_err(ChainApiError::backend)
     }
@@ -304,7 +393,7 @@ impl ChainClient {
     /// one peer. It does not tell whether a node accepted the transaction.
     pub async fn broadcast(&self, tx: Transaction) -> Result<Txid, ChainApiError> {
         let txid = tx.compute_txid();
-        self.requester
+        self.requester()?
             .submit_package(tx)
             .await
             .map_err(ChainApiError::backend)?;
@@ -325,7 +414,7 @@ impl ChainClient {
                 error.to_string(),
             ))
         })?;
-        self.requester
+        self.requester()?
             .submit_package(package)
             .await
             .map_err(ChainApiError::backend)?;
@@ -334,7 +423,46 @@ impl ChainClient {
 
     /// Stops the client.
     pub fn shutdown(&self) -> Result<(), ChainApiError> {
-        self.requester.shutdown().map_err(ChainApiError::backend)
+        self.requester()?.shutdown().map_err(ChainApiError::backend)
+    }
+}
+
+impl ChainAccess for ChainClient {
+    fn watch_script(&self, script: ScriptBuf) {
+        Self::watch_script(self, script);
+    }
+
+    fn watch_output(&self, outpoint: OutPoint, script: ScriptBuf) {
+        Self::watch_output(self, outpoint, script);
+    }
+
+    fn tip_height(&self) -> Option<u32> {
+        Self::tip_height(self)
+    }
+
+    fn synced_height(&self) -> Option<u32> {
+        Self::synced_height(self)
+    }
+
+    fn transaction(&self, txid: &Txid) -> Option<ConfirmedTx> {
+        Self::transaction(self, txid)
+    }
+
+    fn confirmations(&self, txid: &Txid) -> u32 {
+        Self::confirmations(self, txid)
+    }
+
+    fn spending_tx(&self, outpoint: &OutPoint) -> Option<ConfirmedTx> {
+        Self::spending_tx(self, outpoint)
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<ChainEvent> {
+        Self::subscribe(self)
+    }
+
+    fn broadcast(&self, tx: Transaction) -> BroadcastFuture {
+        let client = self.clone();
+        Box::pin(async move { Self::broadcast(&client, tx).await })
     }
 }
 

@@ -3,15 +3,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client as BitcoinCoreClient};
 use bdk_wallet::bitcoin::Network;
 use bmp_tracing::tracing::{info, warn};
 use chain::CBFScanner;
+use chain::client::{ChainClient, HashCheckpoint};
 use clap::Parser;
 use protocol::params::{EngineConfig, EngineConfigError};
 use protocol::trade_model::{MemoryTradeStore, TradeModelStore};
 use rpc::bmp_wallet_service::{
-    BMPWalletServiceImpl, BitcoinCoreChainApi, BmpWalletImpl, BmpWalletServer,
+    BMPWalletServiceImpl, BmpWalletImpl, BmpWalletServer, BmpWalletService as _,
 };
 use rpc::server::{MusigImpl, MusigServer, NoTradeWallet, TradeWalletProvider};
 use tonic::transport::Server;
@@ -27,18 +27,6 @@ struct Cli {
     #[arg(short, long, default_value_t = 50051)]
     port: u16,
 
-    /// Bitcoin Core RPC URL.
-    #[arg(long, default_value = "http://localhost:18443")]
-    bitcoin_rpc_url: String,
-
-    /// Bitcoin Core RPC username
-    #[arg(long)]
-    bitcoin_rpc_user: Option<String>,
-
-    /// Bitcoin Core RPC password
-    #[arg(long)]
-    bitcoin_rpc_pass: Option<String>,
-
     /// Directory holding the BMP wallet database. When set, the bisq2-facing wallet.Wallet
     /// service is served from a BMPWallet in this directory. The wallet itself is opened (or
     /// created) by the client through the OpenOrCreateWallet RPC, which carries the wallet
@@ -50,8 +38,10 @@ struct Cli {
     #[arg(long, default_value = "regtest")]
     wallet_network: Network,
 
-    /// Peer (host:port) for compact-block-filter syncing of the BMP wallet. Repeatable. With no
-    /// peer given the wallet does not sync, but every non-chain operation still works.
+    /// Peer (host:port) of the Bitcoin network, on the network of the wallet. Repeatable. The
+    /// wallet syncs through the peers with compact block filters, and the wallet and the trade
+    /// service send their transactions to them. With no peer given the wallet does not sync and
+    /// nothing can be sent, but every non-chain operation still works.
     #[arg(long = "wallet-peer")]
     wallet_peers: Vec<String>,
 
@@ -117,43 +107,37 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // start of the daemon.
     let engine_config = cli.engine_config()?;
     info!("Configuration of the trade engine: {engine_config}.");
-    // Create RPC client. (No connection is made at this point.) Only the broadcaster of the BMP
-    // wallet uses it.
-    let rpc_client = {
-        let auth = if let (Some(user), Some(pass)) = (&cli.bitcoin_rpc_user, &cli.bitcoin_rpc_pass)
-        {
-            Auth::UserPass(user.clone(), pass.clone())
-        } else {
-            Auth::None
-        };
-        Arc::new(BitcoinCoreClient::new(&cli.bitcoin_rpc_url, auth)?)
-    };
-
     let addr = format!("127.0.0.1:{}", cli.port).parse()?;
 
     // The bisq2-facing wallet service is optional: without --wallet-dir there is no BMPWallet to
     // serve.
     let trades: Arc<dyn TradeModelStore> = Arc::new(MemoryTradeStore::default());
+    // All access to the chain goes through peers of the Bitcoin network (D2). One long-running
+    // client serves the trade service and the broadcasts of the wallet.
+    let peers = chain::parse_peers(&cli.wallet_peers)?;
+    let chain_client = (!peers.is_empty() && cli.wallet_dir.is_some())
+        .then(|| ChainClient::new(cli.wallet_network, peers));
+
+    // The bisq2-facing wallet service is optional: without --wallet-dir there is no BMPWallet to
+    // serve.
     let bmp_wallet = if let Some(dir) = &cli.wallet_dir {
         // The wallet service knows the trades, so that it does not release a coin that a trade
         // has reserved.
         let mut service = BMPWalletServiceImpl::new(dir.clone(), cli.wallet_network)
-            .with_broadcaster(Arc::new(BitcoinCoreChainApi::new(Arc::clone(&rpc_client))))
             .with_trade_store(Arc::clone(&trades));
-
         if let Some(secs) = cli.wallet_poll_secs {
             service = service.with_poll_period(Duration::from_secs(secs));
         }
-
-        let peers = &cli.wallet_peers;
-        if peers.is_empty() {
-            warn!("No --wallet-peer given: the BMP wallet will not sync with the chain.");
-        } else {
+        if let Some(chain_client) = &chain_client {
             info!(
-                peer_count = peers.len(),
+                peer_count = cli.wallet_peers.len(),
                 "Syncing the BMP wallet over compact block filters once it has been opened."
             );
-            service = service.with_chain_data_source(CBFScanner::from_hostnames(&peers.clone()));
+            service = service
+                .with_chain_data_source(CBFScanner::from_hostnames(&cli.wallet_peers)?)
+                .with_broadcaster(Arc::new(chain_client.clone()));
+        } else {
+            warn!("No --wallet-peer given: the BMP wallet will not sync with the chain.");
         }
 
         let service = Arc::new(service);
@@ -163,6 +147,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None
     };
 
+    // The chain client starts when the wallet has synced: near the chain tip of the wallet,
+    // because no trade exists before the wallet is open, so earlier blocks are of no interest.
+    if let (Some(chain_client), Some(service)) = (&chain_client, &bmp_wallet) {
+        let (chain_client, service) = (chain_client.clone(), Arc::clone(service));
+        tokio::spawn(async move {
+            while !service.is_ready() {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            let start = service.chain_start_point().await;
+            info!(?start, "Starting the chain client of the trade service.");
+            chain_client.start(start.map(|(height, hash)| HashCheckpoint::new(height, hash)));
+        });
+    }
+
     // The trade service uses the wallet of the wallet service. Without a wallet it refuses every
     // request that needs one.
     let trade_wallet: Arc<dyn TradeWalletProvider> = if let Some(service) = &bmp_wallet {
@@ -171,7 +169,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         warn!("No --wallet-dir given: the trade service has no wallet and cannot start a trade.");
         Arc::new(NoTradeWallet)
     };
-    let musig = MusigImpl::new(trades, trade_wallet, engine_config);
+    let mut musig = MusigImpl::new(trades, trade_wallet, engine_config);
+    if let Some(chain_client) = chain_client {
+        musig = musig.with_chain(Arc::new(chain_client));
+    } else {
+        warn!("The trade service has no access to the chain and cannot publish a deposit.");
+    }
 
     let mut server = Server::builder().add_service(MusigServer::new(musig));
     if let Some(service) = bmp_wallet {

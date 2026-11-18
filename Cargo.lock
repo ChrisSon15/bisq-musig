@@ -1990,7 +1990,6 @@ name = "rpc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bdk_bitcoind_rpc",
  "bdk_wallet",
  "bmp_tracing",
  "chain",
@@ -2004,6 +2003,7 @@ dependencies = [
  "serde",
  "serde_with",
  "tempfile",
+ "testenv",
  "thiserror",
  "tokio",
  "tokio-stream",
