@@ -1,44 +1,27 @@
 name: CI
 
+# Every change is built, checked and tested as a whole workspace: the crates depend on each
+# other, and a change in one of them can break another one.
 on: [push, pull_request, workflow_dispatch]
 
 permissions:
   contents: read
-  pull-requests: write
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  changes:
-    name: Detect changes
+  test:
+    name: Build, clippy and tests of the workspace
     runs-on: ubuntu-latest
-    outputs:
-      wallet: ${{ steps.filter.outputs.wallet }}
-      protocol: ${{ steps.filter.outputs.protocol }}
-    steps:
-      - uses: actions/checkout@v5
-      - name: Check changed paths
-        id: filter
-        uses: dorny/paths-filter@v4
-        with:
-          filters: |
-            wallet:
-              - 'wallet/**'
-            protocol:
-              - 'protocol/**'
-
-  wallet:
-    name: Build and test wallet
-    needs: changes
-    if: needs.changes.outputs.wallet == 'true'
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        rust:
-          - stable
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-      - name: Generate cache key
-        run: echo "${{ matrix.rust }}" | tee .cache_key
       - name: Cache
         uses: actions/cache@v6
         with:
@@ -46,62 +29,86 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('.cache_key') }}-${{ hashFiles('**/Cargo.toml','**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-stable-${{ hashFiles('**/Cargo.toml','**/Cargo.lock') }}
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.rust }}
-          components: rustfmt, clippy
-
+          toolchain: stable
+          components: clippy
       - name: Install dependencies
-        run:  sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Build
-        run: cargo build 
-
+        run: cargo build --all-targets
       - name: Clippy
         run: cargo clippy --all-targets
-      
+      # The tests start bitcoind for every test environment. They include the tests with two
+      # musigd processes.
       - name: Unit and Integration tests
         run: RUST_LOG=off cargo test
 
-  protocol:
-    name: Build and test protocol
-    needs: changes
-    if: needs.changes.outputs.protocol == 'true'
+  format:
+    name: Formatting of the changed lines
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        rust:
-          - stable
+    # Several files of the repository are not formatted as a whole, so only the lines that a
+    # change touches are checked. rustfmt can misjudge a line range that cuts through a
+    # construct, so this job reports and does not block. A blocking check of the whole workspace
+    # needs one commit that formats all files.
+    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-      - name: Generate cache key
-        run: echo "${{ matrix.rust }}" | tee .cache_key
-      - name: Cache
-        uses: actions/cache@v6
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('.cache_key') }}-${{ hashFiles('**/Cargo.toml','**/Cargo.lock') }}
+          fetch-depth: 0
+      - name: Setup nightly rustfmt
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rustfmt
+      - name: Check the formatting of the changed lines
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ -n "$BASE_REF" ]; then
+            base="origin/$BASE_REF"
+          elif [ -n "$BEFORE" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            base="$BEFORE"
+          else
+            base="HEAD~1"
+          fi
+          python3 .github/scripts/check-format.py "$(git merge-base "$base" HEAD)"
+
+  audit:
+    name: Audit of the dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.rust }}
-          components: rustfmt, clippy
-      
+          toolchain: stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # Known vulnerabilities of the versions in Cargo.lock, from the RustSec advisory database.
+      - name: Audit
+        run: cargo audit
+
+  java:
+    name: Java test client
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
       - name: Install dependencies
-        run:  sudo apt-get update && sudo apt-get install -y protobuf-compiler
-        
-      - name: Build
-        run: cargo build
-        
-      - name: Clippy
-        run: cargo clippy --all-targets
-
-      - name: Unit and Integration tests
-        run: RUST_LOG=off cargo test
-
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # The Java client is generated from the protobuf files of the rpc crate. A change of a
+      # message that breaks the client is found here.
+      - name: Compile the Java client and its tests
+        run: mvn --batch-mode --no-transfer-progress -f rpc/pom.xml test-compile

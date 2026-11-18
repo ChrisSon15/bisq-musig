@@ -1,0 +1,52 @@
+name: Nightly
+
+# The slow checks that do not run for every change: the whole test suite at many thread counts,
+# which finds tests that depend on timing, and the audit of the dependencies against advisories
+# that were published since the last change.
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    name: Tests at thread counts 32 to 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-stable-${{ hashFiles('**/Cargo.toml','**/Cargo.lock') }}
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Run the test suite at every thread count
+        run: RUST_LOG=off bash ./test-runner.sh
+
+  audit:
+    name: Audit of the dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit
+        run: cargo audit

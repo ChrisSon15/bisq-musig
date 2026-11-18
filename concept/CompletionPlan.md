@@ -916,6 +916,33 @@ Not done:
 - Packaging of `musigd` with bisq2; `musigd` starts and stops together with bisq2 (issue #128;
   section 12, answer 7).
 
+Status on 2026-11-18 (branch `wp8-ci`, on top of `wp7-interface`), for the part of WP8 that is
+a change of this repository. The workflows were written and their syntax was checked. They were
+not run: no runner is available here, and nothing is pushed.
+
+Done:
+
+- `.github/workflows/cont_integration.yml`: every push and pull request builds, lints and tests
+  the whole workspace (F25). Before, a change in `rpc`, `chain` or `testenv` alone started no
+  job. Further jobs: the audit of the dependencies (`cargo audit`), and the compilation of the
+  Java test client against the protobuf files (F26).
+- Formatting: a job checks the lines that a change touches with nightly rustfmt
+  (`.github/scripts/check-format.py`). It reports and does not block, for two reasons. Several
+  files are not formatted as a whole. And rustfmt with a line range is not reliable: when the
+  script was tried on this branch, it removed a closing brace in `rpc/src/server.rs` and broke
+  a macro. A blocking check needs one commit that formats the whole workspace, which touches
+  every open pull request. This is a decision for the project owner.
+- `.github/workflows/nightly.yml`: once a day the test suite at thread counts 32 to 1
+  (`test-runner.sh`) and the audit of the dependencies.
+
+Not done:
+
+- Clippy does not fail the build for a warning. The workspace has warnings today: the lint
+  `clippy::unused_async_trait_impl` is not known to the stable toolchain.
+- The Java client is compiled in CI. No Java test with assertions exists (F23).
+- Independent review, trial phase, packaging of `musigd` with bisq2: not part of a change of
+  this repository.
+
 Estimated total for the Rust work: 21 to 33 weeks for one developer, plus the tests of section 9
 that are not already counted in a package (5 to 8 weeks). The decisions did not change the total:
 WP3 grew because the CBF client is now the only backend, WP7 shrank because authentication and the
