@@ -218,7 +218,7 @@ still does not broadcast (F3).
 | Chain access (`chain`) | Broadcast trait; CBF scanner that builds a new client for every wallet sync | Long-running CBF client; watching scripts and outpoints; block height; reorganisation events; broadcast over the peer-to-peer network (D2) |
 | `mem` crate | ZMQ transaction stream; no crate uses it | Removed in WP1 (D16) |
 | `musigd` | Starts the services on `127.0.0.1`. Broadcasts wallet transactions through Bitcoin Core RPC (F27). | Drain when Java calls `close` (D8), network checks, configuration, removal of the Bitcoin Core options (D2) |
-| `testenv` | bitcoind 29.0 and electrs on regtest, mining, funding; block filters are enabled | Helpers for reorganisations, mempool checks, lock time maturity, node restart |
+| `testenv` | bitcoind 29.0 and electrs on regtest, mining, funding; block filters are enabled | Helpers for reorganisations, mempool checks, lock time maturity, node restart. The Electrum server and its client `Testchain` are removed at the end of WP3. |
 | Tests | See section 9.1 | See section 9 |
 | CI | Builds and tests when `wallet/**` or `protocol/**` change | `rpc` changes, formatting, dependency audit, Java tests |
 | bisq2 Java side | Calls all ten `Musig` RPCs; mediation and arbitration messaging exist | Confirmation handling is disabled, deposits are fixed at 30,000 sat, no warning path, no recovery after RPC errors |
@@ -280,7 +280,7 @@ The decisions D1 to D16 were taken by the project owner on 2026-11-17, D17 and D
 | # | Question | Decision | What follows for the work |
 |---|---|---|---|
 | D1 | Which implementation becomes the single engine? | `TradeModel`. | Move it into the `protocol` crate. Remove `BMPProtocol` after its integration tests are ported (WP1). |
-| D2 | How does the engine observe the chain? | Compact block filters over the peer-to-peer network only. No direct use of Bitcoin Core RPC. Reason: privacy. | One implementation of the chain interface. The engine sees confirmed transactions only. Broadcast goes to peers and returns no acceptance result. `musigd` loses its Bitcoin Core options (F27). The tests still start bitcoind, as the peer that the client connects to and for assertions. Points N1 to N4. |
+| D2 | How does the engine observe the chain? | Compact block filters over the peer-to-peer network only. No direct use of Bitcoin Core RPC. Reason: privacy. | One implementation of the chain interface. The engine sees confirmed transactions only. Broadcast goes to peers and returns no acceptance result. `musigd` loses its Bitcoin Core options (F27). The tests still start bitcoind, as the peer that the client connects to and for assertions. The tests stop using the Electrum server of `testenv`, and it is removed (WP3). Points N1 to N4. |
 | D3 | Claim by pre-signed transaction or by script? | By script spend. | The claim transaction leaves the set of pre-signed transactions: two signing sessions and three protobuf fields less. The claimer builds and signs it alone, with a current fee rate, and can replace it with a higher fee. The escrow output does not change (section 4.1). |
 | D4 | Redirect lock time of 1 block? | Yes. | Constant of the protocol, not a trade parameter. A redirect can be sent when the warning has 1 confirmation. |
 | D5 | Final lock times; values per payment method? | Explicit trade parameters that both peers agree on and that are part of the contract. `NetworkParams for Network` is removed. For the lock times D19 replaces this decision. | Java passes the parameters at trade start: since WP1 with `GetNonceShares` (open point O13 of the specification). The engine checks limits and that both peers use the same values. Tests can use any value. The values per payment method are still open (N9). |
@@ -491,10 +491,29 @@ first milestone, and it contains the largest technical uncertainty of the plan.
 - One method that returns the fee rate for the engine's own transactions (claim, CPFP children,
   drain, deposit abort). For now it returns a fixed 10 sat/vB and contains a TODO comment; the
   real source is supplied later (N1). No other code contains a fee rate for these transactions.
+- Tests on compact block filters (decided on 2026-11-18). Until WP3 the chain tests reach the
+  chain through the Electrum server (`electrs`) of `testenv`, with the client `Testchain`. D2
+  makes compact block filters the only chain access, so the tests must use them too:
+  - Build the harness of section 9.3 on the shared `bip157` client: each party has a real
+    `BMPWallet`, an engine and a client that connects to the bitcoind of the test.
+  - Move the engine chain tests (`protocol/tests/trade_model_integration_tests.rs`) to this
+    harness. Since WP1 and WP2 they use a simpler helper that syncs the wallets through
+    `Testchain` and sends transactions to the node itself. This is a difference to step 2 of
+    section 9.5.
+  - Move the wallet tests that sync or broadcast through `Testchain` to compact block filters
+    (`wallet/tests/wallet_integration_test.rs`). The wallet service tests in `rpc/tests` use
+    compact block filters already.
+- Remove the Electrum path, as the last step of this package, when no test uses it any more:
+  `electrs` and `Testchain` in `testenv`, `MemWallet` in the `wallet` crate (no production path
+  uses it), the error variant `WalletErrorKind::Electrum`, and the dependency `bdk_electrum` of
+  the workspace. `wallet/src/bmp_wallet.rs` imports three bitcoin types through `bdk_electrum`;
+  they come from `bdk_wallet` then. The tests keep bitcoind, as the peer of the clients and for
+  assertions, mining and funding through its RPC interface.
 
 Done when: the engine reports confirmations, spends and reorganisations of trade outputs on
-regtest, also after a restart with blocks mined while it was stopped, and `musigd` runs without
-any Bitcoin Core RPC connection.
+regtest, also after a restart with blocks mined while it was stopped, `musigd` runs without any
+Bitcoin Core RPC connection, and the workspace contains no Electrum client and starts no Electrum
+server.
 
 ### WP4 Complete the trade flows (estimate: 4 to 6 weeks)
 
@@ -626,7 +645,7 @@ run. The warning lock time in a test must be larger than `MIN_CONFIRMATIONS`.
 
 The engine under test has no RPC access to bitcoind (D2). Only the test code uses bitcoind RPC:
 to mine, to read the mempool, and to submit a transaction directly when a test needs the node's
-answer.
+answer. No test uses an Electrum server after WP3.
 
 ### 9.3 Test support code to build first
 
@@ -859,7 +878,11 @@ reason. "Engine refuses" means: the engine returns an error and sends nothing.
    mock wallets (parts of B, C, D, G, K at level L1 and L3). They replace the Java `main` program
    as the only driver of the trade service and protect the move in WP1.
 2. With WP1 and WP2: the harness of 9.3, groups A (without chain timing), B, I, and H9, H10.
-3. With WP3: J5, J7, J9, J10, J11 and the chain parts of A.
+   Status: the tests of these groups exist, but with a simpler helper on the Electrum server of
+   `testenv` instead of the harness on compact block filters.
+3. With WP3: the harness of 9.3 on the shared compact block filter client, the move of the
+   existing chain tests to it, the removal of the Electrum path, then J5, J7, J9, J10, J11 and
+   the chain parts of A.
 4. With WP4: groups C, D, E, F, M and the rest of J.
 5. With WP5: group H.
 6. With WP6: C5, E9, E10, E15, F5, J6.
