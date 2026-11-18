@@ -54,8 +54,12 @@ trade ID is refused and does not change the existing trade.
 ## Checks of the peer's data
 
 The order of checks and the consequences of a failed check are defined in
-[trade-states.md](trade-states.md): a failed validation terminates the trade, and nothing of the
-request is stored.
+[trade-states.md](trade-states.md). Nothing of a request with a failed check is stored.
+
+All checks of this section concern data that the peer created, except the limits of the
+redirection receivers, which the caller supplies. An unmodified client of the peer passes all of
+them. A failed check of the peer's data therefore terminates the trade, and the engine logs the
+reason in detail. A setup that is terminated is abandoned.
 
 Key shares and script key:
 

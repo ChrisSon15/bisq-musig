@@ -11,10 +11,11 @@ The file and line references were updated on 2026-11-18 to the code after the fi
 F2 and F4 are fixed. Only the references were updated. The text of the plan still describes the
 state of revision 3.
 
-The decisions D17 and D18 and the tests G13 and G14 were added on 2026-11-18.
+The decisions D17 and D18 and the tests G13 to G15 were added on 2026-11-18.
 
 The specification of WP0 was written on 2026-11-18 to `docs/specifications/trade/`. Its README
-lists twelve open points (O1 to O12) that wait for a confirmation by the project owner.
+lists the open points that wait for a confirmation by the project owner. On the same day O2 was
+decided (see D17), O6 was accepted (see N6), and O1 was postponed (section 12, row 8).
 
 The identifiers of revision 1 are unchanged: findings F1 to F26, decisions D1 to D16, work packages
 WP0 to WP8, test groups A to L. Revision 2 added findings F27 and F28, the points N1 to N9
@@ -287,7 +288,7 @@ The decisions D1 to D16 were taken by the project owner on 2026-11-17, D17 and D
 | D14 | Minimum trade amount and deposit. | Derived from the dust limit and the fee rate, so that every pre-signed transaction has valid outputs. Smaller trades are rejected in `GetNonceShares`. | Validation in the engine (WP4). |
 | D15 | Where do authoritative specifications live? | `docs/specifications/trade/`. `concept/` keeps the history. | WP0 writes the specification files. Concept files are not updated; section 3 says which ones are outdated. |
 | D16 | Future of `walletrpc.Wallet` and the `mem` crate. | Remove both now, also if this breaks bisq2. | First step of WP1. bisq2 at commit `bac6dd1d1c` contains no reference to `walletrpc` (text search), so no break is expected there. |
-| D17 | What happens to a trade when a request fails a validation? | Anything that fails a validation terminates the trade. The trade is unusable afterwards. There is no recovery: a corrected request is not accepted. | The engine marks the trade as blocked. A blocked trade accepts no further data and does not change its state. Implemented so far for the check of the peer's nonce shares only (G4). The specification must say which actions stay possible for a terminated trade after the deposit is signed, because its funds are then locked in the deposit outputs (WP0). Tests G13. |
+| D17 | When does a failed check terminate a trade? | Everything by which the engine detects that the other side tampered with the software or does not run our client terminates the trade. The reason is logged in detail. The trade is unusable afterwards; there is no recovery. Other conditions, which can also happen because of network issues for example, can be repeated. (First form of the decision on the same day: "anything which fails the validation terminates the trade".) | The specification lists the checks of each kind (`docs/specifications/trade/trade-states.md`). The engine marks the trade as terminated, logs the reason, accepts no corrected data and does not change the state. Implemented so far for the check of the peer's nonce shares only (G4). The other checks of peer data do not terminate the trade yet (WP1). Which actions a terminated trade keeps after the deposit is signed is postponed (section 12, row 8). Tests G13, G15. |
 | D18 | In which order does the engine process a request? | Validate before storing, and check the state before any change. | Every engine operation checks the state first, then validates all data of the request, and only then stores data or signs. A refused request leaves no data and no signature in the trade. The handlers in `rpc/src/server.rs` do not follow this order yet: several store request data before the validation, and `SignCustomPayoutTx` signs before the state check (WP1). Tests G14. |
 
 What D8 and answer 7 of section 12 mean together: `musigd` does not run while bisq2 is closed, so
@@ -309,7 +310,7 @@ must settle. The last column gives the status after the answers of section 12.
 | N3 | **CPFP over the peer-to-peer network (D2).** `bip157` 0.6.3 accepts a package of one parent and one child. Whether a parent below the minimum relay fee is accepted this way depends on the receiving nodes. I believe Bitcoin Core supports this since version 28.0, but I did not verify it. | Verify with a regtest test against bitcoind 29.0 early in WP3, before WP6 depends on it. If it does not work, the pre-signed fee rates need a larger safety margin. | Assumed to work (answer 4). Test J7 stays in the plan and shows whether the assumption holds for bitcoind 29.0. |
 | N4 | **Peers (D2).** The client must connect to peers that serve block filters. The peers see the IP address that broadcasts the trade transactions. | Out of scope for this plan (issues #127, #129). The specification states the limit. The peer list stays a start option of `musigd`. | Not asked. The proposal stands until WP0. |
 | N5 | **Limits of the drain at wallet close (D8).** (a) The drain runs only when Java calls `close`. If bisq2 crashes, or the process is killed or loses power, nothing is drained. (b) The drain transaction is only sent, not confirmed, when the process ends. (c) A drain links all open payouts in one transaction. (d) Imported coins that are locked for an open trade are not drained (existing behaviour of `drain_imported_balance`). | Store the signed drain transaction before sending it. At the next start, check whether it confirmed; if not, send it again or replace it with a higher fee. Document the remaining risk: after an unclean stop, a dishonest peer can win the payout if the user stays offline until the peer's warning lock time and the claim lock time have both ended. | Trigger clarified (answer 1): the `close` method. `musigd` does not run while bisq2 is closed (answer 7), so the limits (a) and (b) matter. The proposal stands. |
-| N6 | **Derivation rule (D10).** The rule must give different key shares for every trade, must not collide with wallet keys, and must not be computable from a public key of the wallet. | A hardened BIP32 path that the BIP86 wallet does not use gives a trade root secret. Key share = tagged hash of (trade root secret, trade id, label "buyer payout" or "seller payout"), reduced to a valid scalar. A trade id is never accepted twice, also not after the trade is closed (F2). The specification contains test vectors. | Accepted (answer 5). |
+| N6 | **Derivation rule (D10).** The rule must give different key shares for every trade, must not collide with wallet keys, and must not be computable from a public key of the wallet. | A hardened BIP32 path that the BIP86 wallet does not use gives a trade root secret. Key share = tagged hash of (trade root secret, trade id, label "buyer payout" or "seller payout"), reduced to a valid scalar. A trade id is never accepted twice, also not after the trade is closed (F2). The specification contains test vectors. | Accepted (answer 5). Path `m/86'/coin_type'/0'/2'` and tag `BisqMuSig/key-share` accepted on 2026-11-18; specified with test vectors in `docs/specifications/trade/key-derivation.md`. |
 | N7 | **Accepted risk (D11).** Every local process, also of other users on the same computer, can call all RPCs: close a trade, sign the swap transaction, send wallet funds while the wallet is unlocked. Reading the seed phrase needs the wallet password. | Record this as a security assumption in the specification: the computer and all its local users are trusted. Keep the fixed loopback bind address and test it (K4). | Not asked. The proposal stands until WP0. |
 | N8 | **Reorganisations (D6).** The constant covers the deposit. The rule for other transactions is not decided. | Deposit: below 3 confirmations no secret leaves the engine; if a reorganisation lowers the depth below 3 before the payment started, the state goes back. Reactions to a peer transaction (redirect, penalty) start at 1 confirmation, because waiting costs time before the claim lock time ends. A trade is final, and watching ends, when its closing transaction has 3 confirmations. | Accepted (answer 6). |
 | N9 | **Parameter values (D5).** Which payment methods need which lock times is not decided. The warning lock time (10 days on mainnet today) is also the latest time by which a seller must have received the fiat payment or started mediation. The timeout of D13 and the safety margin of F6 also need values. | Decide with bisq2. The engine only enforces limits, for example: warning lock time larger than `MIN_CONFIRMATIONS` plus the F6 margin. | Answered (answer 2): the values are configurable. The plan fixes no values. Lock times are trade parameters (D5). The deposit timeout and the release safety margin are configuration values of the engine with defaults. |
@@ -374,6 +375,9 @@ Done when: every state transition and every chain event has a specified reaction
 - Move `protocol::mocks` behind a test feature (F11).
 - Replace panics on input from the peer or from the RPC caller by errors (F4). Reject a duplicate
   trade id (F2).
+- Apply D17 and D18 in every engine operation: check the state, then validate all data, then
+  store or sign. Terminate the trade, with a detailed log entry, for every check of peer data
+  that the specification lists; refuse without a change in all other cases.
 
 Done when: one engine exists, the ported tests pass with `BMPWallet`, no production path uses a
 mock wallet, and the workspace contains neither `walletrpc` nor `mem`.
@@ -708,8 +712,9 @@ reason. "Engine refuses" means: the engine returns an error and sends nothing.
 | G10 | Wrong private key share at close | `MismatchedKeyPair`; state unchanged |
 | G11 | Oversized messages and lists | Rejected by size limits |
 | G12 | Any message repeated or delivered in the wrong order | Same result as the first delivery, or an error; never a second signature with the same nonce |
-| G13 | A request that failed a validation is followed by the corrected request (D17) | Refused; the trade stays terminated and does not change its state |
-| G14 | A request is refused by the state check or by a validation (D18) | The trade holds no data and no signature of this request |
+| G13 | Data of the peer that an unmodified client never produces, for each check that the specification lists; then the corrected data (D17) | Trade terminated; the reason is in the log with its details and contains no secret; the corrected data is refused; the state does not change |
+| G14 | A request is refused by a precondition or by a failed check (D18) | The trade holds no data and no signature of this request |
+| G15 | A request is refused for a reason that can have another cause: too early, wrong order, wrong role, invalid data of the caller, no network peer; then the request is sent again when the reason is gone (D17) | The trade is not terminated; the repeated request succeeds |
 
 #### H. Restart, persistence and restore
 
@@ -836,8 +841,8 @@ implementation exists as a first step (D2).
 
 ## 12. Questions and answers, to be reviewed later
 
-These were the open questions of revision 2. The project owner answered them on 2026-11-17. The
-questions stay here so that the answers can be reviewed later. The column "Review later" names
+These were the open questions of revision 2. The project owner answered them on 2026-11-17. Row 8
+was added on 2026-11-18. The questions stay here so that the answers can be reviewed later. The column "Review later" names
 what should be checked at that review.
 
 | # | Question | Answer (2026-11-17) | Where it is in the plan | Review later |
@@ -849,6 +854,7 @@ what should be checked at that review.
 | 5 | Is the derivation rule of N6 acceptable, including the rule that a trade id can never be used twice? | Yes. | N6; WP2, WP5; tests H9, H10, K2 | The exact derivation path and the test vectors, when `key-derivation.md` is written. |
 | 6 | Is the reorganisation rule of N8 acceptable: reactions at 1 confirmation, final at 3? | Yes. | N8; WP4; tests A14, J1 to J4 | Nothing specific. |
 | 7 | Does `musigd` keep running when bisq2 is closed? | No. | D7 and the paragraph after the table in section 7.1; N5; WP8 | Nothing is watched while bisq2 is closed. For closed trades the drain at `close` is the only protection in that time. For open trades the user must start the program before the claim lock time ends after a peer warning. Is this acceptable for mainnet, or is a watching process needed later? |
+| 8 | Which actions does a terminated trade (D17) keep after the deposit is signed? Its funds are then locked in the deposit outputs. | Postponed on 2026-11-18. To be decided later. | D17; open point O1 of `docs/specifications/trade/README.md`; `trade-states.md`, section "Terminated trades" | The decision itself. Until then the specification states: the cooperative steps end, and the engine keeps every action that the trader can perform alone (warning, redirect, penalty, claim, swap transaction, reading the key from a spend, deposit abort). Without such a rule a terminated trade would lose its funds. |
 
 Points of section 7.2 that were not part of the questions and still need a decision in WP0: N2
 (broadcast without result), N4 (peers and the visible IP address), N7 (wording of the security

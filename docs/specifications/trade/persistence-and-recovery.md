@@ -10,7 +10,7 @@ way as the wallet database.
 
 Stored for each trade:
 
-- trade ID, role, trade parameters, state, and the terminated mark;
+- trade ID, role, trade parameters, state, and the terminated mark with its reason;
 - the peer's public key shares, script key, addresses and half of the deposit;
 - the deposit transaction; the trader's own fully signed warning and redirect transaction;
 - for the buyer, the adaptor signature of the swap transaction; for the seller, the swap

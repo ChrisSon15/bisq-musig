@@ -34,8 +34,9 @@ Rules:
   state the response contains no partial signature for the swap transaction.
 - The seller's engine hands out message F only after it holds the complete, valid swap
   transaction. The seller can then always finish the trade alone.
-- A key share that does not match the public key share fails the validation
-  ([trade-states.md](trade-states.md)).
+- A key share that does not match the public key share terminates the trade
+  ([trade-states.md](trade-states.md)). The same holds for a partial signature in message E that
+  does not complete the adaptor signature.
 - Only the buyer may perform step 1 and 4. Only the seller may perform step 2, 3 and 5.
 
 ### Release safety margin
@@ -143,10 +144,13 @@ Rules:
 - The buyer can perform step 1 after he received nothing from the seller, also when the seller
   has released already. If the seller's swap transaction then confirms, the buyer's trade closes
   as a forced close.
-- A second request for step 1 with other values fails the validation. The engine never signs two
-  different custom payout transactions for one trade.
-- A PSBT of the peer for another transaction, with other outputs or other amounts, fails the
-  validation.
+- A second request for step 1 with other values is refused. The engine never signs two different
+  custom payout transactions for one trade.
+- A PSBT of the peer for another transaction, with other outputs or other amounts, is refused. It
+  does not terminate the trade, because the two callers can have used different amounts or fee
+  rates. The trader can still finalise with a PSBT of the peer for the same transaction.
+- The engine checks the peer's signatures in the PSBT. A PSBT of the peer for the same
+  transaction with an invalid signature terminates the trade.
 - Step 2 can be repeated. It returns the same transaction and sends it again.
 - A successful step 2 means that the transaction is complete and was sent. It does not mean that
   it is confirmed. The trade is final when the transaction has `MIN_CONFIRMATIONS` confirmations.

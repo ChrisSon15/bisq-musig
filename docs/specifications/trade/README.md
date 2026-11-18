@@ -65,7 +65,7 @@ The decisions D1 to D18 of `concept/CompletionPlan.md`, section 7:
 | D12 No check of the peer's deposit inputs on chain | [setup-and-deposit.md](setup-and-deposit.md) |
 | D13 Deposit abort | [setup-and-deposit.md](setup-and-deposit.md), [transactions.md](transactions.md) |
 | D14 Minimum amounts from dust limit and fee rate | [parameters.md](parameters.md) |
-| D17 A failed validation terminates the trade | [trade-states.md](trade-states.md) |
+| D17 Proof of a modified or foreign client of the peer terminates the trade; other failures can be repeated | [trade-states.md](trade-states.md) |
 | D18 Validate before storing, check the state before any change | [trade-states.md](trade-states.md) |
 
 D1, D15 and D16 are decisions about the code and the documents. They need no rule here.
@@ -77,18 +77,23 @@ confirmed. The text of the files contains the rule of the column "Rule in the sp
 
 | # | Question | Rule in the specification | File |
 |---|---|---|---|
-| O1 | What may a terminated trade (D17) still do after the deposit is signed? | The cooperative steps end. The engine keeps watching the chain and keeps every action that the trader can perform alone: warning, redirect, penalty, claim, swap transaction, reading the key from a spend, deposit abort. Without this, a terminated trade would lose its funds. | [trade-states.md](trade-states.md) |
-| O2 | Which refused requests terminate a trade (D17)? | Only a failed validation of the data of a request. A request that is refused by a precondition (role, state, confirmations of the deposit) does not terminate the trade. Reason: otherwise a request that comes one block too early would end the trade. | [trade-states.md](trade-states.md) |
+| O1 | What may a terminated trade (D17) still do after the deposit is signed? **Postponed** on 2026-11-18; listed in `concept/CompletionPlan.md`, section 12, row 8. | Until the decision: the cooperative steps end. The engine keeps watching the chain and keeps every action that the trader can perform alone: warning, redirect, penalty, claim, swap transaction, reading the key from a spend, deposit abort. | [trade-states.md](trade-states.md) |
 | O3 | How does the engine handle a broadcast without a result (N2)? | Status "sent", repeated sending until the transaction or a conflicting one confirms. | [chain-observation.md](chain-observation.md) |
 | O4 | Peers and the visible IP address (N4) | The peer list is a start option. Hiding the IP address is not specified. | [chain-observation.md](chain-observation.md) |
 | O5 | Wording of the security assumption for the open port (N7) | The computer and all its local users are trusted. | [service-interface.md](service-interface.md) |
-| O6 | Path and tag of the key derivation (N6) | Path `m/86'/coin_type'/0'/2'`, tag `BisqMuSig/key-share`, message layout as specified. | [key-derivation.md](key-derivation.md) |
 | O7 | Default values of the deposit timeout and the release safety margin; limits of the lock times (N9) | No default values are specified. The limits are: warning lock time larger than 3 plus the release safety margin; claim lock time larger than 1. | [parameters.md](parameters.md) |
 | O8 | When does the seller's engine publish the swap transaction on its own (D7)? | When the number of blocks before the buyer's warning becomes valid falls to the release safety margin. The caller can ask for it earlier. | [closing.md](closing.md) |
 | O9 | Values of the fee schedule: blocks between two steps, size of a step, upper limit | No values are specified. | [fees.md](fees.md) |
 | O10 | Size limits of message fields and lists | No values are specified. | [parameters.md](parameters.md) |
 | O11 | gRPC status codes and error details for the error cases | Five cases are specified, without codes. | [service-interface.md](service-interface.md) |
 | O12 | Sanity limits of the engine for the deposit fee rate and the prepared fee rate | Not specified. | [fees.md](fees.md) |
+
+Points that were open and are decided:
+
+| # | Question | Decision of the project owner | File |
+|---|---|---|---|
+| O2 | Which failed checks terminate a trade (D17)? | 2026-11-18: everything by which the engine detects that the peer tampered with the software or does not run our client terminates the trade, and the reason is logged in detail. Conditions that can have another cause, for example a network problem, can be repeated. | [trade-states.md](trade-states.md) |
+| O6 | Path and tag of the key derivation (N6) | 2026-11-18: accepted as specified. Path `m/86'/coin_type'/0'/2'`, tag `BisqMuSig/key-share`. | [key-derivation.md](key-derivation.md) |
 
 ## Differences to the state model in the code
 

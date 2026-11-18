@@ -104,29 +104,91 @@ A request that is repeated with the same data returns the same result as the fir
 not sign again and does not change the state. This holds also when the trade has moved to a later
 state, as long as the engine still holds the data of the result.
 
-A request that carries other data than the stored data of an earlier request fails the validation.
-
 Rationale: the caller cannot know whether a response was lost. It must be able to repeat a request
 safely. A second signature with the same nonce on other data would reveal a key.
 
-## Terminated trades
+## Failed checks: repeat or terminate
 
-A request that fails the validation terminates the trade:
+A failed check has one of two consequences. The question that decides is: can this failure happen
+although the peer runs our unmodified software?
 
-- The engine marks the trade as terminated. The mark is stored with the trade.
-- The engine accepts no further request data for this trade, also no corrected data.
-- The engine does not continue the cooperative steps of the trade. It hands out no further
-  signature and no key share.
-- The engine reports the termination to the caller.
+### The failure proves a modified or foreign client: the trade is terminated
+
+The engine terminates the trade when it receives data of the peer that our software never
+produces, whatever happens on the network. These are:
+
+- a field of a message of the peer that cannot be decoded: no valid point, nonce, signature,
+  transaction, PSBT or address;
+- a field or a list of a message of the peer above its size limit;
+- key shares or a script key of the peer that break the rules of
+  [setup-and-deposit.md](setup-and-deposit.md);
+- a half of the deposit that breaks the rules of that file;
+- an address of the peer for another network;
+- a nonce of the peer that is used for more than one signature;
+- a partial signature of the peer that is not valid for the transaction that the trader computed;
+- a partial signature in message E that does not complete the adaptor signature of the swap
+  transaction;
+- a secret key share in message F or G that does not match the public key share of the peer;
+- a custom payout PSBT of the peer for the trader's own transaction with an invalid signature;
+- data of the peer that differs from data of the same kind that the trade already holds, for
+  example a second message with other nonces.
+
+When the engine terminates a trade:
+
+- It marks the trade as terminated and stores the mark with the reason.
+- It writes a log entry at error level with the details: trade ID, role, state, the request, the
+  check that failed, the field, and the value that failed. A secret is never logged. For a wrong
+  secret key share the entry names the public key share that it should match.
+- It reports the termination and the reason to the caller.
+- It accepts no further data for this trade, also no corrected data.
+- It does not continue the cooperative steps of the trade. It hands out no further signature and
+  no key share.
 
 There is no recovery from this mark.
 
-A request that is refused by a precondition (step 1) does not terminate the trade. The caller can
-send the request again when the precondition holds.
+Rationale: such data comes from a peer whose software was changed, or from other software. This
+peer may be preparing an attack. The engine stops cooperating at the first proof, so that it
+cannot be used to test prepared data. The detailed log entry lets the user and the developers see
+what the peer did.
 
-A terminated trade still has funds if the deposit is signed. For this reason the engine keeps
-watching the chain for a terminated trade, and it keeps every action that the trader can perform
-alone with the data that the trade already holds:
+### The failure can have another cause: the request is refused and can be repeated
+
+In every other case the engine refuses the request. The trade is not changed and continues. The
+caller can send the request again. These cases are:
+
+- a precondition does not hold: the request came too early or in the wrong order, for the wrong
+  role, or the deposit has too few confirmations;
+- data that the caller itself supplied is invalid: trade parameters, redirection receivers, fee
+  rates, the amount of a custom payout;
+- a condition outside of the trade: the wallet is closed, no peer of the network is reachable;
+- a custom payout PSBT of the peer for another transaction than the trader's own. The two callers
+  can have used different amounts or fee rates.
+
+Messages of the peer can be lost, delayed, delivered twice or delivered in another order. None of
+this terminates a trade: a message that comes too early is refused by a precondition, and a
+message that comes twice is a repeated request.
+
+If the engine cannot tell whether a failure proves a modified client, it refuses the request and
+does not terminate the trade.
+
+### A failed check during the setup
+
+During the setup (`Init`) a partial signature of the peer is invalid also when the two callers
+passed different trade parameters to their engines. The engine cannot tell this case from a
+modified client. It terminates the trade in both cases, and the log entry says that both causes
+are possible. No funds are bound in `Init`, so the only consequence is that the traders must start
+a new trade with a new trade ID.
+
+## Terminated trades
+
+A trade that is terminated in `Init` is abandoned.
+
+A trade that is terminated after the trader signed the deposit still has funds. The decision
+which actions such a trade keeps is postponed (open point O1 in [README.md](README.md)). Until it
+is decided, this rule applies:
+
+The engine keeps watching the chain for a terminated trade, and it keeps every action that the
+trader can perform alone with the data that the trade already holds:
 
 - publishing the trader's own warning transaction, when its lock time has passed;
 - the reactions to a warning transaction of the peer (redirect, penalty) and the claim;
@@ -134,11 +196,5 @@ alone with the data that the trade already holds:
 - for the buyer, reading the seller's key share from a spend of the seller's payout;
 - the deposit abort.
 
-A trade that is terminated in `Init` is abandoned.
-
-Rationale: invalid data comes from a peer or a caller that does not follow the protocol. The
-trader's engine stops cooperating at the first such event, so that it cannot be used as a test
-service for prepared data. The actions that the trader performs alone do not depend on the peer
-and are needed to get the funds out of the deposit.
-
-Open points O1 and O2 in [README.md](README.md) belong to this section.
+Rationale: these actions do not depend on the peer, and without them the funds of the trader
+would stay in the deposit for ever.

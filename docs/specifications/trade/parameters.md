@@ -103,6 +103,6 @@ Addresses:
 
 Sizes:
 
-- The engine limits the size of every message field and the length of every list. A request above
-  a limit fails the validation. The values of the limits are open point O10 in
-  [README.md](README.md).
+- The engine limits the size of every message field and the length of every list. Data of the
+  peer above a limit terminates the trade ([trade-states.md](trade-states.md)). The values of the
+  limits are open point O10 in [README.md](README.md).

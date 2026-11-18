@@ -79,8 +79,10 @@ The order of checks, the handling of repeated requests and the terminated mark a
 - A request for an unknown trade ID is refused.
 - `InitTrade` for a known trade ID is refused. The existing trade is not changed.
 - A request that is not allowed for the role, the state or the chain conditions is refused. The
-  trade is not changed and continues.
-- A request whose data fails the validation terminates the trade.
+  trade is not changed and continues. The request can be repeated.
+- A request with invalid data that the caller itself supplied is refused in the same way.
+- A request with data of the peer that an unmodified client never produces terminates the trade.
+  The engine logs the reason in detail.
 - A request that is repeated with the same data returns the same response.
 
 ## Errors
@@ -89,8 +91,8 @@ Every error tells the caller which of these cases applies:
 
 | Case | Meaning for the caller |
 |---|---|
-| Refused | A precondition does not hold. The request can be sent again when it holds. |
-| Terminated | The validation failed, now or earlier. The trade is terminated. Sending the request again is useless. |
+| Refused | A precondition does not hold, or data of the caller is invalid. The trade continues. The request can be sent again. |
+| Terminated | The peer sent data that an unmodified client never produces, now or earlier. The trade is terminated. The error contains the reason. Sending the request again is useless. |
 | Unknown trade, known trade ID | The trade ID is wrong for this request. |
 | Temporary | The engine could not process the request for a reason outside of the trade, for example the wallet is closed or no peer is reachable. The request can be sent again. |
 | Internal | A defect of the engine. The state of the trade is as before the request. |
