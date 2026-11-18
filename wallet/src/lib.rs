@@ -35,7 +35,7 @@ mod tests {
     use bdk_wallet::rusqlite::Connection;
     use bdk_wallet::signer::SignerError;
     use bdk_wallet::template::{Bip86, DescriptorTemplate as _};
-    use bdk_wallet::test_utils::{ReceiveTo, receive_output_to_address};
+    use bdk_wallet::test_utils::{ReceiveTo, insert_checkpoint, receive_output_to_address};
     use bdk_wallet::{AddressInfo, KeychainKind, SignOptions};
     use bmp_tracing::tracing;
     use rand::RngCore as _;
@@ -390,6 +390,65 @@ mod tests {
 
         assert_eq!(trade_keys.len(), 500);
         assert!(trade_keys.is_disjoint(&user_keys));
+        Ok(())
+    }
+
+    /// I7 (F19): the wallet of a key that is imported with a start height begins with the blocks
+    /// of the main wallet up to this height. A sync with compact block filters starts at the
+    /// lowest block that any wallet knows, minus 7 known blocks, so it no longer starts at the
+    /// genesis block.
+    #[test]
+    fn i7_imported_key_starts_at_the_given_height() -> anyhow::Result<()> {
+        // Files, because the in-memory databases of imported keys do not outlive the wallet.
+        let dir = tempfile::tempdir()?;
+        let storage = DBStorage::from(dir.path());
+        let mut wallet = BMPWallet::new(storage.clone(), &test_password(), Network::Regtest)?;
+        let block = |height: u32| BlockId {
+            height,
+            hash: BlockHash::hash(&height.to_be_bytes()),
+        };
+        for height in 100..=130 {
+            insert_checkpoint(&mut wallet, block(height));
+        }
+
+        // Without a start height the wallet of the key knows only the genesis block.
+        wallet.import_private_key(new_private_key(), None)?;
+        // The start is the highest known block at or below the height.
+        wallet.import_private_key_since(new_private_key(), None, 120)?;
+        wallet.import_private_key_since(new_private_key(), None, 500)?;
+        // Below the first known block there is nothing to start from.
+        wallet.import_private_key_since(new_private_key(), None, 50)?;
+        assert_eq!(wallet.imported_wallet_tip_heights(), vec![0, 120, 130, 0]);
+
+        // The imported wallets and their start are stored.
+        drop(wallet);
+        let wallet = BMPWallet::load_wallet(storage, Network::Regtest, &test_password())?;
+        let mut tips = wallet.imported_wallet_tip_heights();
+        tips.sort_unstable();
+        assert_eq!(tips, vec![0, 0, 120, 130]);
+        Ok(())
+    }
+
+    /// F16: a PSBT input without the output that it spends does not stop the process. The wallet
+    /// signs what it can.
+    #[test]
+    fn f16_sign_psbt_without_witness_utxo() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        let unsigned_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![bdk_wallet::bitcoin::TxIn {
+                previous_output: OutPoint::new(bdk_wallet::bitcoin::Txid::all_zeros(), 0),
+                ..Default::default()
+            }],
+            output: vec![],
+        };
+        let mut psbt = psbt::Psbt::from_unsigned_tx(unsigned_tx)?;
+        assert!(psbt.inputs[0].witness_utxo.is_none());
+        // The result may be an error of the signer, but the call returns.
+        let _ = wallet.sign(&mut psbt, SignOptions::default());
+        assert!(psbt.inputs[0].final_script_witness.is_none());
         Ok(())
     }
 

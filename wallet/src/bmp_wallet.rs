@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
 use std::vec;
 
 use bdk_electrum::bdk_core::bitcoin::{Address, FeeRate, OutPoint};
@@ -11,7 +10,9 @@ use bdk_wallet::bitcoin::{
     Amount, Network, PrivateKey, Psbt, ScriptBuf, Sequence, TapNodeHash, Transaction, Weight,
     XOnlyPublicKey, consensus, psbt,
 };
-use bdk_wallet::chain::{CanonicalizationParams, ChainPosition, FullTxOut, Merge as _};
+use bdk_wallet::chain::{
+    BlockId, CanonicalizationParams, ChainPosition, CheckPoint, FullTxOut, Merge as _,
+};
 use bdk_wallet::descriptor::ExtendedDescriptor;
 use bdk_wallet::keys::bip39::Mnemonic;
 use bdk_wallet::miniscript::descriptor::{KeyMap, TapTree, Tr};
@@ -20,8 +21,8 @@ use bdk_wallet::rusqlite::Connection;
 use bdk_wallet::signer::{InputSigner as _, SignerContext, SignerError, SignerWrapper};
 use bdk_wallet::template::{Bip86, DescriptorTemplate as _};
 use bdk_wallet::{
-    AddressInfo, Balance, KeychainKind, LocalOutput, PersistedWallet, SignOptions, TxBuilder, Utxo,
-    Wallet, WeightedUtxo,
+    AddressInfo, Balance, KeychainKind, LocalOutput, PersistedWallet, SignOptions, TxBuilder,
+    Update, Utxo, Wallet, WeightedUtxo,
 };
 use rand::RngCore as _;
 use secp::Scalar;
@@ -34,7 +35,7 @@ use crate::key_shares::{TradeKeyShares, derive_trade_key_shares};
 use crate::password::Password;
 use crate::persisted::{BMPDatabase, BMPWalletPersister as _, DBStorage, PersistenceError};
 use crate::protocol_wallet_api::{
-    ProtocolWalletApi, WalletExt, finish_standard_psbt, internal_key_at_index,
+    ProtocolWalletApi, WalletExt, finish_standard_psbt, internal_key_at_index, seconds_since_epoch,
     sign_selected_inputs_with,
 };
 use crate::utils::{derive_key_from_password, key_verifier};
@@ -99,6 +100,11 @@ impl ImportedKey {
 }
 
 pub(crate) const STOP_GAP: usize = 50;
+
+/// The number of blocks of the main wallet that the wallet of a newly imported key starts with.
+/// A sync with compact block filters steps back 7 known blocks from the tip of each wallet, to be
+/// safe against a chain reorganisation, so the wallet needs more known blocks than that.
+const START_CHECKPOINT_COUNT: usize = 10;
 
 pub(crate) struct ImportedWallet {
     pub(crate) wallet: PersistedWallet<Connection>,
@@ -254,17 +260,75 @@ impl BMPWallet {
         pk: Scalar,
         tap_tree: Option<TapTree<XOnlyPublicKey>>,
     ) -> Result<()> {
+        self.import_key(pk, tap_tree, None)
+    }
+
+    /// Imports a key like [`Self::import_private_key`], for a key that has no confirmed output
+    /// at or below the height `start_height`.
+    ///
+    /// The wallet of the new key starts with the blocks of the main wallet up to this height.
+    /// Without them it would know only the genesis block, and the next sync with compact block
+    /// filters would start there for all wallets, because the sync starts at the lowest block
+    /// that any of the wallets knows.
+    pub fn import_private_key_since(
+        &mut self,
+        pk: Scalar,
+        tap_tree: Option<TapTree<XOnlyPublicKey>>,
+        start_height: u32,
+    ) -> Result<()> {
+        self.import_key(pk, tap_tree, Some(start_height))
+    }
+
+    fn import_key(
+        &mut self,
+        pk: Scalar,
+        tap_tree: Option<TapTree<XOnlyPublicKey>>,
+        start_height: Option<u32>,
+    ) -> Result<()> {
         let key_to_import = ImportedKey::new(pk, tap_tree)?;
         if Self::is_duplicate_imported_key(&self.imported_keys, &key_to_import) {
             return Err(WalletErrorKind::DuplicateKey);
         }
 
-        let imported_wallet =
+        let mut imported_wallet =
             Self::load_imported_wallet(&key_to_import, self.db.storage(), self.network())?;
+        // Only a wallet that knows nothing but the genesis block gets a start: a wallet that was
+        // loaded from an earlier import of the same key has seen the chain already.
+        if imported_wallet.wallet.latest_checkpoint().height() == 0
+            && let Some(start) = start_height.and_then(|height| self.checkpoints_up_to(height))
+        {
+            imported_wallet.wallet.apply_update(Update {
+                chain: Some(start),
+                ..Update::default()
+            })?;
+        }
         self.imported_keys
             .insert(key_to_import.script_pubkey(), key_to_import);
         self.imported_wallets.push(imported_wallet);
+        self.persist()?;
         Ok(())
+    }
+
+    /// The blocks that the main wallet knows at or below `height`: the genesis block and the
+    /// highest [`START_CHECKPOINT_COUNT`] of them. `None` if the main wallet knows no such block
+    /// above the genesis block.
+    fn checkpoints_up_to(&self, height: u32) -> Option<CheckPoint> {
+        let mut blocks = self
+            .wallet
+            .checkpoints()
+            .filter(|checkpoint| (1..=height).contains(&checkpoint.height()))
+            .take(START_CHECKPOINT_COUNT)
+            .map(|checkpoint| checkpoint.block_id())
+            .collect::<Vec<_>>();
+        if blocks.is_empty() {
+            return None;
+        }
+        blocks.push(BlockId {
+            height: 0,
+            hash: self.wallet.local_chain().genesis_hash(),
+        });
+        blocks.reverse();
+        CheckPoint::from_block_ids(blocks).ok()
     }
 
     /// Test-only introspection of the imported keys; enable the `test-utils` feature to use it
@@ -278,6 +342,15 @@ impl BMPWallet {
                 .cmp(right.script_pubkey().as_bytes())
         });
         keys
+    }
+
+    /// The heights of the chain tips that the wallets of the imported keys know, in the order in
+    /// which the wallets were loaded.
+    pub fn imported_wallet_tip_heights(&self) -> Vec<u32> {
+        self.imported_wallets
+            .iter()
+            .map(|imported| imported.wallet.latest_checkpoint().height())
+            .collect()
     }
 
     pub fn imported_balance(&self) -> Balance {
@@ -668,11 +741,15 @@ impl BMPWallet {
 
         <Self as WalletApi>::sign(self, &mut psbt, SignOptions::default())?;
         let tx = psbt.extract_tx()?;
+        self.record_unconfirmed_transaction(&tx)?;
 
-        let last_seen = UNIX_EPOCH
-            .elapsed()
-            .map_err(WalletErrorKind::generic)?
-            .as_secs();
+        Ok(tx)
+    }
+
+    /// Records a signed transaction as unconfirmed in the main wallet and in the wallets of the
+    /// imported keys, and stores it. Its inputs count as spent from here on.
+    pub fn record_unconfirmed_transaction(&mut self, tx: &Transaction) -> Result<()> {
+        let last_seen = seconds_since_epoch()?;
         let tx_ref = Arc::new(tx.clone());
         let wallets = std::iter::once(&mut self.wallet).chain(
             self.imported_wallets
@@ -683,8 +760,7 @@ impl BMPWallet {
             wallet.apply_unconfirmed_txs([(Arc::clone(&tx_ref), last_seen)]);
         }
         <Self as WalletApi>::persist(self)?;
-
-        Ok(tx)
+        Ok(())
     }
 
     fn load_imported_wallet(
@@ -850,6 +926,23 @@ impl ProtocolWalletApi for BMPWallet {
         tap_tree: Option<TapTree<XOnlyPublicKey>>,
     ) -> Result<()> {
         self.import_private_key(pk, tap_tree)
+    }
+
+    fn import_private_key_since(
+        &mut self,
+        pk: Scalar,
+        tap_tree: Option<TapTree<XOnlyPublicKey>>,
+        start_height: u32,
+    ) -> Result<()> {
+        self.import_private_key_since(pk, tap_tree, start_height)
+    }
+
+    fn chain_tip_height(&self) -> u32 {
+        self.wallet.latest_checkpoint().height()
+    }
+
+    fn record_transaction(&mut self, tx: &Transaction) -> Result<()> {
+        self.record_unconfirmed_transaction(tx)
     }
 
     fn trade_key_shares(&self, trade_id: &str) -> Result<TradeKeyShares> {
@@ -1039,7 +1132,12 @@ impl WalletApi for BMPWallet {
     fn sign(&mut self, psbt: &mut Psbt, sign_options: SignOptions) -> Result<()> {
         let secp = self.secp_ctx();
         for (input_index, input_details) in psbt.inputs.clone().iter().enumerate() {
-            let txout = input_details.witness_utxo.as_ref().unwrap();
+            // An input without the output that it spends cannot be recognised as a coin of an
+            // imported key. It is left to the signer of the seed wallet below, which signs only
+            // what it owns. A PSBT can come from the peer, so it must never stop the process.
+            let Some(txout) = input_details.witness_utxo.as_ref() else {
+                continue;
+            };
 
             if let Some(signing_key) = self.imported_keys.get(&txout.script_pubkey) {
                 let signer =

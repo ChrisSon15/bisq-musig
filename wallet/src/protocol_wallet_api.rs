@@ -1,13 +1,14 @@
 use std::io::Write as _;
 use std::mem;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
+use std::time::UNIX_EPOCH;
 
 use bdk_electrum::BdkElectrumClient;
 use bdk_electrum::bdk_core::bitcoin::bip32::Xpriv;
 use bdk_electrum::electrum_client::Client;
 use bdk_wallet::bitcoin::{
-    Address, Amount, FeeRate, Network, OutPoint, Psbt, ScriptBuf, XOnlyPublicKey, absolute,
-    secp256k1,
+    Address, Amount, FeeRate, Network, OutPoint, Psbt, ScriptBuf, Transaction, XOnlyPublicKey,
+    absolute, secp256k1,
 };
 use bdk_wallet::coin_selection::CoinSelectionAlgorithm;
 use bdk_wallet::descriptor::{Descriptor, ExtendedDescriptor};
@@ -64,6 +65,31 @@ pub trait ProtocolWalletApi {
         pk: Scalar,
         tap_tree: Option<TapTree<XOnlyPublicKey>>,
     ) -> Result<()>;
+
+    /// Imports the key of a payout of a trade, like [`Self::import_private_key`]. No output of
+    /// the key was confirmed at or below the height `start_height`, so the wallet does not need
+    /// to look for it in earlier blocks.
+    ///
+    /// The default implementation ignores the height. It fits wallets that do not scan the chain
+    /// separately for an imported key.
+    fn import_private_key_since(
+        &mut self,
+        pk: Scalar,
+        tap_tree: Option<TapTree<XOnlyPublicKey>>,
+        start_height: u32,
+    ) -> Result<()> {
+        let _ = start_height;
+        self.import_private_key(pk, tap_tree)
+    }
+
+    /// The height of the last block that the wallet has seen.
+    fn chain_tip_height(&self) -> u32;
+
+    /// Records a signed transaction that the wallet did not create itself, as unconfirmed. From
+    /// then on the coins of the wallet that the transaction spends count as spent, and its
+    /// outputs to the wallet count as incoming. The caller is responsible for sending the
+    /// transaction to the network.
+    fn record_transaction(&mut self, tx: &Transaction) -> Result<()>;
 
     /// Returns the two secret key shares of the trade `trade_id`, derived from the seed of the
     /// wallet as specified in `docs/specifications/trade/key-derivation.md`. The same seed and the
@@ -230,7 +256,17 @@ impl ProtocolWalletApi for MemWallet {
     ) -> Result<()> {
         // `MemWallet` is an in-memory wallet that doesn't currently support imported keys.
         // If/when this is needed, mirror the `BMPWallet` implementation.
-        todo!("MemWallet does not yet support importing private keys")
+        Err(WalletErrorKind::Unsupported(
+            "MemWallet cannot import private keys",
+        ))
+    }
+
+    fn chain_tip_height(&self) -> u32 {
+        self.wallet.chain_tip_height()
+    }
+
+    fn record_transaction(&mut self, tx: &Transaction) -> Result<()> {
+        self.wallet.record_transaction(tx)
     }
 
     fn trade_key_shares(&self, trade_id: &str) -> Result<TradeKeyShares> {
@@ -297,10 +333,18 @@ impl ProtocolWalletApi for Wallet {
         _pk: Scalar,
         _tap_tree: Option<TapTree<XOnlyPublicKey>>,
     ) -> Result<()> {
-        unimplemented!(
-            "bdk_wallet::Wallet does not support importing external private keys; \
-            use BMPWallet for that"
-        )
+        Err(WalletErrorKind::Unsupported(
+            "a plain BDK wallet cannot import private keys; use BMPWallet for that",
+        ))
+    }
+
+    fn chain_tip_height(&self) -> u32 {
+        self.latest_checkpoint().height()
+    }
+
+    fn record_transaction(&mut self, tx: &Transaction) -> Result<()> {
+        self.apply_unconfirmed_txs([(Arc::new(tx.clone()), seconds_since_epoch()?)]);
+        Ok(())
     }
 
     fn trade_key_shares(&self, _trade_id: &str) -> Result<TradeKeyShares> {
@@ -326,6 +370,14 @@ impl ProtocolWalletApi for Wallet {
     fn is_utxo_locked(&self, utxo: OutPoint) -> bool {
         self.is_outpoint_locked(utxo)
     }
+}
+
+/// The current time as the "last seen" time of a transaction that is recorded as unconfirmed.
+pub(crate) fn seconds_since_epoch() -> Result<u64> {
+    Ok(UNIX_EPOCH
+        .elapsed()
+        .map_err(WalletErrorKind::generic)?
+        .as_secs())
 }
 
 /// Sign the wallet-owned inputs of `psbt` using the supplied `sign` closure, then transfer the

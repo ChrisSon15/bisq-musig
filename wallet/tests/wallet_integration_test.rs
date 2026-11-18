@@ -304,6 +304,45 @@ async fn test_cbf_imported() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// I7 (F19): a key that is imported with a start height. The wallet of the key begins near the
+/// tip of the main wallet, the sync with compact block filters works from there, and it finds a
+/// coin of the key that is confirmed after the start height.
+#[tokio::test]
+async fn i7_cbf_sync_of_a_key_imported_with_start_height() -> anyhow::Result<()> {
+    let mut env = TestEnv::new()?;
+    env.mine_blocks(30)?;
+    let peers = vec![TrustedPeer::from_socket_addr(
+        env.p2p_socket_addr().unwrap(),
+    )];
+    let cbf = CBFScanner::new(peers);
+
+    let mut wallet = BMPWallet::new(
+        env.new_temp_path().into(),
+        &test_password(),
+        Network::Regtest,
+    )?;
+    wallet.sync_all(&cbf).await?;
+    let tip = wallet.latest_checkpoint().height();
+    assert!(tip >= 30, "the main wallet knows the chain up to {tip}");
+
+    let prv_key = new_private_key();
+    wallet.import_private_key_since(prv_key, None, tip)?;
+    assert_eq!(wallet.imported_wallet_tip_heights(), vec![tip]);
+
+    env.fund_from_prv_key(&prv_key, Amount::from_sat(10_000))?;
+    env.mine_blocks(3)?;
+    wallet.sync_all(&cbf).await?;
+    assert_eq!(
+        wallet.imported_balance().confirmed,
+        Amount::from_sat(10_000)
+    );
+    // Both wallets followed the chain to the same tip.
+    let new_tip = wallet.latest_checkpoint().height();
+    assert!(new_tip >= tip + 3);
+    assert_eq!(wallet.imported_wallet_tip_heights(), vec![new_tip]);
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_cbf_imported_and_main() -> anyhow::Result<()> {
     let mut env = TestEnv::new()?;

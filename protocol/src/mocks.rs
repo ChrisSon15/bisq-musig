@@ -163,7 +163,16 @@ impl<Cs: Iterator<Item = TxOutput>, As: Iterator<Item = Address>> ProtocolWallet
         _pk: Scalar,
         _tap_tree: Option<TapTree<XOnlyPublicKey>>,
     ) -> Result<(), WalletErrorKind> {
-        unimplemented!("MockTradeWallet does not support importing private keys")
+        // The mock holds no coins of imported keys, so the key is only accepted.
+        Ok(())
+    }
+
+    fn chain_tip_height(&self) -> u32 {
+        0
+    }
+
+    fn record_transaction(&mut self, _tx: &Transaction) -> Result<(), WalletErrorKind> {
+        Ok(())
     }
 
     fn trade_key_shares(&self, trade_id: &str) -> wallet::error::Result<TradeKeyShares> {
