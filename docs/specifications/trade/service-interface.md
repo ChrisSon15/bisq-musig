@@ -60,7 +60,7 @@ Requests that the interface needs in addition:
 | Request | Role | Meaning | Defined in |
 |---|---|---|---|
 | Publish the warning transaction | Both | Starts the dispute path | [dispute.md](dispute.md) |
-| Events of a trade | Both | One stream per trade: state changes, the terminated mark, transactions sent and confirmed, deadlines as block heights, actions that the user must take, losses | [chain-observation.md](chain-observation.md) |
+| Events of a trade | Both | One stream per trade: state changes, the terminated mark, transactions sent and confirmed, deadlines as block heights, actions that the user must take, losses, a problem with the peers and its end | [chain-observation.md](chain-observation.md) |
 | Close of the wallet service (exists as `Close` of `wallet.Wallet`) | - | Drains the imported coins when the user ends the program | [post-trade-protection.md](post-trade-protection.md) |
 
 Changes of existing messages that this specification requires:
@@ -132,7 +132,7 @@ of the status describes the reason:
 | Known trade ID in `InitTrade` | `ALREADY_EXISTS` |
 | Temporary: no wallet is open | `FAILED_PRECONDITION` |
 | Temporary: `musigd` was started without a peer, so the engine has no access to the chain, and the request needs it | `FAILED_PRECONDITION` |
-| Temporary: no peer is reachable, or no peer serves compact block filters, and the request needs the chain (`PublishDepositTx`, `SubscribeTxConfirmationStatus`) | `UNAVAILABLE`. The message names the problem. The trade is not changed, and the caller can repeat the request. |
+| Temporary: no peer is reachable, or no peer serves compact block filters, and the request must send a transaction (`PublishDepositTx`) | `UNAVAILABLE`. The message names the problem. The trade is not changed, and the caller can repeat the request. |
 | Internal | `INTERNAL` |
 
 ## Events and responses

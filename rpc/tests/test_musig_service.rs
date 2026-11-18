@@ -1750,11 +1750,13 @@ async fn trade_with_signed_deposit() -> Trade {
     trade
 }
 
-/// J10 and J5 for the service: while the chain reports a problem with the peers, the requests
-/// that need the chain are refused with a status that names the problem, and they change
-/// nothing in the trade. When the problem is over, the same requests succeed.
+/// J10 and J5 for the service, while the chain reports a problem with the peers:
+/// - `PublishDepositTx` is refused with a status that names the problem. It changes nothing in the
+///   trade and sends nothing. When the problem is over, the same request succeeds.
+/// - `SubscribeTxConfirmationStatus` only observes, so it is accepted (D21). Its stream gives no
+///   event while the problem lasts, and gives the events of the deposit afterwards.
 #[tokio::test]
-async fn j10_chain_requests_are_refused_while_the_peers_have_a_problem() {
+async fn j10_publishing_is_refused_and_observing_is_accepted_during_a_peer_problem() {
     for (problem, message) in [
         (
             PeerProblem::NoCompactFilters,
@@ -1774,11 +1776,17 @@ async fn j10_chain_requests_are_refused_while_the_peers_have_a_problem() {
             .publish_deposit_tx(&makers_deposit_psbt)
             .await;
         assert_refused(result, Code::Unavailable, message);
-        let result = trade
+        let mut makers_events = trade
             .party_mut(maker_side)
             .subscribe_tx_confirmation_status()
-            .await;
-        assert_refused(result, Code::Unavailable, message);
+            .await
+            .expect("SubscribeTxConfirmationStatus is accepted during the problem");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), makers_events.next())
+                .await
+                .is_err(),
+            "no event while the chain is not observed"
+        );
         trade.assert_states(TradeState::Deposit, TradeState::Deposit);
         for side in SIDES {
             let party = trade.party(side);
@@ -1790,13 +1798,19 @@ async fn j10_chain_requests_are_refused_while_the_peers_have_a_problem() {
         for side in SIDES {
             trade.party(side).chain.set_peer_problem(None);
         }
-        trade
-            .party_mut(maker_side)
-            .subscribe_tx_confirmation_status()
-            .await
-            .expect("SubscribeTxConfirmationStatus succeeds after the problem");
         drop(trade.publish_deposit_tx().await);
-        assert!(sent_count_reaches(&trade.party(taker_side).chain, 1).await);
+        let takers_chain = Arc::clone(&trade.party(taker_side).chain);
+        assert!(sent_count_reaches(&takers_chain, 1).await);
+        // The stream that was opened during the problem reports the deposit when the maker's
+        // chain sees it in a block.
+        let deposit_tx = takers_chain.sent().remove(0);
+        trade
+            .party(maker_side)
+            .chain
+            .mine(std::slice::from_ref(&deposit_tx));
+        let event = next_event(&mut makers_events).await.expect("an event");
+        assert_eq!(event.num_confirmations, 1);
+        assert_eq!(tx(&event.tx), deposit_tx);
     }
 }
 

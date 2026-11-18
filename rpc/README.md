@@ -64,7 +64,8 @@ All access to the chain goes through these peers, over the Bitcoin peer-to-peer 
 observation of the transactions of a trade, and the sending of transactions. One long-running connection serves the
 wallet and the trade service. `musigd` connects only to the given peers and has no connection to the RPC interface of
 a node. A peer must serve compact block filters. While no peer is reachable, `musigd` keeps trying to connect, the
-wallet does not sync, and the trade service refuses the requests that need the chain. A `bitcoind` regtest instance
+wallet does not sync, the trade service refuses to publish a deposit, and its confirmation events arrive only when a
+peer is reachable again. A `bitcoind` regtest instance
 that can serve as the peer may be started up as follows:
 
 ```sh

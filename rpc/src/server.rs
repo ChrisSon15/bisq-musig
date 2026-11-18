@@ -93,18 +93,26 @@ impl MusigImpl {
         self
     }
 
-    /// The access to the chain, or the status for a request that needs it. While a problem with
-    /// the peers lasts, the chain is not observed and nothing can be sent, so such a request
-    /// does not proceed. The caller can repeat it.
+    /// The access to the chain, or the status for a request that needs it.
     fn chain(&self) -> Result<Arc<dyn ChainAccess>> {
-        let chain = self.chain.clone().ok_or_else(|| {
+        self.chain.clone().ok_or_else(|| {
             Status::failed_precondition(
                 "the trade service has no access to the chain; start musigd with a peer",
             )
-        })?;
+        })
+    }
+
+    /// The access to the chain for a request that changes the trade and sends a transaction.
+    /// While a problem with the peers lasts, nothing can be sent, so such a request does not
+    /// proceed and changes nothing. The caller can repeat it.
+    ///
+    /// A request that only observes the chain does not use this check: it is accepted, and its
+    /// events arrive when a peer is reachable again (decision D21 of the plan).
+    fn chain_for_sending(&self) -> Result<Arc<dyn ChainAccess>> {
+        let chain = self.chain()?;
         if let Some(problem) = chain.peer_problem() {
             return Err(Status::unavailable(format!(
-                "the chain cannot be observed and nothing can be sent at the moment: {problem}"
+                "nothing can be sent at the moment: {problem}"
             )));
         }
         Ok(chain)
@@ -329,8 +337,9 @@ impl musig_server::Musig for MusigImpl {
         &self,
         request: Request<PublishDepositTxRequest>,
     ) -> Result<Response<Self::PublishDepositTxStream>> {
-        // Checked first: without access to the chain the request changes nothing.
-        let chain = self.chain()?;
+        // Checked first: without a peer that the transaction can be sent to, the request changes
+        // nothing.
+        let chain = self.chain_for_sending()?;
         let deposit_timeout = self.config.deposit_timeout();
         self.handle_trade_request(request, move |request, trade_model, wallet| {
             let peers_deposit_psbt = request

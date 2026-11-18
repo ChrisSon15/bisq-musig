@@ -39,9 +39,13 @@ start option of `musigd`. The network of the peers must be the network of the wa
   way.
 - A condition counts as a problem when it has lasted for some seconds. The engine has no peer for
   a moment at every start and at every new connection.
-- While a problem lasts, a request of the caller that needs the chain is refused, and the caller
-  can repeat it ([service-interface.md](service-interface.md)). A sync of the wallet ends with an
-  error that names the problem, and the wallet keeps what it knows.
+- While a problem lasts, a request of the caller that must send a transaction is refused, and the
+  caller can repeat it ([service-interface.md](service-interface.md)). A request that only
+  observes the chain is accepted: its events arrive when a peer is reachable again. A sync of the
+  wallet ends with an error that names the problem, and the wallet keeps what it knows.
+- The caller is told about a problem with the peers, and about its end, as an event of the trade
+  ([service-interface.md](service-interface.md), "Events of a trade"). An accepted request that
+  gives no events does not tell the caller whether the chain is observed.
 - What the engine knows about the chain stays valid while it has no connection. After a new
   connection the engine evaluates the blocks that it missed. It notices a reorganisation that
   happened in between and treats it like one that it saw while it was connected.

@@ -48,7 +48,7 @@ A paragraph that starts with "Rationale" explains a requirement and is not one i
 
 ## Where the decisions are specified
 
-The decisions D1 to D20 of `concept/CompletionPlan.md`, section 7:
+The decisions D1 to D21 of `concept/CompletionPlan.md`, section 7:
 
 | Decision | Specified in |
 |---|---|
@@ -69,6 +69,7 @@ The decisions D1 to D20 of `concept/CompletionPlan.md`, section 7:
 | D18 Validate before storing, check the state before any change | [trade-states.md](trade-states.md) |
 | D19 Lock times are configuration values of the engine, read from the environment; they are not part of the service interface | [parameters.md](parameters.md) |
 | D20 The engine connects only to the configured peers | [chain-observation.md](chain-observation.md) |
+| D21 During a problem with the peers a request that only observes the chain is accepted; a request that must send is refused | [chain-observation.md](chain-observation.md), [service-interface.md](service-interface.md) |
 
 D1, D15 and D16 are decisions about the code and the documents. They need no rule here.
 
