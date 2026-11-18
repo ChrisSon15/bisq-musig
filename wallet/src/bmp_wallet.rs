@@ -3,12 +3,11 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::vec;
 
-use bdk_electrum::bdk_core::bitcoin::{Address, FeeRate, OutPoint};
 use bdk_wallet::bitcoin::bip32::Xpriv;
 use bdk_wallet::bitcoin::hex::DisplayHex as _;
 use bdk_wallet::bitcoin::{
-    Amount, Network, PrivateKey, Psbt, ScriptBuf, Sequence, TapNodeHash, Transaction, Weight,
-    XOnlyPublicKey, consensus, psbt,
+    Address, Amount, FeeRate, Network, OutPoint, PrivateKey, Psbt, ScriptBuf, Sequence,
+    TapNodeHash, Transaction, Weight, XOnlyPublicKey, consensus, psbt,
 };
 use bdk_wallet::chain::{
     BlockId, CanonicalizationParams, ChainPosition, CheckPoint, FullTxOut, Merge as _,

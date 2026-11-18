@@ -97,7 +97,7 @@ impl ServerHandle {
         Client::new(url, Auth::UserPass(user, pass)).expect("connect to bitcoind RPC")
     }
 
-    /// Gracefully stop the server with SIGINT and wait for it to exit, so bitcoind/electrs release
+    /// Gracefully stop the server with SIGINT and wait for it to exit, so bitcoind releases
     /// the data directory cleanly before the next run reuses it.
     fn shutdown(mut self) {
         // SIGINT triggers the binary's ctrlc handler -> graceful shutdown.
@@ -105,7 +105,7 @@ impl ServerHandle {
             .args(["-INT", &self.child.id().to_string()])
             .status();
 
-        // Give it a moment to tear bitcoind/electrs down, then make sure it's gone.
+        // Give it a moment to tear bitcoind down, then make sure it's gone.
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match self.child.try_wait() {
@@ -162,10 +162,6 @@ fn testenv_server_persists_chain_across_restarts() {
         assert!(
             data_dir.join("bitcoind").join("regtest").is_dir(),
             "bitcoind should populate its regtest sub-dir under the data dir"
-        );
-        assert!(
-            data_dir.join("electrsd").is_dir(),
-            "electrs should populate its sub-dir under the data dir"
         );
 
         let rpc = server.rpc_client();

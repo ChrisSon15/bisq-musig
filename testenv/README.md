@@ -1,14 +1,17 @@
 # Bitcoin Regtest Environment
 
-A clean Bitcoin regtest environment using electrsd with automatic executable downloads.
+A clean Bitcoin regtest environment: one `bitcoind` node with automatic executable download.
+
+Code under test reaches the chain only through the peer-to-peer port of the node, with compact block filters. The RPC
+interface of the node is for the test code: mining, funding and assertions. The environment starts no Electrum server.
 
 ## Features
 
-- **Automatic Downloads**: Downloads required executables (bitcoind, electrs) automatically
+- **Automatic Downloads**: Downloads the required executable (bitcoind) automatically
 - **Dependencies**: No Docker for running the tests
 - **Modern Rust API**: Clean, ergonomic interface inspired by BDK
 - **Compact Block Filters**: bitcoind runs with `-blockfilterindex=1 -peerblockfilters=1 -txindex=1` and P2P enabled,
-  so wallets can sync over CBF as well as via Electrum
+  so wallets and the trade engine sync over compact block filters (CBF)
 - **Web UI**: Built-in blockchain explorer for visual debugging
   (needs podman)
 - **Standalone server**: the `testenv-server` binary runs the environment outside of a test, e.g. for the Java
@@ -29,15 +32,15 @@ env.mine_block()?;
 let address = env.new_address()?;
 let txid = env.fund_address(&address, Amount::from_sat(100000))?;
 
-// Wait until electrum sees the transaction, then confirm it
-env.wait_for_tx(txid)?;
+// Confirm it
 env.mine_block()?;
-env.wait_for_block()?;
 
 println!("Transaction confirmed: {}", txid);
 ```
 
-The `wait_for_*` methods poll until the configured `Config::timeout` (5 seconds by default) expires.
+`fund_address` returns when the node has accepted the transaction. A wallet or a chain client under test sees the
+transaction after it is confirmed and after its own next sync, so a test waits on the wallet or on the client, not on
+the node.
 
 ### Web UI (btc-rpc-explorer)
 
@@ -77,12 +80,6 @@ let mut config = Config::default();
 // Customize bitcoind settings
 config.bitcoind.args.push("-maxmempool=100");
 
-// Wait longer in the wait_for_* methods
-config.timeout = Duration::from_secs(10);
-
-// Customize electrsd settings
-// config.electrsd.view_stderr = true;  // Uncomment to see electrsd logs
-
 // Create environment with custom configuration
 let mut env = TestEnv::new_with_conf(config)?;
 
@@ -100,11 +97,10 @@ let env = TestEnvBuilder::new(Some("bitcoin".to_owned()))
 ### Environment Variables
 
 ```bash
-# Override executables via environment variables
+# Override the executable via an environment variable
 export BITCOIND_EXEC="/custom/path/to/bitcoind"
-export ELECTRS_EXEC="/custom/path/to/electrs"
 
-cargo test  # Will use custom executables
+cargo test  # Will use the custom executable
 
 # Allow several TestEnv instances to run at the same time (faster, but may be flaky).
 # By default a global lock serializes them.
@@ -119,16 +115,16 @@ cargo run --bin testenv-server -p testenv -- --data-dir /path/to/dir # persisten
 ```
 
 It prints the connection details as `KEY=value` lines (`TESTENV_RPC_URL`, `TESTENV_RPC_USER`, `TESTENV_RPC_PASS`,
-`TESTENV_ELECTRUM_URL`, `TESTENV_P2P_ADDR`, ...) and runs until stopped with Ctrl+C. The RPC credentials are
+`TESTENV_P2P_ADDR`, ...) and runs until stopped with Ctrl+C. The RPC credentials are
 `bitcoin`/`bitcoin`.
 
 ## API Reference
 
 ### TestEnv
 
-The main environment manager that handles both bitcoind and electrs instances.
+The main environment manager that handles the bitcoind instance.
 
-> **⚠️ Important**: Keep the `TestEnv` instance alive (don't drop it) while you need the services running. When the instance is dropped, both bitcoind and electrs processes will be terminated.
+> **⚠️ Important**: Keep the `TestEnv` instance alive (don't drop it) while you need the services running. When the instance is dropped, the bitcoind process is terminated.
 
 #### Creation Methods
 
@@ -138,16 +134,9 @@ The main environment manager that handles both bitcoind and electrs instances.
 
 #### Client Access
 
-- `electrum_client()` / `bdk_electrum_client()` - Access to the electrum client for blockchain operations
-- `new_client()` - Create a new, independent `BdkElectrumClient`
-- `new_testchain()` - Create a `Testchain` (implements `ChainApi` / `ChainScanner`)
 - `bitcoind_client()` / `bitcoin_core_rpc_client()` - Access to bitcoind's RPC
-- `electrum_url()` - Get electrum server URL
-- `esplora_url()` - Get Esplora REST URL (if available)
 - `bitcoin_rpc_port()` / `bitcoin_rpc_password()` - RPC connection details (user is `bitcoin`)
-- `p2p_socket_addr()` - bitcoind's P2P address, e.g. for Compact Block Filter syncing
-
-`TestEnv` itself also implements `ChainScanner`.
+- `p2p_socket_addr()` - bitcoind's P2P address, the peer of a compact block filter client
 
 #### Web UI
 
@@ -160,13 +149,8 @@ The main environment manager that handles both bitcoind and electrs instances.
 - `mine_blocks(count)` - Mine multiple blocks
 - `fund_address(address, amount)` - Send BTC to address
 - `fund_from_prv_key(key, amount)` - Send BTC to the P2TR address of a private key
-- `broadcast(tx)` - Broadcast a transaction
+- `broadcast(tx)` - Send a transaction to the node through its RPC interface; an error contains the reject reason
 - `new_address()` - Generate new test address
-
-#### Synchronization
-
-- `wait_for_block()` - Wait for electrum to see new block
-- `wait_for_tx(txid)` - Wait for electrum and bitcoind to see transaction
 
 #### Information
 
@@ -176,14 +160,13 @@ The main environment manager that handles both bitcoind and electrs instances.
 
 ### Utility Methods
 
-- `trigger_sync()` - Trigger electrs sync (Unix only)
 - `workdir()` - Get working directory path
 - `new_temp_path()` - Get a fresh temporary directory that lives as long as the `TestEnv`
 - `TestEnv::get_bound_port()` - Get a `TcpListener` bound to a free local port
 
 ## Testing
 
-The executables are downloaded automatically at build time, so the tests need no further setup:
+The executable is downloaded automatically at build time, so the tests need no further setup:
 
 ```bash
 cargo test -p testenv

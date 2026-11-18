@@ -25,10 +25,10 @@ The code is organised as a Cargo workspace:
 | Crate                           | Purpose                                                                                                                   |
 |---------------------------------|---------------------------------------------------------------------------------------------------------------------------|
 | `protocol`                      | Cryptographic core: trade transaction builders (deposit, warning, redirect, claim, swap, custom payout), MuSig2 + adaptor signing, Taproot script paths |
-| [`wallet`](wallet/README.md)    | BDK-based wallets (`BMPWallet`, `MemWallet`) and the `ProtocolWalletApi` trait consumed by `protocol`                     |
-| `chain`                         | Small traits (`ChainApi`, `ChainScanner`) that decouple the wallets from a specific chain backend                         |
+| [`wallet`](wallet/README.md)    | BDK-based wallet (`BMPWallet`) and the `ProtocolWalletApi` trait consumed by `protocol`                                   |
+| `chain`                         | Chain access over the Bitcoin peer-to-peer network with compact block filters: wallet sync, watching, broadcast           |
 | [`rpc`](rpc/README.md)          | gRPC server (`musigd`) and Java test clients                                                                              |
-| [`testenv`](testenv/README.md)  | Spins up `bitcoind` + `electrs` on regtest for the integration tests                                                      |
+| [`testenv`](testenv/README.md)  | Spins up `bitcoind` on regtest for the integration tests                                                                  |
 | `bmp_tracing`                   | Shared tracing/logging initialisation                                                                                     |
 
 ## docs
@@ -97,7 +97,7 @@ setting `RUST_LOG=off`.
 
 ## running the tests
 
-The Rust tests automatically spin up a TestEnv with bitcoind and electrs as needed, so you may need some RAM and patience.
+The Rust tests automatically spin up a TestEnv with bitcoind as needed, so you may need some RAM and patience.
 
 ```bash
 cargo test

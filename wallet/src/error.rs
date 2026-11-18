@@ -16,8 +16,6 @@ pub enum ChainDataSourceError {
     MissingWallet { index: usize },
     #[error("failed to apply chain update: {0}")]
     ApplyUpdate(#[from] bdk_wallet::chain::local_chain::CannotConnectError),
-    #[error("full scan failed: {0}")]
-    FullScan(#[from] chain::FullScanError),
 }
 
 #[derive(Error, Debug)]
@@ -57,7 +55,6 @@ pub enum WalletErrorKind {
     Bip32(#[from] bdk_wallet::bitcoin::bip32::Error),
     Descriptor(#[from] bdk_wallet::descriptor::DescriptorError),
     Mnemonic(#[from] bdk_wallet::keys::bip39::Error),
-    Electrum(#[from] bdk_electrum::electrum_client::Error),
     ApplyUpdate(#[from] bdk_wallet::chain::local_chain::CannotConnectError),
     ChainDataSource(#[from] ChainDataSourceError),
     Generic(Box<dyn std::error::Error + Sync + Send + 'static>),

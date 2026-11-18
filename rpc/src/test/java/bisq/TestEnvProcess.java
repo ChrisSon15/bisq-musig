@@ -18,8 +18,7 @@ import java.util.concurrent.TimeoutException;
 
 /**
  * Starts and stops a {@code testenv-server} process — a throwaway regtest {@code bitcoind}
- * (started with compact block filters and a transaction index) plus {@code electrs} — for
- * integration tests that want a chain of their own instead of one started by hand.
+ * (started with compact block filters and a transaction index) — for integration tests that want a chain of their own instead of one started by hand.
  *
  * <p>The binary is located via the {@code testenv.bin} system property, falling back to
  * {@code target/debug/testenv-server} relative to the workspace root. Build it first with
@@ -29,13 +28,13 @@ import java.util.concurrent.TimeoutException;
  * lines (the same ones a human exports before running {@code mvn verify}), which this class
  * parses and exposes. Everything else it prints, on either stream, is kept in a log file for
  * {@link #tailLog()}. It shuts down in an orderly way on the SIGTERM that
- * {@link Process#destroy()} sends, taking bitcoind and electrs with it; {@link #close()} still
+ * {@link Process#destroy()} sends, taking bitcoind with it; {@link #close()} still
  * makes sure no daemon is left behind, which matters if the server had to be killed instead.
  */
 public final class TestEnvProcess implements AutoCloseable {
     private static final long STARTUP_TIMEOUT_MS = 120_000;
     private static final long SHUTDOWN_TIMEOUT_MS = 30_000;
-    /** How long bitcoind and electrs get to finish their own shutdown before being killed. */
+    /** How long bitcoind gets to finish its own shutdown before being killed. */
     private static final long DAEMON_GRACE_MS = 5_000;
     /** The settings the tests cannot do without; the server prints more, which are optional. */
     private static final List<String> REQUIRED_SETTINGS = List.of(
@@ -104,7 +103,7 @@ public final class TestEnvProcess implements AutoCloseable {
             throw e;
         }
         System.out.println("testenv-server is up: RPC " + testenv.getRpcUrl() + ", P2P "
-                + testenv.getP2pAddr() + ", electrum " + testenv.getElectrumUrl());
+                + testenv.getP2pAddr());
         return testenv;
     }
 
@@ -162,11 +161,6 @@ public final class TestEnvProcess implements AutoCloseable {
     /** bitcoind's P2P endpoint, the one a compact-block-filter client such as musigd syncs from. */
     public String getP2pAddr() {
         return settings.get("TESTENV_P2P_ADDR");
-    }
-
-    /** May be {@code null} if the server didn't print it; nothing here needs it. */
-    public String getElectrumUrl() {
-        return settings.get("TESTENV_ELECTRUM_URL");
     }
 
     /** A JSON-RPC client for the node this server started. */

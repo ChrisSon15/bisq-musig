@@ -1,28 +1,22 @@
-use std::io::Write as _;
 use std::mem;
 use std::sync::{Arc, LazyLock};
 use std::time::UNIX_EPOCH;
 
-use bdk_electrum::BdkElectrumClient;
-use bdk_electrum::bdk_core::bitcoin::bip32::Xpriv;
-use bdk_electrum::electrum_client::Client;
 use bdk_wallet::bitcoin::{
     Address, Amount, FeeRate, Network, OutPoint, Psbt, ScriptBuf, Transaction, XOnlyPublicKey,
     absolute, secp256k1,
 };
 use bdk_wallet::coin_selection::CoinSelectionAlgorithm;
-use bdk_wallet::descriptor::{Descriptor, ExtendedDescriptor};
+use bdk_wallet::descriptor::Descriptor;
 use bdk_wallet::miniscript::ToPublicKey as _;
 use bdk_wallet::miniscript::descriptor::TapTree;
 use bdk_wallet::miniscript::psbt::PsbtExt as _;
-use bdk_wallet::template::{Bip86, DescriptorTemplate as _};
-use bdk_wallet::{AddressInfo, KeychainKind, SignOptions, TxBuilder, TxOrdering, Wallet};
-use rand::RngCore as _;
+use bdk_wallet::{KeychainKind, SignOptions, TxBuilder, TxOrdering, Wallet};
 use secp::Scalar;
 
 use crate::error::WalletErrorKind::MalformedPsbt;
 use crate::error::{Result, WalletErrorKind};
-use crate::key_shares::{TradeKeyShares, derive_trade_key_shares};
+use crate::key_shares::TradeKeyShares;
 
 /// The Protocol Wallet API is used by the protocol to create and sign transactions.
 /// It's the part of functionality being exposed only to the protocol.
@@ -107,83 +101,8 @@ pub trait ProtocolWalletApi {
     fn is_utxo_locked(&self, utxo: OutPoint) -> bool;
 }
 
-pub struct MemWallet {
-    wallet: Wallet,
-    client: BdkElectrumClient<Client>,
-    /// The master key of the wallet, for the derivation of the key shares of trades.
-    master_key: Xpriv,
-}
-
-// TODO think about stop_gap and batch_size
-const STOP_GAP: usize = 50;
-const BATCH_SIZE: usize = 5;
-
 pub(crate) static LIBSECP256K1_CTX: LazyLock<secp256k1::Secp256k1<secp256k1::All>> =
     LazyLock::new(secp256k1::Secp256k1::new);
-
-impl MemWallet {
-    pub fn public_descriptor(&self, chain: KeychainKind) -> &ExtendedDescriptor {
-        self.wallet.public_descriptor(chain)
-    }
-
-    pub fn new(client: BdkElectrumClient<Client>) -> Result<Self> {
-        let mut seed: [u8; 32] = [0u8; 32];
-        rand::rng().fill_bytes(&mut seed);
-
-        let network: Network = Network::Regtest;
-        let xprv: Xpriv = Xpriv::new_master(network, &seed)?;
-
-        let (descriptor, external_map, _) =
-            Bip86(xprv, KeychainKind::External).build(network.into())?;
-        let (change_descriptor, internal_map, _) =
-            Bip86(xprv, KeychainKind::Internal).build(network.into())?;
-
-        let wallet = Wallet::create(descriptor, change_descriptor)
-            .network(network)
-            .keymap(KeychainKind::External, external_map)
-            .keymap(KeychainKind::Internal, internal_map)
-            .create_wallet_no_persist()?;
-
-        Ok(Self {
-            wallet,
-            client,
-            master_key: xprv,
-        })
-    }
-
-    pub fn sync(&mut self) -> Result<()> {
-        // Populate the electrum client's transaction cache so it doesn't re-download transaction we
-        // already have.
-        self.client
-            .populate_tx_cache(self.wallet.tx_graph().full_txs().map(|tx_node| tx_node.tx));
-
-        let request = self.wallet.start_full_scan().inspect({
-            let mut stdout = std::io::stdout();
-            // let mut once = HashSet::<KeychainKind>::new();
-            move |_k, _spk_i, _| {
-                stdout.flush().expect("must flush");
-            }
-        });
-        tracing::info!("requesting update...");
-        let update = self
-            .client
-            .full_scan(request, STOP_GAP, BATCH_SIZE, false)?;
-        self.wallet.apply_update(update)?;
-        Ok(())
-    }
-
-    pub fn balance(&self) -> Amount {
-        self.wallet.balance().trusted_spendable()
-    }
-
-    pub fn reveal_next_address(&mut self) -> AddressInfo {
-        self.wallet.reveal_next_address(KeychainKind::External)
-    }
-
-    pub fn next_unused_address(&mut self) -> AddressInfo {
-        self.wallet.next_unused_address(KeychainKind::External)
-    }
-}
 
 pub(crate) trait WalletExt {
     fn update_psbt_with_derivation_paths(&self, psbt: &mut Psbt);
@@ -211,84 +130,6 @@ impl WalletExt for Wallet {
                 }
             }
         }
-    }
-}
-
-impl WalletExt for MemWallet {
-    fn update_psbt_with_derivation_paths(&self, psbt: &mut Psbt) {
-        self.wallet.update_psbt_with_derivation_paths(psbt);
-    }
-}
-
-impl ProtocolWalletApi for MemWallet {
-    fn network(&self) -> Network {
-        self.wallet.network()
-    }
-
-    fn new_address(&mut self) -> Result<Address> {
-        self.wallet.new_address()
-    }
-
-    fn new_internal_key(&mut self) -> Result<XOnlyPublicKey> {
-        self.wallet.new_internal_key()
-    }
-
-    fn create_psbt(
-        &mut self,
-        recipients: Vec<(ScriptBuf, Amount)>,
-        fee_rate: FeeRate,
-    ) -> Result<Psbt> {
-        self.wallet.create_psbt(recipients, fee_rate)
-    }
-
-    fn sign_selected_inputs(
-        &mut self,
-        psbt: &mut Psbt,
-        is_selected: &dyn Fn(&OutPoint) -> bool,
-    ) -> Result<()> {
-        self.wallet.sign_selected_inputs(psbt, is_selected)
-    }
-
-    fn import_private_key(
-        &mut self,
-        _pk: Scalar,
-        _tap_tree: Option<TapTree<XOnlyPublicKey>>,
-    ) -> Result<()> {
-        // `MemWallet` is an in-memory wallet that doesn't currently support imported keys.
-        // If/when this is needed, mirror the `BMPWallet` implementation.
-        Err(WalletErrorKind::Unsupported(
-            "MemWallet cannot import private keys",
-        ))
-    }
-
-    fn chain_tip_height(&self) -> u32 {
-        self.wallet.chain_tip_height()
-    }
-
-    fn record_transaction(&mut self, tx: &Transaction) -> Result<()> {
-        self.wallet.record_transaction(tx)
-    }
-
-    fn trade_key_shares(&self, trade_id: &str) -> Result<TradeKeyShares> {
-        derive_trade_key_shares(&self.master_key, trade_id)
-    }
-
-    fn lock_utxo(&mut self, utxo: OutPoint) -> Result<()> {
-        self.wallet.lock_outpoint(utxo);
-        Ok(())
-    }
-
-    fn list_locked_utxos(&self) -> Vec<OutPoint> {
-        self.wallet.list_locked_unspent().collect()
-    }
-
-    fn unlock_utxo(&mut self, utxo: OutPoint) -> Result<()> {
-        self.wallet.unlock_outpoint(utxo);
-        Ok(())
-    }
-
-    fn is_utxo_locked(&self, utxo: OutPoint) -> bool {
-        self.wallet.is_outpoint_locked(utxo)
     }
 }
 
@@ -434,7 +275,7 @@ where
 
 /// Apply the standard PSBT-builder configuration used by the trade protocol — untouched output
 /// ordering, zero locktime, given fee rate, given recipients — and finish the builder. Generic
-/// over the coin-selection algorithm so the same helper serves `Wallet`, `MemWallet`, and
+/// over the coin-selection algorithm so the same helper serves `Wallet` and
 /// `BMPWallet`.
 pub(crate) fn finish_standard_psbt<Cs: CoinSelectionAlgorithm>(
     mut builder: TxBuilder<'_, Cs>,

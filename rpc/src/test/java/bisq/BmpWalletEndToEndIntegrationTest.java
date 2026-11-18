@@ -55,9 +55,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * would drive it, against a real regtest chain with real transactions mined into real blocks.
  *
  * <p>Unlike the other integration tests this one is self-contained: it starts its own
- * {@code testenv-server} (a regtest {@code bitcoind} with compact block filters, plus
- * {@code electrs}), mines its own chain, launches {@code musigd} against that node, and tears
- * everything down again. It needs no running testenv and no exported {@code TESTENV_*}
+ * {@code testenv-server} (a regtest {@code bitcoind} with compact block filters), mines its own
+ * chain, launches {@code musigd} against that node, and tears everything down again. It needs no running testenv and no exported {@code TESTENV_*}
  * variables — only the two binaries, found via {@code -Dmusigd.bin} and {@code -Dtestenv.bin} or
  * at their default {@code target/debug} locations. See {@code readme-full-blown-wallet-test.md}.
  *

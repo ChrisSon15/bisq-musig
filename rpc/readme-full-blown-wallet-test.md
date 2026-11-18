@@ -40,10 +40,10 @@ that `Process.destroy()` sends there, on which the server shuts down cleanly.
 | `protoc` on `PATH` (or `PROTOC` set) | the `rpc` crate generates its gRPC code at build time; `apt-get install -y protobuf-compiler` on Debian/Ubuntu |
 | JDK 21 | the Maven module targets Java 21 |
 | Maven 3.9+ | runs the test; downloads `protoc` and the gRPC Java plugin itself |
-| Internet access on first build | the `testenv` crate's build scripts download Bitcoin Core 29.0 and `electrs` into `target/`; Maven downloads its plugins and dependencies |
+| Internet access on first build | the `testenv` crate's build scripts download Bitcoin Core 29.0 into `target/`; Maven downloads its plugins and dependencies |
 
 No Bitcoin node, no wallet, no Podman: `testenv-server` brings its own `bitcoind` (started with
-`-regtest -txindex -blockfilterindex -peerblockfilters`) and `electrs`, in a temporary directory
+`-regtest -txindex -blockfilterindex -peerblockfilters`), in a temporary directory
 that is deleted when it stops.
 
 ## Build the two binaries
@@ -55,7 +55,7 @@ cargo build --bin musigd
 cargo build -p testenv --bin testenv-server
 ```
 
-The first `testenv` build downloads Bitcoin Core and `electrs`; later builds reuse them. The test
+The first `testenv` build downloads Bitcoin Core; later builds reuse it. The test
 looks for both binaries under `target/debug/`. Rebuild `musigd` after changing anything in the
 `rpc` or `wallet` crates — the test runs whatever binary it finds, it does not build it.
 
@@ -82,7 +82,7 @@ What a successful run prints, abbreviated:
 
 ```
 Starting testenv-server: /…/target/debug/testenv-server
-testenv-server is up: RPC http://127.0.0.1:…, P2P 127.0.0.1:…, electrum 127.0.0.1:…
+testenv-server is up: RPC http://127.0.0.1:…, P2P 127.0.0.1:…
 Mining 101 blocks so the node has spendable coins...
 Starting musigd: /…/target/debug/musigd --port 50063 --wallet-dir /tmp/bmp-wallet-e2e-it-… --wallet-network regtest --wallet-poll-secs 2 --bitcoin-rpc-url http://127.0.0.1:… --bitcoin-rpc-user bitcoin --bitcoin-rpc-pass … --wallet-peer 127.0.0.1:…
 musigd is accepting connections on port 50063
@@ -109,7 +109,7 @@ Final balance: 99600 sat after 3 transactions
 ### Ports and files
 
 - `musigd` listens on **127.0.0.1:50063** (the other integration tests use 50051, 50052, 50061
-  and 50062, so all of them can run in one `mvn verify`). `bitcoind` and `electrs` pick free
+  and 50062, so all of them can run in one `mvn verify`). `bitcoind` picks free
   ports, printed in the first lines of the output.
 - The wallet lives in a `bmp-wallet-e2e-it-*` directory under the system temp directory, the
   regtest node in a `.tmp*` directory there as well, and the daemon logs in
@@ -122,7 +122,7 @@ Final balance: 99600 sat after 3 transactions
 - `TestEnvProcess` (new) launches `testenv-server`, reads the `TESTENV_RPC_URL`,
   `TESTENV_RPC_USER`, `TESTENV_RPC_PASS` and `TESTENV_P2P_ADDR` lines it prints, keeps the rest
   of its output for the log tail, and on close stops it with `Process.destroy()` (SIGTERM), on
-  which it shuts down cleanly, taking `bitcoind` and `electrs` with it. Any daemon that is
+  which it shuts down cleanly, taking `bitcoind` with it. Any daemon that is
   nevertheless left behind is killed.
 - `MusigdProcess` (shared with the other wallet tests) launches `musigd --wallet-dir … --wallet-peer
   <P2P addr> --wallet-poll-secs 2` and waits for the gRPC port.
@@ -137,9 +137,9 @@ Final balance: 99600 sat after 3 transactions
 |---|---|
 | `musigd binary not found at …/target/debug/musigd` | run `cargo build --bin musigd` (or pass `-Dmusigd.bin`) |
 | `testenv-server binary not found at …/target/debug/testenv-server` | run `cargo build -p testenv --bin testenv-server` (or pass `-Dtestenv.bin`) |
-| `testenv-server did not become ready within 120000ms` | look at the embedded log tail: usually `bitcoind` or `electrs` failed to start. Delete `target/debug/build/corepc-node-*` / `electrsd-*` and rebuild to re-download them. |
+| `testenv-server did not become ready within 120000ms` | look at the embedded log tail: usually `bitcoind` failed to start. Delete `target/debug/build/corepc-node-*` and rebuild to download it again. |
 | `musigd did not open port 50063` | something else is listening on 50063 (`ss -ltnp | grep 50063`); stop it, or a previous run left a `musigd` behind (`pkill -f 'musigd --port 50063'`). |
 | `Timed out … waiting for the wallet to finish its initial sync` | the compact-block-filter sync to `bitcoind` failed; the embedded `musigd` log says why. The wallet peer is `bitcoind`'s P2P port as printed by `testenv-server`. |
-| stray `bitcoind` / `electrs` processes after an aborted run | `pkill -f 'bitcoind.*-regtest'` and `pkill electrs`; they only ever belong to a `testenv-server` in a temp directory. |
+| stray `bitcoind` processes after an aborted run | `pkill -f 'bitcoind.*-regtest'`; they only ever belong to a `testenv-server` in a temp directory. |
 | `Fee estimation failed` from `sendmany` | would mean `bitcoind` was started without `-fallbackfee`; `testenv-server` sets it, so this points at a `-Dtestenv.bin` that isn't the project's. |
 | Maven cannot download `protoc`/plugins | the Java build needs network access on first run; afterwards everything is in `~/.m2`. |

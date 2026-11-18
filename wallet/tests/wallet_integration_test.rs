@@ -31,6 +31,13 @@ fn test_password() -> Password {
         .expect("TEST_PASSWORD follows the password rules")
 }
 
+/// The wallet sync over compact block filters, with the node of the test as the only peer.
+fn scanner(env: &TestEnv) -> CBFScanner {
+    CBFScanner::new(vec![TrustedPeer::from_socket_addr(
+        env.p2p_socket_addr().expect("peer address of the node"),
+    )])
+}
+
 fn new_private_key() -> Scalar {
     let mut seed: [u8; 32] = [0u8; 32];
     rand::rng().fill_bytes(&mut seed);
@@ -40,7 +47,7 @@ fn new_private_key() -> Scalar {
 #[tokio::test]
 async fn init_test() -> anyhow::Result<()> {
     let mut env = TestEnv::new()?;
-    let chain = env.new_testchain()?;
+    let chain = scanner(&env);
 
     let mut wallet = BMPWallet::new(
         env.new_temp_path().into(),
@@ -63,7 +70,7 @@ async fn init_test() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_sync_with_imported_keys() -> anyhow::Result<()> {
     let mut env = TestEnv::new()?;
-    let chain = env.new_testchain()?;
+    let chain = scanner(&env);
 
     let prv_key = new_private_key();
 
@@ -92,7 +99,7 @@ async fn test_sync_with_imported_keys() -> anyhow::Result<()> {
 async fn test_broadcast_transaction() -> anyhow::Result<()> {
     // This test broadcast a transaction created from main wallet balance only
     let mut env = TestEnv::new()?;
-    let chain = env.new_testchain()?;
+    let chain = scanner(&env);
 
     let prv_key = new_private_key();
 
@@ -146,7 +153,7 @@ async fn test_broadcast_transaction() -> anyhow::Result<()> {
 async fn test_broadcast_transaction_two() -> anyhow::Result<()> {
     // This test broadcast a transaction created from imported wallets only
     let mut env = TestEnv::new()?;
-    let chain = env.new_testchain()?;
+    let chain = scanner(&env);
 
     let prv_key = new_private_key();
 
@@ -196,7 +203,7 @@ async fn test_broadcast_transaction_three() -> anyhow::Result<()> {
     // This test will attempt send a transaction created from both main wallet and imported keys
     // balance
     let mut env = TestEnv::new()?;
-    let chain = env.new_testchain()?;
+    let chain = scanner(&env);
 
     let prv_key = new_private_key();
 
@@ -437,7 +444,7 @@ async fn test_drain_wallet_with_main_balance() -> anyhow::Result<()> {
     // This test will attempt to drain the imported wallets UTXOs
     // With the main wallet having some balance it won't be touched.
     let mut env = TestEnv::new()?;
-    let chain = env.new_testchain()?;
+    let chain = scanner(&env);
 
     env.mine_block()?;
 
@@ -491,7 +498,7 @@ async fn test_drain_wallet_with_main_balance() -> anyhow::Result<()> {
 #[tokio::test]
 async fn m1_drain_imported_coins() -> anyhow::Result<()> {
     let mut env = TestEnv::new()?;
-    let chain = env.new_testchain()?;
+    let chain = scanner(&env);
     env.mine_block()?;
     let mut wallet = BMPWallet::new(
         env.new_temp_path().into(),

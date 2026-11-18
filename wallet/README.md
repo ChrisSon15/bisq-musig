@@ -5,7 +5,7 @@ Wallet module of the Bisq-musig protocol. This crate has the primitives for inte
 It currently provides the following features:
 
 - `ProtocolWalletApi`: the trait through which the `protocol` crate uses a wallet, implemented by a plain
-  `bdk_wallet::Wallet`, the in-memory `MemWallet` and the persistent `BMPWallet`
+  `bdk_wallet::Wallet` and the persistent `BMPWallet`
 - `BMPWallet`: a persistent HD wallet on top of BDK
   - always password-protected: stored in an encrypted SQLite database (SQLCipher) whose key is derived from the wallet
     password with Argon2; the salt is stored next to the database as `<dbname>.salt`
@@ -16,7 +16,6 @@ It currently provides the following features:
   - the wallet password can be checked and changed, but not removed
   - importing of external private keys (e.g. for the swap tx), which are signed with alongside the HD keys
   - sending to an address, listing addresses, UTXOs and transactions
-- `MemWallet`: an in-memory wallet synced via BDK Electrum, mainly used in tests
 - Syncing using Compact Block Filters (CBF) through `bdk_kyoto`, behind the `ChainDataSource` trait
 
 ## Imported-key identity
@@ -47,7 +46,7 @@ trades, reservation of coins, recording of transactions, imported keys of payout
 
 `cargo test -p wallet`
 
-The tests spin up `bitcoind` + `electrs` via the [`testenv`](../testenv/README.md) crate.
+The tests spin up `bitcoind` via the [`testenv`](../testenv/README.md) crate.
 
 # Running integration tests
 

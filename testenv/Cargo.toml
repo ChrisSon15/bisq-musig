@@ -7,25 +7,20 @@ edition = "2024"
 # Workspace dependencies
 anyhow = { workspace = true }
 bdk_bitcoind_rpc = { workspace = true }
-bdk_electrum = { workspace = true }
 bdk_wallet = { workspace = true, features = ["test-utils"] }
 bmp_tracing = { workspace = true }
-chain = { workspace = true }
 clap = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 secp = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["net", "signal", "rt"] }
-wallet = { workspace = true }
 
 # `termination`: shut down on SIGTERM and SIGHUP as well as Ctrl+C, so a supervising process
 # (e.g. Java's `Process.destroy()` in the rpc crate's integration tests) gets a clean stop.
 ctrlc = { version = "3.5.2", features = ["termination"] }
-electrsd = { version = "0.36.1", features = [
-"esplora_a33e97e1",
-"corepc-node_29_0",
-] }
+# bitcoind 29.0, downloaded at build time.
+corepc-node = { version = "0.10.1", features = ["29_0", "download"] }
 hmac = "0.12.1"
 sha2 = "0.10.9"
 typed-arena = "2"

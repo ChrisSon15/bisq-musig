@@ -7,7 +7,6 @@ anyhow = "1.0.104"
 argon2 = { version = "0.5.3", default-features = false }
 base64 = "0.22.1"
 bdk_bitcoind_rpc = "0.22.0"
-bdk_electrum = { version = "0.23.2", default-features = false, features = ["use-rustls-ring"] }
 bdk_kyoto = "0.17.0"
 bdk_wallet = { version = "3.1.0", features = ["rusqlite", "keys-bip39"] }
 bip39 = "2.2.2"

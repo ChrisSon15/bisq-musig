@@ -1,27 +1,25 @@
-//! Bitcoin regtest environment using electrsd with automatic executable downloads
+//! Bitcoin regtest environment: a bitcoind node with automatic executable download.
+//!
+//! The node serves compact block filters on its peer-to-peer port. Code under test reaches the
+//! chain only through that port; the RPC interface of the node is for the test code (mining,
+//! funding, assertions).
 
 use std::net::SocketAddrV4;
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use bdk_bitcoind_rpc::bitcoincore_rpc;
 use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, RpcApi as _};
-use bdk_electrum::BdkElectrumClient;
-use bdk_electrum::bdk_core::bitcoin::{KnownHrp, XOnlyPublicKey};
-use bdk_electrum::electrum_client::Error;
 use bdk_wallet::bitcoin::address::NetworkChecked;
 use bdk_wallet::bitcoin::key::Secp256k1;
 use bdk_wallet::bitcoin::secp256k1::All;
-use bdk_wallet::bitcoin::{Address, Amount, BlockHash, Network, Transaction, Txid};
-use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse};
-use bdk_wallet::{PersistedWallet, serde_json};
+use bdk_wallet::bitcoin::{
+    Address, Amount, BlockHash, KnownHrp, Network, Transaction, Txid, XOnlyPublicKey,
+};
 use bmp_tracing::tracing;
-use chain::{ChainApi, ChainApiError, ChainScanner, FullScanError};
-use electrsd::corepc_node::Node;
-use electrsd::electrum_client::{Client, ElectrumApi};
-use electrsd::{ElectrsD, corepc_node};
+use corepc_node::Node;
 use hmac::{Hmac, Mac as _};
 use rand::{Rng as _, RngCore as _};
 use secp::Scalar;
@@ -29,23 +27,15 @@ use sha2::Sha256;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use typed_arena::Arena;
-use wallet::chain_data_source::ChainDataSource;
-use wallet::error::ChainDataSourceError;
-use wallet::persisted::BMPWalletPersister;
 
 /// Bitcoin regtest environment manager
 pub struct TestEnv {
     bitcoind: Node,
-    electrsd: ElectrsD,
-    timeout: Duration,
-    delay: Duration,
-    bdk_electrum_client: BdkElectrumClient<Client>,
     ctx: Secp256k1<All>,
     explorer_process: Option<std::process::Child>,
     container_name: Option<String>,
     explorer_port: Option<u16>,
     bitcoin_rpc_pwd: String,
-    mempool: Vec<Txid>,
     _guard: Option<MutexGuard<'static, ()>>,
     /// Append-only arena of every `TempDir` we've handed out a `&Path` to.
     ///
@@ -61,10 +51,6 @@ pub struct TestEnv {
 pub struct Config<'a> {
     /// [`bitcoind::Conf`]
     pub bitcoind: corepc_node::Conf<'a>,
-    /// [`electrsd::Conf`]
-    pub electrsd: electrsd::Conf<'a>,
-    pub timeout: Duration,
-    pub delay: Duration,
     pub runmultithreaded: bool,
     pub password: Option<String>,
 }
@@ -86,16 +72,6 @@ impl Default for Config<'_> {
                 conf.args.push("-txindex=1");
                 conf
             },
-            electrsd: {
-                let mut conf = electrsd::Conf::default();
-                conf.http_enabled = true;
-                conf.args.push("--cors");
-                conf.args.push("*");
-                // conf.view_stderr = true;
-                conf
-            },
-            timeout: Duration::from_secs(5),
-            delay: Duration::from_millis(200),
             password: None,
             runmultithreaded: "true" == std::env::var("TEST_MULTITHREADED").unwrap_or_default().trim().to_lowercase(),
         }
@@ -122,7 +98,7 @@ impl TestEnvBuilder {
         }
     }
 
-    /// Set a persistent data directory for bitcoind and electrs data
+    /// Set a persistent data directory for the data of bitcoind
     ///
     /// If not set, a temporary directory will be used (auto-deleted on exit).
     /// If set, the directory will be created if it doesn't exist and persist across runs.
@@ -144,15 +120,10 @@ impl TestEnvBuilder {
                 )
             })?;
 
-            // Wire the persistent directory into bitcoind and electrs. Both back-ends treat a
-            // `staticdir` as a persistent work directory (reused across runs), whereas the
-            // default `tmpdir`/`None` behaviour creates a throwaway temp dir. They must not share
-            // the same directory, so each gets its own sub-directory under `data_dir`.
-            //
-            // Note: `staticdir` and `tmpdir` are mutually exclusive in both `corepc_node::Conf`
-            // and `electrsd::Conf`, so we leave `tmpdir` as its default `None`.
+            // A `staticdir` is a persistent work directory that is reused across runs, whereas
+            // the default creates a throwaway temp dir. `staticdir` and `tmpdir` are mutually
+            // exclusive, so `tmpdir` stays at its default `None`.
             self.config.bitcoind.staticdir = Some(data_dir.join("bitcoind"));
-            self.config.electrsd.staticdir = Some(data_dir.join("electrsd"));
         }
         TestEnv::new_with_conf(self.config)
     }
@@ -278,71 +249,30 @@ impl TestEnv {
         // initialize global tracing subscriber, defaulting to `info`.
         bmp_tracing::init("info");
 
-        // Try to get electrs executable (from environment or downloads)
-        let electrs_exe = if let Ok(path) = std::env::var("ELECTRS_EXEC") {
-            tracing::info!("Using custom electrs executable: {path}");
-            path
-        } else {
-            // Try to use downloaded electrs
-            let path = electrsd::downloaded_exe_path()
-                .expect("No downloaded electrs found, trying electrs in PATH...");
-            tracing::info!("Using downloaded electrs: {path}");
-            path
-        };
-
-        tracing::info!("Starting electrsd...");
-
-        let electrsd = ElectrsD::with_conf(electrs_exe, &bitcoind, &config.electrsd)
-            .with_context(|| "Starting electrsd failed...")?;
-
-        let client = Client::from_config(
-            &electrsd.electrum_url,
-            bdk_electrum::electrum_client::Config::default(),
-        )?;
-        let bdk_electrum_client = BdkElectrumClient::new(client);
-
-        let test_env = Self {
+        let mut test_env = Self {
             bitcoind,
-            electrsd,
-            timeout: config.timeout,
-            delay: config.delay,
-            bdk_electrum_client,
             ctx: Secp256k1::new(),
             explorer_process: None,
             container_name: None,
             explorer_port: None,
             bitcoin_rpc_pwd,
-            mempool: Vec::new(),
             _guard: guard,
             dirs: Arena::new(),
         };
+        // A node with an empty chain is in its initial block download and does not behave like
+        // a synced node towards its peers. One block ends this state. A node that was started
+        // on an existing data directory has blocks already.
+        if test_env.block_count()? == 0 {
+            test_env.mine_block()?;
+        }
         tracing::info!("Bitcoin regtest environment ready!");
         Ok(test_env)
     }
 
+    /// Sends a transaction to the node through its RPC interface. An error contains the reject
+    /// reason of the node.
     pub fn broadcast(&mut self, tx: &Transaction) -> Result<Txid> {
-        let txid = self.bdk_electrum_client.transaction_broadcast(tx)?;
-        let _ = self.wait_for_tx(txid);
-        self.mempool.push(txid);
-        Ok(txid)
-    }
-
-    pub fn new_client(&self) -> Result<BdkElectrumClient<Client>> {
-        let client = Client::from_config(
-            &self.electrsd.electrum_url,
-            bdk_electrum::electrum_client::Config::default(),
-        )?;
-        Ok(BdkElectrumClient::new(client))
-    }
-
-    /// Create a new [`Testchain`] backed by a fresh electrum client connected to this environment.
-    ///
-    /// Each call returns an independent owned handle (with its own Electrum connection and
-    /// transaction cache), suitable for `Box<dyn ChainApi>` consumers that want one handle per
-    /// simulated peer. For ergonomic single-instance use, `&TestEnv` itself implements
-    /// [`ChainApi`] and [`ChainScanner`].
-    pub fn new_testchain(&self) -> Result<Testchain> {
-        Ok(Testchain::new(self.new_client()?))
+        Ok(self.bitcoin_core_rpc_client()?.send_raw_transaction(tx)?)
     }
 
     pub fn start_explorer_in_container(&mut self) -> Result<()> {
@@ -350,13 +280,6 @@ impl TestEnv {
         let bitcoind_rpc_port = self.bitcoin_rpc_port();
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let browser_port = listener.local_addr()?.port();
-
-        let electrum_port = self
-            .electrsd
-            .electrum_url
-            .split(':')
-            .next_back()
-            .context("Failed to parse electrum port")?;
 
         let container_name = format!("btc-explorer-{browser_port}");
 
@@ -371,8 +294,6 @@ impl TestEnv {
             "-e", &format!("BTCEXP_BITCOIND_PORT={bitcoind_rpc_port}"),
             "-e", "BTCEXP_BITCOIND_USER=bitcoin",
             "-e", &format!("BTCEXP_BITCOIND_PASS={}", self.bitcoin_rpc_pwd),
-            "-e", "BTCEXP_ADDRESS_API=electrum",
-            "-e", &format!("BTCEXP_ELECTRUM_SERVERS=tcp://host.containers.internal:{electrum_port}"),
             "docker.io/getumbrel/btc-rpc-explorer:v3.5.1",
         ]);
 
@@ -416,12 +337,6 @@ impl TestEnv {
         &self.bitcoin_rpc_pwd
     }
 
-    /// Get the electrum client for blockchain operations
-    pub fn electrum_client(&self) -> &impl ElectrumApi {
-        // &self.electrsd.client
-        &self.bdk_electrum_client.inner
-    }
-
     pub const fn bitcoind_client(&self) -> &corepc_node::Client {
         &self.bitcoind.client
     }
@@ -432,36 +347,12 @@ impl TestEnv {
         bitcoincore_rpc::Client::new(url, auth)
     }
 
-    /// Get the electrum URL
-    pub fn electrum_url(&self) -> String {
-        self.electrsd.electrum_url.replace("0.0.0.0", "127.0.0.1")
-    }
-
-    pub const fn bdk_electrum_client(&self) -> &BdkElectrumClient<Client> {
-        &self.bdk_electrum_client
-    }
-
-    /// Get the Esplora REST URL
-    pub fn esplora_url(&self) -> Option<String> {
-        self.electrsd
-            .esplora_url
-            .as_ref()
-            .map(|url| url.replace("0.0.0.0", "127.0.0.1"))
-    }
-
     /// Mine blocks using bitcoind RPC
     pub fn mine_blocks(&mut self, count: usize) -> Result<Vec<BlockHash>> {
         let block_hashes = self
             .bitcoind
             .client
             .generate_to_address(count, &self.new_address()?)?;
-
-        self.wait_for_block()?;
-
-        for txid in &self.mempool {
-            let _ = self.wait_for_tx(*txid);
-        }
-        self.mempool.clear();
 
         // Convert to BlockHash format
         block_hashes
@@ -509,7 +400,6 @@ impl TestEnv {
             .client
             .send_to_address(address, amount)?
             .txid()?;
-        self.mempool.push(txid);
         Ok(txid)
     }
 
@@ -521,51 +411,6 @@ impl TestEnv {
             .get_new_address(None, None)?
             .address()?
             .require_network(NETWORK)?)
-    }
-
-    /// Wait for electrum to see a new block
-    pub fn wait_for_block(&self) -> Result<()> {
-        self.electrsd.client.block_headers_subscribe()?;
-        let start = std::time::Instant::now();
-
-        while start.elapsed() < self.timeout {
-            self.electrsd.trigger()?;
-            self.electrsd.client.ping()?;
-
-            if let Some(_header) = self.electrsd.client.block_headers_pop()? {
-                return Ok(());
-            }
-
-            std::thread::sleep(self.delay);
-        }
-
-        Err(anyhow::anyhow!(
-            "Timeout waiting for electrum to see block after {:?}",
-            self.timeout
-        ))
-    }
-
-    /// Wait for electrum to see a specific transaction
-    pub fn wait_for_tx(&self, txid: Txid) -> Result<()> {
-        let start = std::time::Instant::now();
-        let rpc_api = self.bitcoin_core_rpc_client()?;
-        let direct_client = &self.bitcoind.client;
-        self.trigger_sync()?;
-
-        while start.elapsed() < self.timeout {
-            let api_seen = rpc_api.get_transaction(&txid, Some(false)).is_ok();
-            let direct_seen = direct_client.get_transaction(txid).is_ok();
-            let electrum_seen = self.bdk_electrum_client.fetch_tx(txid).is_ok();
-            if electrum_seen && direct_seen && api_seen {
-                return Ok(());
-            }
-            std::thread::sleep(self.delay);
-        }
-
-        Err(anyhow::anyhow!(
-            "Timeout waiting for electrum to see transaction {txid} after {:?}",
-            self.timeout
-        ))
     }
 
     /// Get the current block count from bitcoind
@@ -586,17 +431,9 @@ impl TestEnv {
         Ok(hash)
     }
 
-    /// Trigger electrs sync
-    pub fn trigger_sync(&self) -> Result<()> {
-        #[cfg(not(target_os = "windows"))]
-        {
-            self.electrsd.trigger()
-        }
-    }
-
-    /// Get the working directory path
+    /// The work directory of bitcoind
     pub fn workdir(&self) -> std::path::PathBuf {
-        self.electrsd.workdir()
+        self.bitcoind.workdir()
     }
 
     /// Get the running bitcoind socket address
@@ -610,116 +447,6 @@ impl TestEnv {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr().unwrap().port();
         Ok((port, listener))
-    }
-}
-
-// Note: `TestEnv` itself cannot implement `ChainApi` because it holds a non-`Send`
-// `MutexGuard` (used to serialize tests by default), but `ChainApi: Send + Sync`. Callers
-// that need an owned `Box<dyn ChainApi>` use [`TestEnv::new_testchain`], which returns a
-// `Testchain` handle with its own electrum client. `ChainScanner`, which has no thread-safety
-// bound, is implemented directly for ergonomic test use (e.g. `wallet.sync_all(&env)`).
-impl ChainScanner for TestEnv {
-    fn populate_tx_cache(&self, txs: impl IntoIterator<Item = impl Into<Arc<Transaction>>>) {
-        self.bdk_electrum_client.populate_tx_cache(txs);
-    }
-
-    fn full_scan<K: Ord + Clone>(
-        &self,
-        request: impl Into<FullScanRequest<K>>,
-        stop_gap: usize,
-        batch_size: usize,
-        fetch_prev_txouts: bool,
-    ) -> std::result::Result<FullScanResponse<K>, FullScanError> {
-        self.bdk_electrum_client
-            .full_scan(request, stop_gap, batch_size, fetch_prev_txouts)
-            .map_err(FullScanError::backend)
-    }
-}
-
-/// Owned Electrum-backed [`ChainApi`] / [`ChainScanner`] handle.
-///
-/// Each instance owns its own [`BdkElectrumClient`] (and therefore its own connection and
-/// transaction cache). Construct via [`TestEnv::new_testchain`] to get a handle connected to
-/// this environment's Electrum endpoint.
-pub struct Testchain {
-    client: BdkElectrumClient<Client>,
-}
-
-impl Testchain {
-    pub const fn new(client: BdkElectrumClient<Client>) -> Self {
-        Self { client }
-    }
-}
-
-impl ChainApi for Testchain {
-    fn transaction_broadcast(&self, tx: &Transaction) -> std::result::Result<Txid, ChainApiError> {
-        broadcast_via(&self.client, tx)
-    }
-}
-
-impl ChainScanner for Testchain {
-    fn populate_tx_cache(&self, txs: impl IntoIterator<Item = impl Into<Arc<Transaction>>>) {
-        self.client.populate_tx_cache(txs);
-    }
-
-    fn full_scan<K: Ord + Clone>(
-        &self,
-        request: impl Into<FullScanRequest<K>>,
-        stop_gap: usize,
-        batch_size: usize,
-        fetch_prev_txouts: bool,
-    ) -> std::result::Result<FullScanResponse<K>, FullScanError> {
-        self.client
-            .full_scan(request, stop_gap, batch_size, fetch_prev_txouts)
-            .map_err(FullScanError::backend)
-    }
-}
-
-/// `ChainDataSource` implementation for the Electrum-backed [`testenv::Testchain`] handle.
-///
-/// `Testchain` lives in the `testenv` crate alongside `TestEnv`; this impl ties it into the
-/// wallet's sync routine. It mirrors the values previously used by the live Electrum-backed
-/// implementation.
-impl ChainDataSource for Testchain {
-    const RECOVERY_HEIGHT: usize = 190_000;
-    const BATCH_SIZE: usize = 16;
-    const STOP_GAP: usize = 10;
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the ChainDataSource trait requires an async method"
-    )]
-    async fn sync(
-        &self,
-        persister: Vec<&mut PersistedWallet<impl BMPWalletPersister>>,
-    ) -> std::result::Result<(), ChainDataSourceError> {
-        for wallet in persister {
-            let tx_nodes = wallet.tx_graph().full_txs().map(|tx_node| tx_node.tx);
-            self.populate_tx_cache(tx_nodes);
-            let request = wallet.start_full_scan();
-
-            let updates = self.full_scan(request, Self::STOP_GAP, Self::BATCH_SIZE, false)?;
-
-            wallet.apply_update(updates)?;
-        }
-        Ok(())
-    }
-}
-
-/// Shared `ChainApi::transaction_broadcast` body — swallows the idempotent
-/// "Transaction outputs already in utxo set" Electrum error (forwarded bitcoin RPC error -27) and
-/// returns the computed txid.
-fn broadcast_via(
-    client: &BdkElectrumClient<Client>,
-    tx: &Transaction,
-) -> std::result::Result<Txid, ChainApiError> {
-    match client.transaction_broadcast(tx) {
-        Ok(txid) => Ok(txid),
-        Err(Error::Protocol(serde_json::Value::String(e))) if e.starts_with(
-            "sendrawtransaction RPC error: {\"code\":-27,") => {
-            Ok(tx.compute_txid())
-        }
-        Err(e) => Err(ChainApiError::backend(e)),
     }
 }
 
@@ -757,7 +484,7 @@ mod tests {
         // Basic checks
         assert!(env.block_count().is_ok());
         assert!(env.genesis_hash().is_ok());
-        assert_ne!(env.electrum_url(), "");
+        assert!(env.p2p_socket_addr().is_some());
 
         Ok(())
     }
@@ -788,7 +515,7 @@ mod tests {
 
     #[test]
     fn test_address_operations() -> Result<()> {
-        use electrsd::corepc_node::vtype::TransactionCategory;
+        use corepc_node::vtype::TransactionCategory;
 
         let mut env = TestEnv::new()?;
 
@@ -815,13 +542,6 @@ mod tests {
 
         // Mine a block to confirm the transaction
         env.mine_block()?;
-
-        // Wait for electrum to sync
-        env.trigger_sync()?;
-
-        // Wait for the transaction to appear in electrum
-        env.wait_for_tx(txid)?;
-        tracing::info!("Transaction confirmed in electrum");
 
         // Verify we can get the transaction from bitcoind
         let tx = env.bitcoind.client.get_transaction(txid)?;
@@ -850,8 +570,6 @@ mod tests {
         let data_root = TempDir::new()?;
         let data_dir = data_root.path().to_path_buf();
         let bitcoind_dir = data_dir.join("bitcoind");
-        let electrsd_dir = data_dir.join("electrsd");
-
         let persisted_height = {
             let mut env = TestEnvBuilder::new(None)
                 .with_data_dir(Some(data_dir.clone()))
@@ -863,24 +581,12 @@ mod tests {
                 "bitcoind data dir should exist: {}",
                 bitcoind_dir.display()
             );
-            assert!(
-                electrsd_dir.is_dir(),
-                "electrs data dir should exist: {}",
-                electrsd_dir.display()
-            );
             // bitcoind writes its regtest data (incl. the cookie) under its sub-directory.
             assert!(
                 bitcoind_dir.join("regtest").is_dir(),
                 "bitcoind should populate its regtest dir: {}",
                 bitcoind_dir.join("regtest").display()
             );
-            // electrs reports the persistent dir we asked for as its workdir.
-            assert_eq!(
-                env.workdir(),
-                electrsd_dir,
-                "electrs workdir should be the persistent dir"
-            );
-
             let initial_height = env.block_count()?;
             env.mine_blocks(MINED)?;
             let height = env.block_count()?;
@@ -888,7 +594,7 @@ mod tests {
             tracing::info!("First run mined up to height {height}");
 
             height
-            // `env` is dropped here, shutting down bitcoind and electrs.
+            // `env` is dropped here, shutting down bitcoind.
         };
 
         // Re-create the environment against the same data dir. bitcoind should reload the
