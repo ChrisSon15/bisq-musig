@@ -54,7 +54,22 @@ pub(super) fn facts(deposit_confirmations: u32, confirmed: &[(&Transaction, u32)
     }
 }
 
+/// Tells the engine of a trader the facts. Returns the events about the state of the trade:
+/// state changes, losses and unexpected events.
 pub(super) fn observe(trader: &mut Trader, facts: &ChainFacts) -> Vec<TradeEvent> {
+    observe_all(trader, facts)
+        .into_iter()
+        .filter(|event| {
+            !matches!(
+                event,
+                TradeEvent::TxConfirmations(_) | TradeEvent::StatusChanged
+            )
+        })
+        .collect()
+}
+
+/// As [`observe`], with all events.
+fn observe_all(trader: &mut Trader, facts: &ChainFacts) -> Vec<TradeEvent> {
     trader
         .model
         .observe_chain(&mut *trader.wallet, facts.clone())
@@ -721,6 +736,282 @@ fn d1_custom_payout_on_chain() {
         );
         assert_eq!(kinds(trader), vec![]);
     }
+}
+
+fn deadline(trader: &Trader, kind: DeadlineKind) -> Option<u32> {
+    trader
+        .model
+        .deadlines()
+        .into_iter()
+        .find(|deadline| deadline.kind == kind)
+        .map(|deadline| deadline.height)
+}
+
+fn deadline_kinds(trader: &Trader) -> Vec<DeadlineKind> {
+    trader
+        .model
+        .deadlines()
+        .into_iter()
+        .map(|deadline| deadline.kind)
+        .collect()
+}
+
+/// The facts when the last block of the chain has the height `tip`, the deposit transaction is
+/// in the block `DEPOSIT_HEIGHT`, and the given transactions are confirmed.
+fn facts_at(tip: u32, confirmed: &[(&Transaction, u32)]) -> ChainFacts {
+    facts(tip + 1 - DEPOSIT_HEIGHT, confirmed)
+}
+
+/// The deadlines that the engine reports are the heights at which its rules change: the test
+/// checks each rule one block before the deadline and at the deadline.
+#[test]
+fn deadlines_are_the_heights_at_which_the_rules_change() {
+    let (mut buyer, mut seller) = trade_with_signed_deposit();
+    assert_eq!(deadline_kinds(&buyer), vec![], "the chain is not known");
+
+    // The deposit timeout.
+    observe_both(&mut buyer, &mut seller, &unconfirmed(0));
+    for trader in [&mut buyer, &mut seller] {
+        assert_eq!(deadline_kinds(trader), vec![DeadlineKind::DepositTimeout]);
+        let timeout = deadline(trader, DeadlineKind::DepositTimeout).unwrap();
+        observe(trader, &unconfirmed(timeout - DEPOSIT_HEIGHT - 1));
+        assert!(!kinds(trader).contains(&TxKind::DepositAbort));
+        observe(trader, &unconfirmed(timeout - DEPOSIT_HEIGHT));
+        assert_eq!(kinds(trader), vec![TxKind::DepositAbort]);
+        assert_eq!(
+            deadline(trader, DeadlineKind::DepositTimeout),
+            Some(timeout)
+        );
+    }
+
+    // The warning lock time and the last release.
+    observe_both(&mut buyer, &mut seller, &facts(3, &[]));
+    assert_eq!(deadline_kinds(&buyer), vec![DeadlineKind::WarningLockTime]);
+    assert_eq!(
+        deadline_kinds(&seller),
+        vec![DeadlineKind::WarningLockTime, DeadlineKind::LastRelease]
+    );
+    let warning_valid = deadline(&buyer, DeadlineKind::WarningLockTime).unwrap();
+    assert_eq!(
+        deadline(&seller, DeadlineKind::WarningLockTime),
+        Some(warning_valid)
+    );
+    assert_eq!(warning_valid, DEPOSIT_HEIGHT + WARNING_LOCK_TIME - 1);
+    let last_release = deadline(&seller, DeadlineKind::LastRelease).unwrap();
+    let signature = {
+        buyer.model.start_payment().expect("payment starts");
+        *buyer
+            .model
+            .my_partial_signatures_on_peer_txs()
+            .unwrap()
+            .swap_tx_input_partial_signature
+            .unwrap()
+    };
+    seller
+        .model
+        .receive_swap_tx_signature(Ok(signature))
+        .expect("valid signature");
+    observe(&mut seller, &facts_at(last_release + 1, &[]));
+    assert!(seller.model.release_payout().is_err(), "after the deadline");
+    assert_eq!(
+        deadline(&seller, DeadlineKind::LastRelease),
+        Some(last_release)
+    );
+    observe(&mut seller, &facts_at(last_release - 1, &[]));
+    seller.model.release_payout().expect("before the deadline");
+
+    // The forced close of the seller's engine.
+    assert_eq!(
+        deadline_kinds(&seller),
+        vec![DeadlineKind::WarningLockTime, DeadlineKind::ForcedClose]
+    );
+    let forced_close = deadline(&seller, DeadlineKind::ForcedClose).unwrap();
+    observe(&mut seller, &facts_at(forced_close - 1, &[]));
+    assert_eq!(kinds(&seller), vec![]);
+    observe(&mut seller, &facts_at(forced_close, &[]));
+    assert_eq!(kinds(&seller), vec![TxKind::Swap]);
+
+    // The warning of the buyer, who did not get the key share, and the claim lock time.
+    observe(&mut buyer, &facts_at(warning_valid - 1, &[]));
+    assert!(buyer.model.start_warning().is_err(), "before the deadline");
+    observe(&mut buyer, &facts_at(warning_valid, &[]));
+    let warning_tx = buyer.model.start_warning().expect("at the deadline");
+    let warning_height = warning_valid + 1;
+    let warned = |tip: u32| facts_at(tip, &[(&warning_tx, tip + 1 - warning_height)]);
+    observe_both(&mut buyer, &mut seller, &warned(warning_height));
+    for trader in [&buyer, &seller] {
+        assert_eq!(deadline_kinds(trader), vec![DeadlineKind::ClaimLockTime]);
+    }
+    let claim_valid = deadline(&buyer, DeadlineKind::ClaimLockTime).unwrap();
+    assert_eq!(
+        deadline(&seller, DeadlineKind::ClaimLockTime),
+        Some(claim_valid)
+    );
+    observe(&mut buyer, &warned(claim_valid - 1));
+    assert_eq!(kinds(&buyer), vec![]);
+    observe(&mut buyer, &warned(claim_valid));
+    assert_eq!(kinds(&buyer), vec![TxKind::Claim]);
+    assert_eq!(
+        deadline(&buyer, DeadlineKind::ClaimLockTime),
+        Some(claim_valid)
+    );
+
+    // A closed trade has no deadline.
+    let redirect_tx = tx_to_send(&seller, TxKind::Redirect);
+    let redirected = facts_at(
+        claim_valid,
+        &[
+            (&warning_tx, claim_valid + 1 - warning_height),
+            (&redirect_tx, 1),
+        ],
+    );
+    observe_both(&mut buyer, &mut seller, &redirected);
+    assert_eq!(deadline_kinds(&buyer), vec![]);
+    assert_eq!(deadline_kinds(&seller), vec![]);
+}
+
+/// The actions that the engine asks of the user: the dispute when the seller's release is no
+/// longer accepted, the warning for a terminated trade, and spending the payout after a
+/// cooperative close.
+#[test]
+fn user_actions_are_reported_when_the_engine_cannot_continue_alone() {
+    let (mut buyer, mut seller) = trade(BUYER_SELLER_ROLES[0]);
+    observe_both(&mut buyer, &mut seller, &facts(3, &[]));
+    for trader in [&buyer, &seller] {
+        assert_eq!(trader.model.user_actions(), vec![]);
+    }
+    let last_release = deadline(&seller, DeadlineKind::LastRelease).unwrap();
+    observe_both(&mut buyer, &mut seller, &facts_at(last_release, &[]));
+    assert_eq!(seller.model.user_actions(), vec![]);
+    let events = observe_all(&mut seller, &facts_at(last_release + 1, &[]));
+    assert_eq!(events, vec![TradeEvent::StatusChanged]);
+    observe(&mut buyer, &facts_at(last_release + 1, &[]));
+    for trader in [&buyer, &seller] {
+        assert_eq!(trader.model.user_actions(), vec![UserAction::StartDispute]);
+    }
+
+    // A terminated trade.
+    buyer.model.terminate("test".to_owned());
+    assert_eq!(buyer.model.user_actions(), vec![UserAction::PublishWarning]);
+    assert_eq!(
+        buyer.model.status().termination_reason.as_deref(),
+        Some("test")
+    );
+
+    // After a cooperative close, until a payout is spent.
+    let (mut buyer, mut seller) = trade(BUYER_SELLER_ROLES[0]);
+    observe_both(&mut buyer, &mut seller, &facts(3, &[]));
+    close_cooperatively(&mut buyer, &mut seller);
+    for trader in [&buyer, &seller] {
+        assert_eq!(
+            trader.model.user_actions(),
+            vec![UserAction::SpendOrDrainPayout]
+        );
+        assert_eq!(deadline_kinds(trader), vec![DeadlineKind::WarningLockTime]);
+    }
+    let buyer_payout = buyer.model.outputs_to_watch().unwrap()[0].0;
+    let payment = Transaction {
+        version: bdk_wallet::bitcoin::transaction::Version::TWO,
+        lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+        input: vec![bdk_wallet::bitcoin::TxIn {
+            previous_output: buyer_payout,
+            ..Default::default()
+        }],
+        output: Vec::new(),
+    };
+    observe_both(&mut buyer, &mut seller, &facts(4, &[(&payment, 1)]));
+    for trader in [&buyer, &seller] {
+        assert_eq!(trader.model.user_actions(), vec![]);
+        assert_eq!(deadline_kinds(trader), vec![]);
+    }
+}
+
+/// The confirmations of the transactions of a trade are reported from the first confirmation
+/// until the transaction counts as confirmed, and again when a reorganisation removes it.
+#[test]
+fn confirmations_of_the_transactions_of_a_trade_are_reported() {
+    let confirmations = |events: Vec<TradeEvent>| {
+        events
+            .into_iter()
+            .filter_map(|event| match event {
+                TradeEvent::TxConfirmations(tx) => Some((tx.kind, tx.confirmations)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let (mut buyer, mut seller) = trade(BUYER_SELLER_ROLES[0]);
+    let deposit_txid = buyer.model.deposit_txid().unwrap();
+    assert_eq!(
+        confirmations(observe_all(&mut buyer, &unconfirmed(0))),
+        vec![]
+    );
+    for depth in 1..=3 {
+        let events = observe_all(&mut buyer, &facts(depth, &[]));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, TradeEvent::TxConfirmations(tx)
+                    if tx.txid == deposit_txid))
+                .count(),
+            1
+        );
+        assert_eq!(confirmations(events), vec![(TxKind::Deposit, depth)]);
+        assert_eq!(
+            buyer.model.confirmed_transactions(),
+            vec![ConfirmedTradeTx {
+                kind: TxKind::Deposit,
+                txid: deposit_txid,
+                confirmations: depth,
+            }]
+        );
+    }
+    assert_eq!(
+        confirmations(observe_all(&mut buyer, &facts(4, &[]))),
+        vec![]
+    );
+    // A reorganisation.
+    assert_eq!(
+        confirmations(observe_all(&mut buyer, &facts(2, &[]))),
+        vec![(TxKind::Deposit, 2)]
+    );
+    assert_eq!(
+        confirmations(observe_all(&mut buyer, &unconfirmed(5))),
+        vec![(TxKind::Deposit, 0)]
+    );
+
+    // The warning and the redirect.
+    observe_both(&mut buyer, &mut seller, &facts(WARNING_LOCK_TIME, &[]));
+    let warning_tx = buyer.model.start_warning().expect("valid");
+    let warned = facts(WARNING_LOCK_TIME + 1, &[(&warning_tx, 1)]);
+    for trader in [&mut buyer, &mut seller] {
+        assert_eq!(
+            confirmations(observe_all(trader, &warned)),
+            vec![(TxKind::Warning, 1)]
+        );
+    }
+    let redirect_tx = tx_to_send(&seller, TxKind::Redirect);
+    let redirected = facts(
+        WARNING_LOCK_TIME + 2,
+        &[(&warning_tx, 2), (&redirect_tx, 1)],
+    );
+    for trader in [&mut buyer, &mut seller] {
+        assert_eq!(
+            confirmations(observe_all(trader, &redirected)),
+            vec![(TxKind::Warning, 2), (TxKind::Redirect, 1)]
+        );
+    }
+    // The trade becomes final, which is a change of the status without a change of the state.
+    let final_facts = facts(
+        WARNING_LOCK_TIME + 4,
+        &[(&warning_tx, 4), (&redirect_tx, 3)],
+    );
+    let events = observe_all(&mut buyer, &final_facts);
+    assert!(events.contains(&TradeEvent::StatusChanged), "{events:?}");
+    assert!(buyer.model.status().is_final);
+    assert_eq!(
+        confirmations(events),
+        vec![(TxKind::Warning, 3), (TxKind::Redirect, 3)]
+    );
 }
 
 /// A buyer and a seller who have signed the same custom payout, with a confirmed deposit.

@@ -48,7 +48,8 @@ use rpc::pb::musigrpc::{
     PubKeySharesResponse, PublishDepositTxRequest, PublishWarningTxRequest,
     PublishWarningTxResponse, ReceiverAddressAndAmount, Role, SubscribeTradeEventsRequest,
     SubscribeTxConfirmationStatusRequest, SwapTxSignatureRequest, SwapTxSignatureResponse,
-    TradeEvent, TradeEventType, TradeStateKind, TradeTxKind, TxConfirmationStatus,
+    TradeDeadline, TradeDeadlineKind, TradeEvent, TradeEventType, TradeStateKind, TradeTxKind,
+    TradeUserAction, TxConfirmationStatus,
 };
 use rpc::server::{MusigImpl, MusigServer, TradeWalletProvider, WalletOperation, restore_trades};
 use tokio::net::TcpListener;
@@ -2103,6 +2104,95 @@ async fn trade_event_of_type(
             return event;
         }
     }
+}
+
+/// The event stream of a trade reports what the caller shows to the user: the confirmations of
+/// the transactions of the trade, the deadlines as block heights, the actions that the user must
+/// take, and the terminated mark with its reason.
+#[tokio::test]
+async fn trade_events_report_confirmations_deadlines_actions_and_the_terminated_mark() {
+    let deadline = |kind: TradeDeadlineKind, block_height: u32| TradeDeadline {
+        kind: kind.into(),
+        block_height,
+    };
+    let mut trade = trade_with_signed_deposit().await;
+    let mut events = trade.seller.subscribe_trade_events().await.unwrap();
+    let first = next_trade_event(&mut events).await;
+    assert_eq!(first.r#type(), TradeEventType::State);
+    let deposit_timeout = u32::from(EngineConfig::default().deposit_timeout());
+    assert_eq!(
+        first.deadlines,
+        vec![deadline(
+            TradeDeadlineKind::DepositTimeout,
+            FakeChain::START_HEIGHT + deposit_timeout + 1
+        )]
+    );
+    assert_eq!(first.required_actions, Vec::<i32>::new());
+    assert_eq!(first.termination_reason, None);
+
+    // The deposit transaction gets into the block after the start height, and two more blocks
+    // follow. Blocks that arrive together can give one event.
+    drop(trade.publish_deposit_tx().await);
+    trade.confirm_deposit().await;
+    let deposit_txid = trade.deposit_tx().compute_txid().to_string();
+    let confirmed = loop {
+        let event = trade_event_of_type(&mut events, TradeEventType::TxConfirmed).await;
+        assert_eq!(event.tx_kind(), TradeTxKind::DepositTx);
+        assert_eq!(event.tx_id.as_deref(), Some(&deposit_txid[..]));
+        if event.num_confirmations == Some(3) {
+            break event;
+        }
+    };
+    let deposit_height = FakeChain::START_HEIGHT + 1;
+    let warning_valid = deposit_height + u32::from(WARNING_LOCK_TIME) - 1;
+    let last_release = warning_valid - 6;
+    assert_eq!(
+        confirmed.deadlines,
+        vec![
+            deadline(TradeDeadlineKind::WarningLockTime, warning_valid),
+            deadline(TradeDeadlineKind::LastRelease, last_release),
+        ]
+    );
+    assert_eq!(confirmed.state(), TradeStateKind::Deposit);
+
+    // The last height for the release passes. The service asks the user to start the dispute.
+    for _ in confirmed.current_block_height..=last_release {
+        trade.mine(&[]);
+    }
+    let event = loop {
+        let event = trade_event_of_type(&mut events, TradeEventType::Status).await;
+        if !event.required_actions.is_empty() {
+            break event;
+        }
+    };
+    assert_eq!(event.current_block_height, last_release + 1);
+    assert_eq!(
+        event.required_actions,
+        vec![i32::from(TradeUserAction::StartDispute)]
+    );
+    assert_eq!(event.termination_reason, None);
+
+    // The buyer's client sends a signature that is not valid. The trade is terminated, and the
+    // way that is left for the seller is his warning transaction.
+    let result = trade.seller.sign_swap_tx(&random_scalar()).await;
+    assert_terminated(result, &trade.seller, "partial signature");
+    let event = trade_event_of_type(&mut events, TradeEventType::Status).await;
+    let reason = event
+        .termination_reason
+        .clone()
+        .expect("the event names the reason");
+    assert!(reason.contains("partial signature"), "{reason}");
+    assert_eq!(
+        event.required_actions,
+        vec![i32::from(TradeUserAction::PublishWarning)]
+    );
+    assert_eq!(event.state(), TradeStateKind::Deposit);
+    // A stream that is opened later starts with the same information.
+    let mut later_events = trade.seller.subscribe_trade_events().await.unwrap();
+    let first = next_trade_event(&mut later_events).await;
+    assert_eq!(first.termination_reason, Some(reason));
+    assert_eq!(first.required_actions, event.required_actions);
+    assert_eq!(first.deadlines, event.deadlines);
 }
 
 /// The last transaction that the chain of a service got to send, when it has got `count`.

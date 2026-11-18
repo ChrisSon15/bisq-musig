@@ -32,8 +32,9 @@ service Musig {
   rpc PublishWarningTx (PublishWarningTxRequest) returns (PublishWarningTxResponse);
 
   // The events of one trade. The first event reports the current state of the trade. Later events report every change
-  // of the state, every transaction that the service sends for the trade, a loss, an event on the chain that the
-  // service does not expect, and the start and the end of a problem with the peers of the Bitcoin network.
+  // of the state, every transaction that the service sends for the trade, the confirmations of the transactions of
+  // the trade, a loss, an event on the chain that the service does not expect, a change of the deadlines or of the
+  // actions that the user must take, and the start and the end of a problem with the peers of the Bitcoin network.
   rpc SubscribeTradeEvents (SubscribeTradeEventsRequest) returns (stream TradeEvent);
 }
 
@@ -224,6 +225,13 @@ enum TradeEventType {
   // and nothing can be sent until the event CHAIN_PROBLEM_OVER.
   CHAIN_PROBLEM = 4;
   CHAIN_PROBLEM_OVER = 5;
+  // The number of confirmations of a transaction of the trade changed. It is reported from the first confirmation
+  // until the transaction counts as confirmed (3 confirmations), and with 0 if a reorganisation removed the
+  // transaction.
+  TX_CONFIRMED = 6;
+  // A deadline, a required action of the user, the terminated mark or the final mark of the trade changed, and the
+  // state did not.
+  STATUS = 7;
 }
 
 enum TradeStateKind {
@@ -262,6 +270,44 @@ enum TradeTxKind {
   PENALTY_TX = 7;
 }
 
+// A point in time of a trade at which a rule of the service changes. The rule changes when the last block of the chain
+// has the height of the deadline.
+enum TradeDeadlineKind {
+  // The deposit transaction is unconfirmed. At this height the service sends the deposit abort transaction.
+  DEPOSIT_TIMEOUT = 0;
+  // From this height on a warning transaction is valid: PublishWarningTx is accepted, and a warning transaction of
+  // either trader can be in the next block.
+  WARNING_LOCK_TIME = 1;
+  // The last height at which the seller's release is accepted.
+  LAST_RELEASE = 2;
+  // The seller has released and the buyer has not answered. At this height the seller's service publishes the swap
+  // transaction on its own.
+  FORCED_CLOSE = 3;
+  // A warning transaction is confirmed and its escrow is unspent. From this height on the claim of the trader who
+  // published the warning is valid, and his service sends it. The redirect or the penalty transaction of the other
+  // trader must be confirmed at this height at the latest.
+  CLAIM_LOCK_TIME = 4;
+}
+
+message TradeDeadline {
+  TradeDeadlineKind kind = 1;
+  uint32 blockHeight = 2;
+}
+
+// Something that the service cannot do on its own, and that the user must do.
+enum TradeUserAction {
+  // The trade is terminated, so no step with the peer is possible any more. The trader must publish his warning
+  // transaction when the warning lock time has passed, unless the peer publishes his own first.
+  PUBLISH_WARNING = 0;
+  // The seller's release is not accepted any more. The traders must agree on a custom payout, or a trader must
+  // publish his warning transaction when the warning lock time has passed.
+  START_DISPUTE = 1;
+  // The trade is closed cooperatively and both payouts are unspent. The peer can still publish his warning
+  // transaction, and the service answers it only while it runs. The user must spend his payout, or end the program in
+  // the regular way, which moves the payout to the seed wallet.
+  SPEND_OR_DRAIN_PAYOUT = 2;
+}
+
 message TradeEvent {
   string tradeId = 1;
   TradeEventType type = 2;
@@ -273,9 +319,18 @@ message TradeEvent {
   optional ClosureKind closureType = 5;
   // Whether nothing can change for the trade any more.
   bool final = 6;
-  // Set in an event of the type TX_SENT.
+  // Set in an event of the type TX_SENT or TX_CONFIRMED.
   optional TradeTxKind txKind = 7;
   optional string txId = 8;
   // A description, in an event of the type LOSS, UNEXPECTED or CHAIN_PROBLEM.
   optional string message = 9;
+  // Set in every event of a trade that was terminated because the peer did not follow the protocol: the reason.
+  optional string terminationReason = 10;
+  // The deadlines of the trade that are in force. Set in every event.
+  repeated TradeDeadline deadlines = 11;
+  // What the user must do at the moment. Set in every event.
+  repeated TradeUserAction requiredActions = 12;
+  // Set in an event of the type TX_CONFIRMED, together with txKind and txId. The kind DEPOSIT_ABORT_TX stands for
+  // every transaction that spent an input of the deposit transaction in its place, whoever sent it.
+  optional uint32 numConfirmations = 13;
 }

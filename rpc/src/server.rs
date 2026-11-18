@@ -14,7 +14,9 @@ use drop_stream::DropStreamExt as _;
 use futures_util::stream::{self, BoxStream, Stream, StreamExt as _, TryStream, TryStreamExt as _};
 use musig2::PartialSignature;
 use musig2::secp::Scalar;
-use protocol::chain_facts::{ChainFacts, TradeEvent as EngineEvent, TxKind, TxToSend};
+use protocol::chain_facts::{
+    ChainFacts, DeadlineKind, TradeEvent as EngineEvent, TxKind, TxToSend, UserAction,
+};
 use protocol::params::{EngineConfig, TradeParams, engine_fee_rate};
 use protocol::state::{ClosureType, TradeState};
 use protocol::storage::ByVal;
@@ -38,8 +40,8 @@ use crate::pb::musigrpc::{
     PartialSignaturesMessage, PartialSignaturesRequest, PubKeySharesRequest, PubKeySharesResponse,
     PublishDepositTxRequest, PublishWarningTxRequest, PublishWarningTxResponse,
     SubscribeTradeEventsRequest, SubscribeTxConfirmationStatusRequest, SwapTxSignatureRequest,
-    SwapTxSignatureResponse, TradeEvent, TradeEventType, TradeStateKind, TradeTxKind,
-    TxConfirmationStatus, musig_server,
+    SwapTxSignatureResponse, TradeDeadline, TradeDeadlineKind, TradeEvent, TradeEventType,
+    TradeStateKind, TradeTxKind, TradeUserAction, TxConfirmationStatus, musig_server,
 };
 
 /// An operation of the trade service that needs the wallet of the trader.
@@ -221,22 +223,31 @@ impl MusigImpl {
                             ))
                         })?;
                 let mut trade_model = trade_model.lock().unwrap();
-                let state_before = trade_model.state();
                 // The engine checks the chain conditions of a request against the facts that it
                 // was told last, so it is told the current facts first.
                 if let Some(chain) = &self.chain {
                     ensure_watched(&**chain, &self.watched, &trade_model, wallet);
                     observe_chain(&**chain, &mut trade_model, wallet, &self.events);
                 }
+                let status_before = trade_model.status();
                 let result = handler(request, &mut trade_model, wallet);
                 if let Some(chain) = &self.chain {
                     // From the moment the trader has signed the deposit transaction, the peer
                     // can publish it.
                     ensure_watched(&**chain, &self.watched, &trade_model, wallet);
                 }
-                if trade_model.state() != state_before {
-                    let event =
-                        trade_event(&trade_model, self.chain.as_deref(), TradeEventType::State);
+                // A request can change the state, and without a change of the state the
+                // deadlines, the required actions and the terminated mark.
+                let status = trade_model.status();
+                let event_type = if status.state != status_before.state {
+                    Some(TradeEventType::State)
+                } else if status != status_before {
+                    Some(TradeEventType::Status)
+                } else {
+                    None
+                };
+                if let Some(event_type) = event_type {
+                    let event = trade_event(&trade_model, self.chain.as_deref(), event_type);
                     let _ = self.events.send(event);
                 }
                 // A request can give the trade a transaction to send.
@@ -829,10 +840,16 @@ fn observe_chain(
         return false;
     };
     for event in trade_model.observe_chain(wallet, facts) {
+        let mut confirmed = None;
         let (event_type, message) = match event {
             EngineEvent::StateChanged { .. } => (TradeEventType::State, None),
             EngineEvent::Loss(loss) => (TradeEventType::Loss, Some(loss)),
             EngineEvent::Unexpected(what) => (TradeEventType::Unexpected, Some(what)),
+            EngineEvent::StatusChanged => (TradeEventType::Status, None),
+            EngineEvent::TxConfirmations(tx) => {
+                confirmed = Some(tx);
+                (TradeEventType::TxConfirmed, None)
+            }
             _ => continue,
         };
         if let Some(message) = &message {
@@ -846,6 +863,9 @@ fn observe_chain(
         // An error means that nobody is subscribed.
         let _ = events.send(TradeEvent {
             message,
+            tx_kind: confirmed.map(|tx| tx_kind(tx.kind).into()),
+            tx_id: confirmed.map(|tx| tx.txid.to_string()),
+            num_confirmations: confirmed.map(|tx| tx.confirmations),
             ..trade_event(trade_model, Some(chain), event_type)
         });
     }
@@ -883,16 +903,40 @@ fn trade_event(
             }),
         ),
     };
+    let status = trade_model.status();
+    let deadlines = status.deadlines.iter().map(|deadline| TradeDeadline {
+        kind: match deadline.kind {
+            DeadlineKind::DepositTimeout => TradeDeadlineKind::DepositTimeout,
+            DeadlineKind::WarningLockTime => TradeDeadlineKind::WarningLockTime,
+            DeadlineKind::LastRelease => TradeDeadlineKind::LastRelease,
+            DeadlineKind::ForcedClose => TradeDeadlineKind::ForcedClose,
+            DeadlineKind::ClaimLockTime => TradeDeadlineKind::ClaimLockTime,
+        }
+        .into(),
+        block_height: deadline.height,
+    });
+    let required_actions = status.user_actions.iter().map(|action| {
+        match action {
+            UserAction::PublishWarning => TradeUserAction::PublishWarning,
+            UserAction::StartDispute => TradeUserAction::StartDispute,
+            UserAction::SpendOrDrainPayout => TradeUserAction::SpendOrDrainPayout,
+        }
+        .into()
+    });
     TradeEvent {
         trade_id: trade_model.trade_id().to_owned(),
         r#type: event_type.into(),
         current_block_height: chain.and_then(ChainAccess::tip_height).unwrap_or(0),
         state: state.into(),
         closure_type: closure_type.map(Into::into),
-        r#final: trade_model.is_final(),
+        r#final: status.is_final,
         tx_kind: None,
         tx_id: None,
         message: None,
+        termination_reason: status.termination_reason,
+        deadlines: deadlines.collect(),
+        required_actions: required_actions.collect(),
+        num_confirmations: None,
     }
 }
 

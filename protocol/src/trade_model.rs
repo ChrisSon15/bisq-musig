@@ -23,7 +23,10 @@ use thiserror::Error;
 use tracing::{error, info, instrument};
 use wallet::protocol_wallet_api::ProtocolWalletApi;
 
-use crate::chain_facts::{ChainFacts, Spend, TradeEvent, TxKind, TxToSend};
+use crate::chain_facts::{
+    ChainFacts, ConfirmedTradeTx, Deadline, DeadlineKind, Spend, TradeEvent, TradeStatus, TxKind,
+    TxToSend, UserAction,
+};
 use crate::multisig::{KeyCtx, KeyPair, PointExt as _, SigCtx};
 use crate::params::{
     EngineConfig, MIN_CONFIRMATIONS, REDIRECT_LOCK_TIME, TradeParams, engine_fee_rate,
@@ -1287,6 +1290,8 @@ impl TradeModel {
     ) -> Vec<TradeEvent> {
         let mut events = Vec::new();
         let before = self.state();
+        let status_before = self.status();
+        let confirmed_before = self.confirmed_transactions();
         self.chain = facts;
         let not_started = TradeState::Init;
         let abandoned = TradeState::TradeClosed(ClosureType::Abandoned);
@@ -1338,7 +1343,232 @@ impl TradeModel {
                  transaction of the trade"
             )));
         }
+        events.extend(self.confirmation_events(&confirmed_before));
+        if after == before && self.status() != status_before {
+            events.push(TradeEvent::StatusChanged);
+        }
         events
+    }
+
+    /// The events for the transactions of the trade whose number of confirmations changed. A
+    /// transaction with [`MIN_CONFIRMATIONS`] or more confirmations counts as confirmed, and
+    /// further confirmations are not reported.
+    fn confirmation_events(&self, confirmed_before: &[ConfirmedTradeTx]) -> Vec<TradeEvent> {
+        let capped = |tx: &ConfirmedTradeTx| ConfirmedTradeTx {
+            confirmations: tx.confirmations.min(MIN_CONFIRMATIONS.into()),
+            ..*tx
+        };
+        let before = confirmed_before.iter().map(capped).collect::<Vec<_>>();
+        let after = self
+            .confirmed_transactions()
+            .iter()
+            .map(capped)
+            .collect::<Vec<_>>();
+        let removed = before
+            .iter()
+            .filter(|tx| after.iter().all(|other| other.txid != tx.txid))
+            .map(|tx| ConfirmedTradeTx {
+                confirmations: 0,
+                ..*tx
+            });
+        let changed = after.iter().filter(|tx| !before.contains(tx)).copied();
+        removed
+            .chain(changed)
+            .map(TradeEvent::TxConfirmations)
+            .collect()
+    }
+
+    /// The confirmed transactions of the trade, with their numbers of confirmations.
+    pub fn confirmed_transactions(&self) -> Vec<ConfirmedTradeTx> {
+        let facts = &self.chain;
+        let mut confirmed = Vec::new();
+        let Ok(situation) = self.situation() else {
+            return confirmed;
+        };
+        let mut add = |kind, txid, confirmations| {
+            confirmed.push(ConfirmedTradeTx {
+                kind,
+                txid,
+                confirmations,
+            });
+        };
+        let deposit_txid = self.deposit_tx.builder.txid().ok().copied();
+        if let Some(deposit_txid) = deposit_txid.filter(|_| facts.deposit_confirmations > 0) {
+            add(TxKind::Deposit, deposit_txid, facts.deposit_confirmations);
+        }
+        match situation {
+            Situation::DepositConflict { .. } => {
+                let conflict = self
+                    .deposit_inputs()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(outpoint, _)| facts.spends.get(&outpoint))
+                    .map(|spend| (spend.tx.compute_txid(), spend.confirmations))
+                    .find(|(txid, _)| Some(*txid) != deposit_txid);
+                if let Some((txid, confirmations)) = conflict {
+                    add(TxKind::DepositAbort, txid, confirmations);
+                }
+            }
+            Situation::Warning {
+                of_buyer,
+                confirmations,
+                escrow,
+            } => {
+                let txs = if of_buyer {
+                    &self.buyer_txs
+                } else {
+                    &self.seller_txs
+                };
+                if let Ok(txid) = txs.warning.builder.txid() {
+                    add(TxKind::Warning, *txid, confirmations);
+                }
+                let kind = match escrow {
+                    EscrowSpend::Unspent => None,
+                    EscrowSpend::Redirect { .. } => Some(TxKind::Redirect),
+                    EscrowSpend::Claim { .. } => Some(TxKind::Claim),
+                    EscrowSpend::Penalty { .. } => Some(TxKind::Penalty),
+                };
+                let spend = txs
+                    .warning
+                    .builder
+                    .escrow()
+                    .ok()
+                    .and_then(|escrow| facts.spends.get(&escrow.outpoint));
+                if let (Some(kind), Some(spend)) = (kind, spend) {
+                    add(kind, spend.tx.compute_txid(), spend.confirmations);
+                }
+            }
+            Situation::CustomPayout { confirmations } => {
+                if let Ok(psbt) = self.custom_payout_tx.builder.psbt() {
+                    let txid = psbt.unsigned_tx.compute_txid();
+                    add(TxKind::CustomPayout, txid, confirmations);
+                }
+            }
+            // After a cooperative close a spend of the seller's payout is a payment of the
+            // seller, not a transaction of the trade.
+            Situation::SellerPayoutSpent { spend }
+                if self.state() == TradeState::TradeClosed(ClosureType::Forced) =>
+            {
+                add(TxKind::Swap, spend.tx.compute_txid(), spend.confirmations);
+            }
+            _ => {}
+        }
+        confirmed
+    }
+
+    /// The parts of the trade that its caller shows to the user.
+    pub fn status(&self) -> TradeStatus {
+        TradeStatus {
+            state: self.state(),
+            is_final: self.is_final(),
+            termination_reason: self.terminated.clone(),
+            deadlines: self.deadlines(),
+            user_actions: self.user_actions(),
+        }
+    }
+
+    /// The states in which the trade is open and the seller has not released.
+    const BEFORE_RELEASE: [TradeState; 2] = [TradeState::Deposit, TradeState::BuyerReadyToRelease];
+
+    /// The deadlines of the trade that are in force, according to the facts about the chain.
+    /// A deadline is a fixed height, so it changes only with a reorganisation.
+    pub fn deadlines(&self) -> Vec<Deadline> {
+        let mut deadlines = Vec::new();
+        let (Ok(situation), Ok(config)) = (self.situation(), self.config()) else {
+            return deadlines;
+        };
+        // A trade that is closed cooperatively still has the warning lock time: the peer can
+        // publish his warning transaction until a payout is spent.
+        let cooperative = TradeState::TradeClosed(ClosureType::Cooperative);
+        if matches!(self.state(), TradeState::TradeClosed(_)) && self.state() != cooperative {
+            return deadlines;
+        }
+        let mut add = |kind, height| deadlines.push(Deadline { kind, height });
+        let confirmations = self.chain.deposit_confirmations;
+        // The height at which a transaction with a relative lock time is valid, if the
+        // transaction that it spends has `confirmations` confirmations now: the height of the
+        // block of that transaction plus the lock time, less one.
+        let tip = self.chain.tip_height;
+        let valid_at = |confirmations: u32, lock_time: u16| {
+            (tip.saturating_add(1).saturating_sub(confirmations))
+                .saturating_add(lock_time.into())
+                .saturating_sub(1)
+        };
+        match situation {
+            Situation::PayoutsUnspent if confirmations == 0 => {
+                if let Some(start) = self
+                    .deposit_watch_start
+                    .filter(|_| self.state == TradeState::Deposit)
+                {
+                    let timeout = u32::from(config.deposit_timeout());
+                    add(DeadlineKind::DepositTimeout, start + timeout + 1);
+                }
+            }
+            Situation::PayoutsUnspent => {
+                let warning_valid = valid_at(confirmations, config.warning_lock_time_blocks());
+                add(DeadlineKind::WarningLockTime, warning_valid);
+                if !self.am_buyer() && Self::BEFORE_RELEASE.contains(&self.state) {
+                    let margin = u32::from(config.release_safety_margin());
+                    add(
+                        DeadlineKind::LastRelease,
+                        warning_valid.saturating_sub(margin),
+                    );
+                }
+                if !self.am_buyer() && self.state == TradeState::SellerReadyToRelease {
+                    let margin = u32::from(config.forced_close_margin());
+                    add(
+                        DeadlineKind::ForcedClose,
+                        warning_valid.saturating_sub(margin),
+                    );
+                }
+            }
+            Situation::Warning {
+                confirmations,
+                escrow: EscrowSpend::Unspent,
+                ..
+            } => {
+                let claim_valid = valid_at(confirmations, config.claim_lock_time_blocks());
+                add(DeadlineKind::ClaimLockTime, claim_valid);
+            }
+            _ => {}
+        }
+        deadlines
+    }
+
+    /// What the user must do at the moment, because the engine cannot do it on its own.
+    pub fn user_actions(&self) -> Vec<UserAction> {
+        let mut actions = Vec::new();
+        let unspent = self
+            .situation()
+            .is_ok_and(|situation| situation == Situation::PayoutsUnspent);
+        if !unspent || self.chain.deposit_confirmations == 0 {
+            return actions;
+        }
+        let can_start_warning = [
+            TradeState::Deposit,
+            TradeState::BuyerReadyToRelease,
+            TradeState::CustomPayoutSigned,
+        ]
+        .contains(&self.state);
+        if self.terminated.is_some() {
+            if can_start_warning {
+                actions.push(UserAction::PublishWarning);
+            }
+        } else if Self::BEFORE_RELEASE.contains(&self.state) {
+            let margin = self
+                .config()
+                .map_or(0, |config| config.release_safety_margin().into());
+            if self
+                .blocks_before_warning_is_valid()
+                .is_ok_and(|remaining| remaining < margin)
+            {
+                actions.push(UserAction::StartDispute);
+            }
+        }
+        if self.state == TradeState::TradeClosed(ClosureType::Cooperative) {
+            actions.push(UserAction::SpendOrDrainPayout);
+        }
+        actions
     }
 
     /// The facts about the chain that the engine was told last.

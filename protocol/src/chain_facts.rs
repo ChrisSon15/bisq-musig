@@ -89,6 +89,86 @@ pub struct TxToSend {
     pub tx: Transaction,
 }
 
+/// A point in time of a trade at which a rule of the engine changes. Time is counted in blocks,
+/// so a deadline is a height of the chain: the rule changes when the last block of the chain has
+/// this height.
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "the deadlines follow from the rules of the protocol, a closed set"
+)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DeadlineKind {
+    /// The deposit transaction is unconfirmed. At this height the engine sends the deposit abort
+    /// transaction.
+    DepositTimeout,
+    /// From this height on a warning transaction is valid: the request to publish the warning
+    /// is accepted, and a warning transaction of either trader can be in the next block.
+    WarningLockTime,
+    /// The last height at which the seller's release is accepted. Later, the time before the
+    /// buyer's warning becomes valid is shorter than the release safety margin.
+    LastRelease,
+    /// The seller has released, and the buyer has not answered. At this height the seller's
+    /// engine publishes the swap transaction on its own.
+    ForcedClose,
+    /// A warning transaction is confirmed and its escrow is unspent. From this height on the
+    /// claim of the trader who published the warning is valid, and his engine sends it. The
+    /// redirect or the penalty transaction of the other trader must be confirmed at this height
+    /// at the latest.
+    ClaimLockTime,
+}
+
+/// A deadline of a trade that is in force at the moment.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Deadline {
+    pub kind: DeadlineKind,
+    pub height: u32,
+}
+
+/// Something that the engine cannot do on its own, and that the user must do so that the trade
+/// ends or his funds are safe.
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "the actions follow from the rules of the protocol, a closed set"
+)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UserAction {
+    /// The trade is terminated, so no step with the peer is possible any more. The trader gets
+    /// his funds through the dispute path only: he must publish his warning transaction when the
+    /// warning lock time has passed, unless the peer publishes his own first.
+    PublishWarning,
+    /// The seller's release is not accepted any more (the deadline `LastRelease` has passed),
+    /// so the trade cannot end with a release. The traders must agree on a custom payout, or a
+    /// trader must publish his warning transaction when the warning lock time has passed.
+    StartDispute,
+    /// The trade is closed cooperatively and both payouts are unspent. The peer can still
+    /// publish his warning transaction, and the engine answers it only while the program runs.
+    /// The user must spend his payout, or end the program in the regular way, which moves the
+    /// payout to the seed wallet.
+    SpendOrDrainPayout,
+}
+
+/// The parts of a trade that its caller shows to the user: every event of a trade reports them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TradeStatus {
+    pub state: TradeState,
+    /// Whether nothing can change for the trade any more.
+    pub is_final: bool,
+    /// The reason, if the trade was terminated because the peer did not follow the protocol.
+    pub termination_reason: Option<String>,
+    pub deadlines: Vec<Deadline>,
+    pub user_actions: Vec<UserAction>,
+}
+
+/// A confirmed transaction of a trade.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ConfirmedTradeTx {
+    /// [`TxKind::DepositAbort`] stands for every transaction that spent an input of the deposit
+    /// transaction in its place, whoever sent it.
+    pub kind: TxKind,
+    pub txid: Txid,
+    pub confirmations: u32,
+}
+
 /// What the engine reports to its caller after it has looked at the chain.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -101,4 +181,12 @@ pub enum TradeEvent {
     /// Something happened on the chain that the engine does not expect from a peer with
     /// unmodified software. The engine changed no state for it.
     Unexpected(String),
+    /// The number of confirmations of a transaction of the trade changed. It is reported from
+    /// the first confirmation until the transaction counts as confirmed, and with 0 when a
+    /// reorganisation removed the transaction.
+    TxConfirmations(ConfirmedTradeTx),
+    /// A deadline, a required action of the user or the final mark of the trade changed, and the
+    /// state did not. [`TradeModel::status`](crate::trade_model::TradeModel::status) has the new
+    /// values.
+    StatusChanged,
 }
