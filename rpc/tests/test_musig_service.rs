@@ -1945,7 +1945,7 @@ async fn g4_repeated_nonce_is_rejected() {
                 let result = party.get_partial_signatures(&repeated_nonce_shares).await;
                 assert_refused(result, Code::Internal, "used for more than one signature");
                 let result = party.get_partial_signatures(&peers_nonce_shares).await;
-                assert_refused(result, Code::Internal, "trade is blocked");
+                assert_refused(result, Code::Internal, "trade was terminated");
                 assert_eq!(party.state(), TradeState::Init);
             }
         }

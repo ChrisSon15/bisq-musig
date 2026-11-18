@@ -1,5 +1,5 @@
+use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use bdk_wallet::bitcoin::address::{NetworkChecked, NetworkUnchecked, NetworkValidation};
@@ -10,7 +10,7 @@ use guardian::ArcMutexGuardian;
 use musig2::secp::{MaybeScalar, Point, Scalar};
 use musig2::{PartialSignature, PubNonce};
 use thiserror::Error;
-use tracing::{info, instrument};
+use tracing::{error, info, instrument};
 use wallet::protocol_wallet_api::ProtocolWalletApi;
 
 use crate::multisig::{KeyCtx, KeyPair, PointExt as _, SigCtx};
@@ -64,10 +64,10 @@ pub struct TradeModel {
     custom_payout_tx: CustomPayoutTx,
     buyer_txs: ArbitrationTxs,
     seller_txs: ArbitrationTxs,
-    /// Set when a request failed a validation. A failed validation terminates the trade: a blocked
-    /// trade accepts no corrected data and never changes its state again. Today only the check
-    /// of the peer's nonce shares sets this mark.
-    blocked: bool,
+    /// Set when the peer sent data that an unmodified client never produces. This terminates the
+    /// trade: it accepts no corrected data and never changes its state again. Today only the
+    /// check of the peer's nonce shares sets this mark.
+    terminated: bool,
 }
 
 #[expect(clippy::exhaustive_enums, reason = "the four trade roles are a closed set")]
@@ -236,16 +236,30 @@ impl TradeModel {
             .ok_or(ProtocolErrorKind::MissingTradeWallet)?).unwrap())
     }
 
-    const fn check_not_blocked(&self) -> Result<()> {
-        if self.blocked {
-            return Err(ProtocolErrorKind::TradeBlocked);
+    const fn check_not_terminated(&self) -> Result<()> {
+        if self.terminated {
+            return Err(ProtocolErrorKind::TradeTerminated);
         }
         Ok(())
     }
 
+    /// Terminates the trade, because the peer sent data that an unmodified client never
+    /// produces. The reason is logged with its details, so that the user can see why the trade
+    /// ended. It must not contain a secret.
+    fn terminate(&mut self, reason: &str) {
+        error!(
+            trade_id = self.trade_id,
+            role = ?self.my_role,
+            state = %self.state,
+            reason,
+            "Terminating the trade: the peer does not follow the protocol."
+        );
+        self.terminated = true;
+    }
+
     #[instrument(skip_all)]
     fn update_state(&mut self, new_state: TradeState) -> Result<bool> {
-        self.check_not_blocked()?;
+        self.check_not_terminated()?;
         if self.state >= new_state {
             return Ok(false);
         }
@@ -571,9 +585,9 @@ impl TradeModel {
     ///
     /// A nonce share belongs to exactly one signature. If a nonce share of the peer is equal to
     /// another nonce share of the peer or to one of our own nonce shares of this trade, none of
-    /// them is stored and the trade is blocked.
+    /// them is stored and the trade is terminated.
     pub fn set_peer_nonce_shares(&mut self, nonce_shares: ExchangedNonces<ByVal>) -> Result<()> {
-        self.check_not_blocked()?;
+        self.check_not_terminated()?;
         // The order is the order of `all_sig_ctxs_mut`.
         let peers_nonce_shares = [
             nonce_shares.swap_tx_input,
@@ -586,8 +600,8 @@ impl TradeModel {
             nonce_shares.buyers_claim_tx_input,
             nonce_shares.sellers_claim_tx_input,
         ];
-        if !self.are_unused_nonce_shares(&peers_nonce_shares)? {
-            self.blocked = true;
+        if let Some(reason) = self.find_repeated_nonce_share(&peers_nonce_shares)? {
+            self.terminate(&reason);
             return Err(ProtocolErrorKind::RepeatedNonceShare);
         }
         for (sig_ctx, nonce_share) in self.all_sig_ctxs_mut().into_iter().zip(peers_nonce_shares) {
@@ -596,16 +610,46 @@ impl TradeModel {
         Ok(())
     }
 
-    /// Returns whether the nonce shares differ from each other and from our own nonce shares.
-    fn are_unused_nonce_shares(&mut self, nonce_shares: &[PubNonce]) -> Result<bool> {
+    /// Looks for a nonce share of the peer that equals one of our own nonce shares or an earlier
+    /// nonce share of the peer. Returns a description of the first one that it finds.
+    fn find_repeated_nonce_share(
+        &mut self,
+        peers_nonce_shares: &[PubNonce],
+    ) -> Result<Option<String>> {
+        // The signatures that need nonce shares, in the order of `all_sig_ctxs_mut`.
+        const SIGNATURES: [&str; 9] = [
+            "swap transaction",
+            "buyer's warning transaction (buyer input)",
+            "buyer's warning transaction (seller input)",
+            "seller's warning transaction (buyer input)",
+            "seller's warning transaction (seller input)",
+            "buyer's redirect transaction",
+            "seller's redirect transaction",
+            "buyer's claim transaction",
+            "seller's claim transaction",
+        ];
         let sig_ctxs = self.all_sig_ctxs_mut();
-        let mut used_nonce_shares = BTreeSet::new();
+        let mut my_nonce_shares = Vec::with_capacity(sig_ctxs.len());
         for sig_ctx in &sig_ctxs {
-            used_nonce_shares.insert(sig_ctx.my_nonce_share()?);
+            my_nonce_shares.push(sig_ctx.my_nonce_share()?);
         }
-        Ok(nonce_shares
-            .iter()
-            .all(|nonce_share| used_nonce_shares.insert(nonce_share)))
+        for (i, nonce_share) in peers_nonce_shares.iter().enumerate() {
+            let other = if let Some(j) = my_nonce_shares.iter().position(|n| *n == nonce_share) {
+                format!("our own nonce share for the {}", SIGNATURES[j])
+            } else if let Some(j) = peers_nonce_shares[..i]
+                .iter()
+                .position(|n| n == nonce_share)
+            {
+                format!("the peer's nonce share for the {}", SIGNATURES[j])
+            } else {
+                continue;
+            };
+            return Ok(Some(format!(
+                "the peer's nonce share for the {} equals {other} (nonce share {nonce_share})",
+                SIGNATURES[i]
+            )));
+        }
+        Ok(None)
     }
 
     pub fn aggregate_nonce_shares(&mut self) -> Result<()> {
@@ -974,8 +1018,8 @@ pub enum ProtocolErrorKind {
     UnsupportedClosureType(ClosureType),
     #[error("nonce share of the peer is used for more than one signature")]
     RepeatedNonceShare,
-    #[error("trade is blocked after a rejected request")]
-    TradeBlocked,
+    #[error("trade was terminated, because the peer did not follow the protocol")]
+    TradeTerminated,
     #[error("illegal state transition for {role:?}: {old_state} -> {new_state}")]
     IllegalStateTransition {
         role: Role,
@@ -1314,8 +1358,8 @@ mod tests {
         (me, peer)
     }
 
-    /// Checks that the nonce shares are rejected and not stored, and that the rejection blocks the
-    /// trade: the valid nonce shares of the peer are refused afterwards.
+    /// Checks that the nonce shares are rejected and not stored, and that the rejection terminates
+    /// the trade: the valid nonce shares of the peer are refused afterwards.
     #[track_caller]
     fn assert_repeated_nonce_share(
         me: &mut TradeModel,
@@ -1343,15 +1387,15 @@ mod tests {
 
         let result = receive_nonce_shares(me, sent_nonce_shares(peer), REDIRECTION_RECEIVERS);
         assert!(
-            matches!(result, Err(ProtocolErrorKind::TradeBlocked)),
+            matches!(result, Err(ProtocolErrorKind::TradeTerminated)),
             "unexpected result: {result:?}"
         );
         assert!(
             matches!(
                 me.update_state(TradeState::Deposit),
-                Err(ProtocolErrorKind::TradeBlocked)
+                Err(ProtocolErrorKind::TradeTerminated)
             ),
-            "a blocked trade does not change its state"
+            "a terminated trade does not change its state"
         );
         assert_eq!(me.state(), TradeState::Init);
     }
@@ -1372,6 +1416,62 @@ mod tests {
                 nonces.swap_tx_input = nonces.sellers_warning_tx_seller_input.clone();
             });
         }
+    }
+
+    /// The reason that is logged when a trade is terminated names both signatures and the nonce.
+    #[test]
+    fn g4_reason_of_termination_is_detailed() {
+        let (mut me, peer) = trade_models_before_nonce_exchange(ROLE_PAIRS[0]);
+        let nonce_shares = |second: PubNonce, last: PubNonce| {
+            let nonces = sent_nonce_shares(&peer).2;
+            [
+                nonces.swap_tx_input,
+                second,
+                nonces.buyers_warning_tx_seller_input,
+                nonces.sellers_warning_tx_buyer_input,
+                nonces.sellers_warning_tx_seller_input,
+                nonces.buyers_redirect_tx_input,
+                nonces.sellers_redirect_tx_input,
+                nonces.buyers_claim_tx_input,
+                last,
+            ]
+        };
+        let peers = sent_nonce_shares(&peer).2;
+        let own = sent_nonce_shares(&me).2.buyers_warning_tx_seller_input;
+        let repeated = peers.sellers_redirect_tx_input;
+
+        // Without a repeated nonce share there is no reason.
+        let valid = nonce_shares(
+            peers.buyers_warning_tx_buyer_input.clone(),
+            peers.sellers_claim_tx_input,
+        );
+        assert_eq!(
+            me.find_repeated_nonce_share(&valid).expect("nonces exist"),
+            None
+        );
+
+        // One of our own nonce shares.
+        let with_own = nonce_shares(own.clone(), repeated.clone());
+        assert_eq!(
+            me.find_repeated_nonce_share(&with_own)
+                .expect("nonces exist"),
+            Some(format!(
+                "the peer's nonce share for the buyer's warning transaction (buyer input) equals \
+                 our own nonce share for the buyer's warning transaction (seller input) (nonce \
+                 share {own})"
+            ))
+        );
+
+        // A nonce share that the peer uses twice.
+        let with_repeated = nonce_shares(peers.buyers_warning_tx_buyer_input, repeated.clone());
+        assert_eq!(
+            me.find_repeated_nonce_share(&with_repeated)
+                .expect("nonces exist"),
+            Some(format!(
+                "the peer's nonce share for the seller's claim transaction equals the peer's \
+                 nonce share for the seller's redirect transaction (nonce share {repeated})"
+            ))
+        );
     }
 
     /// G4: the peer sends one of our own nonces back, for the same signature or for another one.
