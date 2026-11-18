@@ -9,6 +9,7 @@ musig2 = { workspace = true }
 paste = "1.0.15"
 rand = { workspace = true }
 rand_chacha = { workspace = true }
+serde = { version = "1.0.229", features = ["derive"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 wallet = { workspace = true }

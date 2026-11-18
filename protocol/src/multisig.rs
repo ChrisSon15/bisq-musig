@@ -226,6 +226,19 @@ impl SigCtx {
         Ok(())
     }
 
+    /// Restores the public nonce share of a stored trade. The secret nonce is never stored, so
+    /// a restored context cannot sign another message.
+    pub const fn restore_my_nonce_share(&mut self, pub_nonce: PubNonce) {
+        self.my_nonce_pair_share = Some(NoncePair { pub_nonce, sec_nonce: None });
+    }
+
+    /// Restores the partial signature that the trader made for `message` before the trade was
+    /// stored.
+    pub const fn restore_my_partial_sig(&mut self, message: TapSighash, partial_signature: PartialSignature) {
+        self.message = Some(message);
+        self.my_partial_sig = Some(partial_signature);
+    }
+
     pub fn aggregate_nonce_shares(&mut self) -> Result<&AggNonce> {
         let agg_nonce = AggNonce::sum([self.my_nonce_share()?, self.peers_nonce_share()?]);
         Ok(self.aggregated_nonce.insert(agg_nonce))

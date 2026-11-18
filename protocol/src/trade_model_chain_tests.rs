@@ -12,14 +12,14 @@ use super::*;
 
 /// The height of the block that contains the deposit transaction in these tests.
 const DEPOSIT_HEIGHT: u32 = 1_000;
-const WARNING_LOCK_TIME: u32 = 20;
+pub(super) const WARNING_LOCK_TIME: u32 = 20;
 const CLAIM_LOCK_TIME: u32 = 10;
 const RELEASE_SAFETY_MARGIN: u32 = 6;
-const FEE_RATE: FeeRate = FeeRate::from_sat_per_kwu(2_500);
+pub(super) const FEE_RATE: FeeRate = FeeRate::from_sat_per_kwu(2_500);
 
 /// A buyer and a seller who have signed the deposit transaction, for one of the four pairs of
 /// roles.
-fn trade(roles: (Role, Role)) -> (Trader, Trader) {
+pub(super) fn trade(roles: (Role, Role)) -> (Trader, Trader) {
     let (me, peer) = traders_after_deposit_signature(roles);
     if me.model.am_buyer() {
         (me, peer)
@@ -29,11 +29,11 @@ fn trade(roles: (Role, Role)) -> (Trader, Trader) {
 }
 
 /// Both possible pairs of maker and taker, with the buyer first.
-const BUYER_SELLER_ROLES: [(Role, Role); 2] = [ROLE_PAIRS[0], ROLE_PAIRS[1]];
+pub(super) const BUYER_SELLER_ROLES: [(Role, Role); 2] = [ROLE_PAIRS[0], ROLE_PAIRS[1]];
 
 /// The facts when the deposit transaction has `deposit_confirmations` confirmations, and the
 /// given transactions are confirmed with the given number of confirmations.
-fn facts(deposit_confirmations: u32, confirmed: &[(&Transaction, u32)]) -> ChainFacts {
+pub(super) fn facts(deposit_confirmations: u32, confirmed: &[(&Transaction, u32)]) -> ChainFacts {
     let mut spends = BTreeMap::new();
     for (tx, confirmations) in confirmed {
         for input in &tx.input {
@@ -53,18 +53,18 @@ fn facts(deposit_confirmations: u32, confirmed: &[(&Transaction, u32)]) -> Chain
     }
 }
 
-fn observe(trader: &mut Trader, facts: &ChainFacts) -> Vec<TradeEvent> {
+pub(super) fn observe(trader: &mut Trader, facts: &ChainFacts) -> Vec<TradeEvent> {
     trader
         .model
         .observe_chain(&mut *trader.wallet, facts.clone())
 }
 
-fn observe_both(buyer: &mut Trader, seller: &mut Trader, facts: &ChainFacts) {
+pub(super) fn observe_both(buyer: &mut Trader, seller: &mut Trader, facts: &ChainFacts) {
     observe(buyer, facts);
     observe(seller, facts);
 }
 
-fn kinds(trader: &Trader) -> Vec<TxKind> {
+pub(super) fn kinds(trader: &Trader) -> Vec<TxKind> {
     trader
         .model
         .transactions_to_send(FEE_RATE)
@@ -73,7 +73,7 @@ fn kinds(trader: &Trader) -> Vec<TxKind> {
         .collect()
 }
 
-fn tx_to_send(trader: &Trader, kind: TxKind) -> Transaction {
+pub(super) fn tx_to_send(trader: &Trader, kind: TxKind) -> Transaction {
     trader
         .model
         .transactions_to_send(FEE_RATE)
@@ -93,7 +93,7 @@ fn assert_chain_condition<T: std::fmt::Debug>(result: &Result<T>, part_of_reason
 }
 
 /// Messages E and F: the buyer starts the payment, the seller takes the signature and releases.
-fn start_payment_and_release(buyer: &mut Trader, seller: &mut Trader) -> Scalar {
+pub(super) fn start_payment_and_release(buyer: &mut Trader, seller: &mut Trader) -> Scalar {
     buyer.model.start_payment().expect("payment starts");
     let signature = *buyer
         .model
@@ -109,7 +109,7 @@ fn start_payment_and_release(buyer: &mut Trader, seller: &mut Trader) -> Scalar 
 }
 
 /// Messages E, F and G.
-fn close_cooperatively(buyer: &mut Trader, seller: &mut Trader) {
+pub(super) fn close_cooperatively(buyer: &mut Trader, seller: &mut Trader) {
     let sellers_key_share = start_payment_and_release(buyer, seller);
     buyer
         .model
@@ -138,7 +138,7 @@ fn pick<'a>(
     }
 }
 
-fn closed(closure_type: ClosureType) -> TradeState {
+pub(super) fn closed(closure_type: ClosureType) -> TradeState {
     TradeState::TradeClosed(closure_type)
 }
 

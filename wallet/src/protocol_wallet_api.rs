@@ -3,8 +3,8 @@ use std::sync::{Arc, LazyLock};
 use std::time::UNIX_EPOCH;
 
 use bdk_wallet::bitcoin::{
-    Address, Amount, FeeRate, Network, OutPoint, Psbt, ScriptBuf, Transaction, XOnlyPublicKey,
-    absolute, secp256k1,
+    Address, Amount, BlockHash, FeeRate, Network, OutPoint, Psbt, ScriptBuf, Transaction,
+    XOnlyPublicKey, absolute, secp256k1,
 };
 use bdk_wallet::coin_selection::CoinSelectionAlgorithm;
 use bdk_wallet::descriptor::Descriptor;
@@ -90,6 +90,35 @@ pub trait ProtocolWalletApi {
     /// same trade ID always give the same key shares, so a trade ID must be used for one trade
     /// only. The seed does not leave the wallet.
     fn trade_key_shares(&self, trade_id: &str) -> Result<TradeKeyShares>;
+
+    /// Stores the record of a trade durably, in place of an earlier record of the same trade.
+    /// When the call returns without an error, the record is on disk.
+    ///
+    /// The wallet does not look into a record. The trade engine writes and reads it. A record
+    /// can contain the secret key share of the peer, so the wallet stores it encrypted, like its
+    /// own keys. A record is never deleted: the IDs of all trades of a wallet stay known, so that
+    /// no trade ID is used twice.
+    ///
+    /// The default implementation fits a wallet without storage and returns an error.
+    fn store_trade_record(&mut self, trade_id: &str, record: &[u8]) -> Result<()> {
+        let _ = (trade_id, record);
+        Err(WalletErrorKind::Unsupported(
+            "this wallet cannot store trade records",
+        ))
+    }
+
+    /// All trade records of the wallet, with the IDs of their trades.
+    fn trade_records(&mut self) -> Result<Vec<(String, Vec<u8>)>> {
+        Ok(Vec::new())
+    }
+
+    /// The highest block at or below `height` that the wallet knows, with its height. A chain
+    /// client can follow the chain from this block, to evaluate the blocks above it again.
+    /// `None` if the wallet knows no such block.
+    fn known_block_at_or_below(&self, height: u32) -> Option<(u32, BlockHash)> {
+        let _ = height;
+        None
+    }
 
     /// Lock one UTXO and exclude it from coin selection.
     fn lock_utxo(&mut self, utxo: OutPoint) -> Result<()>;

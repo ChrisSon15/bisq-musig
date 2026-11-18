@@ -384,6 +384,18 @@ impl TradeModel {
         my_role: Role,
         wallet: &mut dyn ProtocolWalletApi,
     ) -> Result<Self> {
+        let script_key = wallet.new_internal_key()?;
+        Self::with_script_key(trade_id, my_role, wallet, script_key)
+    }
+
+    /// Creates the trade with a script key that the wallet issued before. The key shares are
+    /// derived again from the seed of the wallet.
+    fn with_script_key(
+        trade_id: String,
+        my_role: Role,
+        wallet: &dyn ProtocolWalletApi,
+        script_key: XOnlyPublicKey,
+    ) -> Result<Self> {
         let am_buyer = matches!(my_role, Role::BuyerAsMaker | Role::BuyerAsTaker);
         let mut keys = Keys {
             am_buyer,
@@ -396,7 +408,7 @@ impl TradeModel {
             .set_my_key_share(key_shares.buyer_payout);
         keys.seller_payout_ctx
             .set_my_key_share(key_shares.seller_payout);
-        keys.my_multisig_script_key = Some(wallet.new_internal_key()?);
+        keys.my_multisig_script_key = Some(script_key);
 
         let mut trade_model = Self {
             trade_id,
@@ -2285,6 +2297,18 @@ impl TradeModel {
         })
     }
 
+    const fn all_sig_ctxs(&self) -> [&SigCtx; 7] {
+        [
+            &self.swap_tx.input_sig_ctx,
+            &self.buyer_txs.warning.buyer_input_sig_ctx,
+            &self.buyer_txs.warning.seller_input_sig_ctx,
+            &self.seller_txs.warning.buyer_input_sig_ctx,
+            &self.seller_txs.warning.seller_input_sig_ctx,
+            &self.buyer_txs.redirect.input_sig_ctx,
+            &self.seller_txs.redirect.input_sig_ctx,
+        ]
+    }
+
     const fn all_sig_ctxs_mut(&mut self) -> [&mut SigCtx; 7] {
         [
             &mut self.swap_tx.input_sig_ctx,
@@ -2729,6 +2753,8 @@ pub enum ProtocolErrorKind {
     OutOfOrder(&'static str),
     #[error("the state of the chain does not allow the request yet: {0}")]
     ChainCondition(String),
+    #[error("the stored record of a trade cannot be used: {0}")]
+    TradeRecord(String),
     #[error("request differs from an earlier request for this trade: {0}")]
     ConflictingRequest(&'static str),
     #[error("trade was terminated, because the peer did not follow the protocol: {0}")]
@@ -2802,7 +2828,7 @@ mod tests {
     use crate::mocks::{mock_buyer_trade_wallet, mock_seller_trade_wallet};
 
     //noinspection SpellCheckingInspection
-    const REDIRECTION_RECEIVERS: [(&str, u64); 3] = [
+    pub(super) const REDIRECTION_RECEIVERS: [(&str, u64); 3] = [
         (
             "bcrt1phc8m8vansnl4utths947mjquprw20puwrrdfrwx8akeeu2tqwklsnxsvf0",
             160_000,
@@ -2869,7 +2895,7 @@ mod tests {
     /// A trader for the trade `trade_id`. The key shares are derived from the seed of the mock
     /// wallet and the trade ID, so two traders with the same role and trade ID have the same key
     /// shares.
-    fn new_trader_for_trade(role: Role, trade_id: &str) -> Trader {
+    pub(super) fn new_trader_for_trade(role: Role, trade_id: &str) -> Trader {
         let mut wallet: Box<dyn ProtocolWalletApi> =
             if matches!(role, Role::BuyerAsMaker | Role::BuyerAsTaker) {
                 Box::new(mock_buyer_trade_wallet())
@@ -2987,7 +3013,7 @@ mod tests {
 
     /// The two traders after the exchange of key shares and nonce shares. Both hold their partial
     /// signatures, but did not yet process the partial signatures of the peer.
-    fn traders_before_deposit_signature(
+    pub(super) fn traders_before_deposit_signature(
         roles: (Role, Role),
         peers_redirection_receivers: [(&str, u64); 3],
         prepare_peer: impl FnOnce(&mut TradeModel),
@@ -3637,6 +3663,13 @@ mod tests {
     }
 }
 
+#[path = "trade_record.rs"]
+mod record;
+
 #[cfg(test)]
 #[path = "trade_model_chain_tests.rs"]
 mod chain_tests;
+
+#[cfg(test)]
+#[path = "trade_record_tests.rs"]
+mod record_tests;

@@ -29,6 +29,7 @@ struct MockTradeWallet<Cs: Iterator<Item = TxOutput>, As: Iterator<Item = Addres
     /// The seed for the key shares of trades. Each mock wallet has its own seed.
     seed: [u8; 32],
     locked_utxos: BTreeSet<OutPoint>,
+    trade_records: BTreeMap<String, Vec<u8>>,
 }
 
 impl<Cs: Iterator<Item = TxOutput>, As: Iterator<Item = Address>> ProtocolWalletApi
@@ -180,6 +181,15 @@ impl<Cs: Iterator<Item = TxOutput>, As: Iterator<Item = Address>> ProtocolWallet
         derive_trade_key_shares(&master_key, trade_id)
     }
 
+    fn store_trade_record(&mut self, trade_id: &str, record: &[u8]) -> wallet::error::Result<()> {
+        self.trade_records.insert(trade_id.to_owned(), record.to_vec());
+        Ok(())
+    }
+
+    fn trade_records(&mut self) -> wallet::error::Result<Vec<(String, Vec<u8>)>> {
+        Ok(self.trade_records.clone().into_iter().collect())
+    }
+
     fn lock_utxo(&mut self, utxo: OutPoint) -> wallet::error::Result<()> {
         self.locked_utxos.insert(utxo);
         Ok(())
@@ -232,6 +242,7 @@ pub fn mock_buyer_trade_wallet() -> impl ProtocolWalletApi {
         script_sigs,
         seed: [1; 32],
         locked_utxos: BTreeSet::new(),
+        trade_records: BTreeMap::new(),
     }
 }
 
@@ -272,6 +283,7 @@ pub fn mock_seller_trade_wallet() -> impl ProtocolWalletApi {
         script_sigs,
         seed: [2; 32],
         locked_utxos: BTreeSet::new(),
+        trade_records: BTreeMap::new(),
     }
 }
 

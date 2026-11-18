@@ -6,7 +6,7 @@ use std::vec;
 use bdk_wallet::bitcoin::bip32::Xpriv;
 use bdk_wallet::bitcoin::hex::DisplayHex as _;
 use bdk_wallet::bitcoin::{
-    Address, Amount, FeeRate, Network, OutPoint, PrivateKey, Psbt, ScriptBuf, Sequence,
+    Address, Amount, BlockHash, FeeRate, Network, OutPoint, PrivateKey, Psbt, ScriptBuf, Sequence,
     TapNodeHash, Transaction, Weight, XOnlyPublicKey, consensus, psbt,
 };
 use bdk_wallet::chain::{
@@ -1001,6 +1001,24 @@ impl ProtocolWalletApi for BMPWallet {
         let seed = Zeroizing::new(mnemonic.to_seed(""));
         let master_key = Xpriv::new_master(self.network(), &seed[..])?;
         derive_trade_key_shares(&master_key, trade_id)
+    }
+
+    fn store_trade_record(&mut self, trade_id: &str, record: &[u8]) -> Result<()> {
+        // The database commits every statement to disk before it returns.
+        Ok(crate::persisted::store_trade_record(
+            &self.db, trade_id, record,
+        )?)
+    }
+
+    fn trade_records(&mut self) -> Result<Vec<(String, Vec<u8>)>> {
+        Ok(crate::persisted::load_trade_records(&self.db)?)
+    }
+
+    fn known_block_at_or_below(&self, height: u32) -> Option<(u32, BlockHash)> {
+        self.wallet
+            .checkpoints()
+            .find(|checkpoint| checkpoint.height() <= height)
+            .map(|checkpoint| (checkpoint.height(), checkpoint.hash()))
     }
 
     fn list_locked_utxos(&self) -> Vec<OutPoint> {

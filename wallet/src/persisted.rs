@@ -512,3 +512,46 @@ fn create_trade_keys_table(db: &Connection, table_name: &str) -> rusqlite::Resul
         ) STRICT"
     ))
 }
+
+/// The table of the trade records. The trade engine stores one record per trade in the
+/// database of the wallet, which is encrypted. The table is created on first use, so that a
+/// wallet database that was created before the table existed can be used without a migration
+/// step.
+const TRADE_RECORDS_TABLE_NAME: &str = "bmp_trade_records";
+
+fn create_trade_records_table(db: &Connection) -> rusqlite::Result<()> {
+    db.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS {TRADE_RECORDS_TABLE_NAME} ( \
+            trade_id TEXT PRIMARY KEY NOT NULL, \
+            record BLOB NOT NULL
+        ) STRICT"
+    ))
+}
+
+/// Stores the record of a trade, in place of an earlier record of the same trade.
+pub(crate) fn store_trade_record(
+    db: &Connection,
+    trade_id: &str,
+    record: &[u8],
+) -> rusqlite::Result<()> {
+    create_trade_records_table(db)?;
+    db.execute(
+        &format!(
+            "INSERT INTO {TRADE_RECORDS_TABLE_NAME} (trade_id, record) VALUES (:trade_id, :record) \
+             ON CONFLICT (trade_id) DO UPDATE SET record = excluded.record"
+        ),
+        named_params! { ":trade_id": trade_id, ":record": record },
+    )?;
+    Ok(())
+}
+
+/// All trade records, in the order of their trade IDs.
+pub(crate) fn load_trade_records(db: &Connection) -> rusqlite::Result<Vec<(String, Vec<u8>)>> {
+    create_trade_records_table(db)?;
+    let mut statement = db.prepare(&format!(
+        "SELECT trade_id, record FROM {TRADE_RECORDS_TABLE_NAME} ORDER BY trade_id"
+    ))?;
+    statement
+        .query_map([], |row| Ok((row.get("trade_id")?, row.get("record")?)))?
+        .collect()
+}

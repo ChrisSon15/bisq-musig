@@ -1030,3 +1030,40 @@ async fn j5_sync_reports_an_unreachable_peer_and_works_again_later() -> anyhow::
     client.shutdown()?;
     Ok(())
 }
+
+/// The trade engine stores the records of its trades in the database of the wallet. A record
+/// replaces an earlier record of the same trade, records are never deleted, and they are there
+/// again when the wallet is loaded. A wallet that is loaded with a wrong password gives no
+/// records, because it does not load at all.
+#[test]
+fn trade_records_are_stored_in_the_wallet_database() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let mut wallet = BMPWallet::new(dir.path().into(), &test_password(), Network::Regtest)?;
+    assert_eq!(wallet.trade_records()?, vec![]);
+    wallet.store_trade_record("trade-b", b"first")?;
+    wallet.store_trade_record("trade-a", b"other trade")?;
+    wallet.store_trade_record("trade-b", b"second")?;
+    let expected = vec![
+        ("trade-a".to_owned(), b"other trade".to_vec()),
+        ("trade-b".to_owned(), b"second".to_vec()),
+    ];
+    assert_eq!(wallet.trade_records()?, expected);
+    // A new wallet knows the first block of the chain only.
+    assert_eq!(
+        wallet.known_block_at_or_below(100).map(|block| block.0),
+        Some(0)
+    );
+    drop(wallet);
+
+    let mut wallet = BMPWallet::load_wallet(dir.path().into(), Network::Regtest, &test_password())?;
+    assert_eq!(wallet.trade_records()?, expected);
+    drop(wallet);
+
+    // The records are in the encrypted database: the file does not contain their text.
+    let database = fs::read(dir.path().join(BMPWallet::DB_NAME))?;
+    let contains = |needle: &[u8]| database.windows(needle.len()).any(|part| part == needle);
+    assert!(!contains(b"other trade") && !contains(b"trade-a"));
+    let wrong_password: Password = "Wr0ng-Password!".parse().expect("valid password");
+    assert!(BMPWallet::load_wallet(dir.path().into(), Network::Regtest, &wrong_password).is_err());
+    Ok(())
+}

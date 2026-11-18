@@ -278,6 +278,16 @@ impl DepositTxBuilder {
 
     pub fn txid(&self) -> Result<&Txid> { Ok(&self.buyer_payout()?.outpoint.txid) }
 
+    /// Puts the stored PSBT of the deposit transaction, with its signatures, in place of the
+    /// computed one. It must be a PSBT of the same transaction.
+    pub fn restore_psbt(&mut self, stored: Psbt) -> Result<&mut Self> {
+        if stored.unsigned_tx != self.psbt()?.unsigned_tx {
+            return Err(TransactionErrorKind::InvalidPsbt);
+        }
+        self.psbt = Some(stored);
+        Ok(self)
+    }
+
     pub fn sign_buyer_inputs(
         &mut self,
         wallet: &mut (impl ProtocolWalletApi + ?Sized),
@@ -666,6 +676,16 @@ impl CustomPayoutTxBuilder {
         psbt.inputs[0].update_with_descriptor_unchecked(self.buyer_input_descriptor()?)?;
         psbt.inputs[1].update_with_descriptor_unchecked(self.seller_input_descriptor()?)?;
         self.psbt = Some(psbt);
+        Ok(self)
+    }
+
+    /// Puts the stored PSBT of the custom payout transaction, with its signatures, in place of
+    /// the computed one. It must be a PSBT of the same transaction.
+    pub fn restore_psbt(&mut self, stored: Psbt) -> Result<&mut Self> {
+        if stored.unsigned_tx != self.psbt()?.unsigned_tx {
+            return Err(TransactionErrorKind::InvalidPsbt);
+        }
+        self.psbt = Some(stored);
         Ok(self)
     }
 
