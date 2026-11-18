@@ -1136,7 +1136,7 @@ implementation exists as a first step (D2).
 ## 12. Questions and answers, to be reviewed later
 
 These were the open questions of revision 2. The project owner answered them on 2026-11-17. Rows 8
-and 9 were added on 2026-11-18. The questions stay here so that the answers can be reviewed later. The column "Review later" names
+to 10 were added on 2026-11-18. The questions stay here so that the answers can be reviewed later. The column "Review later" names
 what should be checked at that review.
 
 | # | Question | Answer (2026-11-17) | Where it is in the plan | Review later |
@@ -1150,6 +1150,7 @@ what should be checked at that review.
 | 7 | Does `musigd` keep running when bisq2 is closed? | No. | D7 and the paragraph after the table in section 7.1; N5; WP8 | Nothing is watched while bisq2 is closed. For closed trades the drain at `close` is the only protection in that time. For open trades the user must start the program before the claim lock time ends after a peer warning. Is this acceptable for mainnet, or is a watching process needed later? |
 | 8 | Which actions does a terminated trade (D17) keep after the deposit is signed? Its funds are then locked in the deposit outputs. | Postponed on 2026-11-18. To be decided later. | D17; open point O1 of `docs/specifications/trade/README.md`; `trade-states.md`, section "Terminated trades" | The decision itself. Until then the specification states: the cooperative steps end, and the engine keeps every action that the trader can perform alone (warning, redirect, penalty, claim, swap transaction, reading the key from a spend, deposit abort). Without such a rule a terminated trade would lose its funds. |
 | 9 | How does a wallet that is restored from its seed words find funds on keys of trades that lie behind a long row of unused keys, and how is a trade restored after a crash in the middle of it? | Postponed on 2026-11-18. Restoring, in particular after crashes in the middle of a trade, is made after the work packages are finished. | Point W1 of `docs/specifications/wallet/README.md`; `trade-keys.md`; tests H11, H12; F12 | The scan range of a restored wallet (trade keys are issued in rows without funds), and the restore of trades from the seed and the trade store. |
+| 10 | Does the trade store keep a list of the transactions that the engine sent, with their status? The first text of the specification said so. | Not for now (2026-11-18). The store keeps no such list. To be looked at again later. | WP5; `persistence-and-recovery.md`, section "The trade store"; the note in WP4 that the deposit abort is not stored | Whether a list is needed. Today the engine derives what it must send from the stored state and from the chain, and every transaction can be built again. A list becomes necessary with a transaction whose content cannot be derived again, for example a replacement with a raised fee (WP6). |
 
 Points of section 7.2 that were not part of the questions and still need a decision in WP0: N2
 (broadcast without result), N4 (peers and the visible IP address), N7 (wording of the security

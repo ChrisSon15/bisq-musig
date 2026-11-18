@@ -44,6 +44,11 @@ transaction, is a change of the stored state.
 The deposit abort transaction is not stored either. Its inputs, its output and its fee follow
 from the stored data of the trade, so the engine builds the same transaction again.
 
+That the store keeps no list of sent transactions is a decision of the project owner of
+2026-11-18 for now. It is looked at again later (`concept/CompletionPlan.md`, section 12,
+row 10): a list becomes necessary with a transaction whose content cannot be derived again, for
+example a replacement with a raised fee ([fees.md](fees.md)).
+
 Stored once for the wallet:
 
 - the drain transaction, while it is unconfirmed
