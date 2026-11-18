@@ -7,7 +7,7 @@ use bdk_wallet::bitcoin::taproot::Signature;
 use bdk_wallet::bitcoin::transaction::Version;
 use bdk_wallet::bitcoin::{
     Address, Amount, FeeRate, Network, OutPoint, Psbt, ScriptBuf, Sequence, TapSighashType,
-    Transaction, TxIn, TxOut, VarInt, Weight, Witness, XOnlyPublicKey, absolute, psbt,
+    Transaction, TxIn, TxOut, Txid, VarInt, Weight, Witness, XOnlyPublicKey, absolute, psbt,
 };
 use bdk_wallet::miniscript::descriptor::TapTree;
 use musig2::secp::Scalar;
@@ -178,6 +178,10 @@ impl<Cs: Iterator<Item = TxOutput>, As: Iterator<Item = Address>> ProtocolWallet
     }
 
     fn record_transaction(&mut self, _tx: &Transaction) -> Result<(), WalletErrorKind> {
+        Ok(())
+    }
+
+    fn forget_transaction(&mut self, _txid: Txid) -> Result<(), WalletErrorKind> {
         Ok(())
     }
 

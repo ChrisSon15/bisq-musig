@@ -1580,6 +1580,54 @@ fn outcome_deposit_aborted_by_a_conflicting_spend() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A13: as before, but the buyer holds the deposit transaction with all signatures, and his
+/// wallet has recorded it as the spend of his coin. The transaction that makes the deposit
+/// impossible spends a coin of the seller, which the buyer's wallet does not see. The wallet
+/// forgets the deposit transaction, and the buyer can use his coin again.
+#[test]
+fn a13_wallet_of_the_publisher_forgets_a_deposit_that_cannot_confirm() -> anyhow::Result<()> {
+    let mut env = TestEnv::new()?;
+    let (mut buyer, mut seller) = traders_with_signed_deposit(&mut env);
+    let sellers_deposit_psbt = seller.model.deposit_psbt()?.clone();
+    buyer
+        .model
+        .receive_deposit_psbt(&mut buyer.wallet, Ok(sellers_deposit_psbt))?;
+    buyer.observe(&env);
+    let buyers_coin = buyer.model.reserved_coins()[0];
+    let holds_coin = |wallet: &BMPWallet| {
+        wallet
+            .list_utxos()
+            .iter()
+            .any(|utxo| OutPoint::new(utxo.tx_id, utxo.vout) == buyers_coin)
+    };
+    assert!(
+        !holds_coin(&buyer.wallet),
+        "the deposit transaction spends it"
+    );
+
+    let sellers_coin = seller.model.reserved_coins()[0];
+    seller.wallet.unlock_utxo(sellers_coin)?;
+    let payment =
+        seller
+            .wallet
+            .send_to_address(&env.new_address()?, Amount::from_sat(100_000), FEE_RATE)?;
+    send_to_node(&env, &payment).map_err(anyhow::Error::msg)?;
+    env.mine_block()?;
+
+    buyer.observe(&env);
+    assert_eq!(buyer.model.state(), closed(ClosureType::DepositAborted));
+    assert!(holds_coin(&buyer.wallet));
+    buyer.chain.sync(&env, &mut buyer.wallet);
+    assert_eq!(buyer.wallet.balance(), FUNDING);
+    let buyers_payment =
+        buyer
+            .wallet
+            .send_to_address(&env.new_address()?, Amount::from_sat(100_000), FEE_RATE)?;
+    assert_eq!(buyers_payment.input[0].previous_output, buyers_coin);
+    send_to_node(&env, &buyers_payment).map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
 /// A buyer (taker) and a seller (maker) who have both signed the deposit transaction and watch
 /// its outputs. Nobody has published it.
 fn traders_with_signed_deposit(env: &mut TestEnv) -> (Trader, Trader) {

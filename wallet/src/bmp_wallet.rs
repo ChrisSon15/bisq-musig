@@ -7,7 +7,7 @@ use bdk_wallet::bitcoin::bip32::Xpriv;
 use bdk_wallet::bitcoin::hex::DisplayHex as _;
 use bdk_wallet::bitcoin::{
     Address, Amount, BlockHash, FeeRate, Network, OutPoint, PrivateKey, Psbt, ScriptBuf, Sequence,
-    TapNodeHash, Transaction, Weight, XOnlyPublicKey, consensus, psbt,
+    TapNodeHash, Transaction, Txid, Weight, XOnlyPublicKey, consensus, psbt,
 };
 use bdk_wallet::chain::{
     BlockId, CanonicalizationParams, ChainPosition, CheckPoint, FullTxOut, Merge as _,
@@ -994,6 +994,20 @@ impl ProtocolWalletApi for BMPWallet {
 
     fn record_transaction(&mut self, tx: &Transaction) -> Result<()> {
         self.record_unconfirmed_transaction(tx)
+    }
+
+    fn forget_transaction(&mut self, txid: Txid) -> Result<()> {
+        let evicted_at = seconds_since_epoch()?;
+        let wallets = std::iter::once(&mut self.wallet).chain(
+            self.imported_wallets
+                .iter_mut()
+                .map(|imported| &mut imported.wallet),
+        );
+        for wallet in wallets {
+            wallet.apply_evicted_txs([(txid, evicted_at)]);
+        }
+        <Self as WalletApi>::persist(self)?;
+        Ok(())
     }
 
     fn trade_key_shares(&self, trade_id: &str) -> Result<TradeKeyShares> {

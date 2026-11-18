@@ -3,7 +3,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::UNIX_EPOCH;
 
 use bdk_wallet::bitcoin::{
-    Address, Amount, BlockHash, FeeRate, Network, OutPoint, Psbt, ScriptBuf, Transaction,
+    Address, Amount, BlockHash, FeeRate, Network, OutPoint, Psbt, ScriptBuf, Transaction, Txid,
     XOnlyPublicKey, absolute, secp256k1,
 };
 use bdk_wallet::coin_selection::CoinSelectionAlgorithm;
@@ -84,6 +84,16 @@ pub trait ProtocolWalletApi {
     /// outputs to the wallet count as incoming. The caller is responsible for sending the
     /// transaction to the network.
     fn record_transaction(&mut self, tx: &Transaction) -> Result<()>;
+
+    /// Removes an unconfirmed transaction that [`Self::record_transaction`] recorded and that
+    /// can never confirm. The coins of the wallet that it spends count as unspent again, and its
+    /// outputs no longer count as incoming. A transaction that is unknown or confirmed is left
+    /// as it is.
+    ///
+    /// The wallet notices on its own when another transaction spends one of its coins. It
+    /// cannot notice a transaction that spends a coin of somebody else, for example an input of
+    /// the peer in the deposit transaction. The caller tells the wallet with this method.
+    fn forget_transaction(&mut self, txid: Txid) -> Result<()>;
 
     /// Returns the two secret key shares of the trade `trade_id`, derived from the seed of the
     /// wallet as specified in `docs/specifications/trade/key-derivation.md`. The same seed and the
@@ -214,6 +224,11 @@ impl ProtocolWalletApi for Wallet {
 
     fn record_transaction(&mut self, tx: &Transaction) -> Result<()> {
         self.apply_unconfirmed_txs([(Arc::new(tx.clone()), seconds_since_epoch()?)]);
+        Ok(())
+    }
+
+    fn forget_transaction(&mut self, txid: Txid) -> Result<()> {
+        self.apply_evicted_txs([(txid, seconds_since_epoch()?)]);
         Ok(())
     }
 

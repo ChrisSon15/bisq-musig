@@ -1759,6 +1759,11 @@ impl TradeModel {
     }
 
     /// Releases the coins that are reserved for the deposit, when the deposit can never confirm.
+    ///
+    /// The wallet of the trader who published the deposit transaction has recorded it as the
+    /// spend of his coins. The transaction that made the deposit impossible can spend a coin of
+    /// the peer, which the wallet does not see, so the engine tells the wallet to forget the
+    /// deposit transaction.
     fn release_reserved_coins(
         &mut self,
         wallet: &mut dyn ProtocolWalletApi,
@@ -1770,6 +1775,18 @@ impl TradeModel {
                     "the reserved coin {outpoint} could not be released: {error}"
                 )));
             }
+        }
+        let forgotten = self
+            .deposit_tx
+            .builder
+            .txid()
+            .map_err(ProtocolErrorKind::from)
+            .and_then(|txid| Ok(wallet.forget_transaction(*txid)?));
+        if let Err(error) = forgotten {
+            events.push(TradeEvent::Unexpected(format!(
+                "the wallet could not forget the deposit transaction, which can never confirm: \
+                 {error}"
+            )));
         }
     }
 
