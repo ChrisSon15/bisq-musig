@@ -934,3 +934,429 @@ pub enum ProtocolErrorKind {
     Multisig(#[from] protocol::multisig::MultisigErrorKind),
     Wallet(#[from] wallet::error::WalletErrorKind),
 }
+
+/// Unit tests of the trade engine without the gRPC service. Two trade models, one per trader,
+/// exchange their data directly. The test IDs (G1, G4, ...) refer to section 9.4 of
+/// `concept/CompletionPlan.md`, the F numbers to its findings.
+///
+/// The claim nonces and the claim signatures are passed on like all other fields, but no test
+/// changes or checks them, because decision D3 of the plan removes them.
+#[cfg(test)]
+mod tests {
+    use bdk_wallet::bitcoin::relative;
+    use protocol::multisig::MultisigErrorKind;
+
+    use super::*;
+
+    //noinspection SpellCheckingInspection
+    const REDIRECTION_RECEIVERS: [(&str, u64); 3] = [
+        (
+            "bcrt1phc8m8vansnl4utths947mjquprw20puwrrdfrwx8akeeu2tqwklsnxsvf0",
+            160_000,
+        ),
+        ("bcrt1qwk6p86mzqmstcsg99qlu2mhsp3766u68jktv6k", 80_000),
+        ("2N2x2bA28AsLZZEHss4SjFoyToQV5YYZsJM", 15_055),
+    ];
+
+    // The same receivers with other amounts. The total amount is the same.
+    //noinspection SpellCheckingInspection
+    const OTHER_REDIRECTION_RECEIVERS: [(&str, u64); 3] = [
+        (
+            "bcrt1phc8m8vansnl4utths947mjquprw20puwrrdfrwx8akeeu2tqwklsnxsvf0",
+            150_000,
+        ),
+        ("bcrt1qwk6p86mzqmstcsg99qlu2mhsp3766u68jktv6k", 90_000),
+        ("2N2x2bA28AsLZZEHss4SjFoyToQV5YYZsJM", 15_055),
+    ];
+
+    const ROLE_PAIRS: [(Role, Role); 4] = [
+        (Role::BuyerAsTaker, Role::SellerAsMaker),
+        (Role::BuyerAsMaker, Role::SellerAsTaker),
+        (Role::SellerAsTaker, Role::BuyerAsMaker),
+        (Role::SellerAsMaker, Role::BuyerAsTaker),
+    ];
+
+    fn receivers(receivers: [(&str, u64); 3]) -> Vec<Receiver<NetworkUnchecked>> {
+        receivers
+            .into_iter()
+            .map(|(address, amount)| Receiver {
+                address: address.parse().expect("valid address"),
+                amount: Amount::from_sat(amount),
+            })
+            .collect()
+    }
+
+    /// The engine calls of the `InitTrade` handler.
+    fn new_trade_model(role: Role) -> TradeModel {
+        let mut trade_model = TradeModel::new("trade".to_owned(), role);
+        trade_model
+            .init_my_key_shares()
+            .expect("key shares can be created");
+        trade_model
+    }
+
+    fn sent_key_shares(trade_model: &TradeModel) -> ExchangedKeys<'static, ByVal> {
+        let key_shares = trade_model.my_key_shares().expect("key shares exist");
+        ExchangedKeys {
+            buyer_payout: *key_shares.buyer_payout,
+            seller_payout: *key_shares.seller_payout,
+            multisig_script: *key_shares.multisig_script,
+        }
+    }
+
+    /// The engine calls of the `GetNonceShares` handler.
+    fn receive_key_shares(
+        trade_model: &mut TradeModel,
+        peers_key_shares: &ExchangedKeys<ByVal>,
+    ) -> Result<()> {
+        trade_model.set_peer_key_shares(peers_key_shares);
+        trade_model.aggregate_key_shares()?;
+        trade_model.set_trade_amount(Amount::from_sat(200_000));
+        trade_model.set_buyers_security_deposit(Amount::from_sat(30_000));
+        trade_model.set_sellers_security_deposit(Amount::from_sat(30_000));
+        trade_model.set_deposit_tx_fee_rate(FeeRate::from_sat_per_kwu(3_125));
+        trade_model.set_prepared_tx_fee_rate(FeeRate::from_sat_per_kwu(2_500));
+        trade_model.set_trade_fee_receiver(None)?;
+        trade_model.init_my_addresses()?;
+        trade_model.init_my_half_deposit_psbt()?;
+        trade_model.init_my_nonce_shares()
+    }
+
+    type SentNonceShares = (
+        Psbt,
+        ExchangedAddresses<'static, ByVal, NetworkUnchecked>,
+        ExchangedNonces<'static, ByVal>,
+    );
+
+    fn sent_nonce_shares(trade_model: &TradeModel) -> SentNonceShares {
+        let half_deposit_psbt = trade_model
+            .my_half_deposit_psbt()
+            .expect("PSBT exists")
+            .clone();
+        let addresses = trade_model.my_addresses().expect("addresses exist");
+        let addresses = ExchangedAddresses {
+            warning_tx_fee_bump: addresses.warning_tx_fee_bump.as_unchecked().clone(),
+            redirect_tx_fee_bump: addresses.redirect_tx_fee_bump.as_unchecked().clone(),
+            claim_tx_payout: addresses.claim_tx_payout.as_unchecked().clone(),
+        };
+        let nonces = trade_model.my_nonce_shares().expect("nonce shares exist");
+        let nonces = ExchangedNonces {
+            swap_tx_input: nonces.swap_tx_input.clone(),
+            buyers_warning_tx_buyer_input: nonces.buyers_warning_tx_buyer_input.clone(),
+            buyers_warning_tx_seller_input: nonces.buyers_warning_tx_seller_input.clone(),
+            sellers_warning_tx_buyer_input: nonces.sellers_warning_tx_buyer_input.clone(),
+            sellers_warning_tx_seller_input: nonces.sellers_warning_tx_seller_input.clone(),
+            buyers_redirect_tx_input: nonces.buyers_redirect_tx_input.clone(),
+            sellers_redirect_tx_input: nonces.sellers_redirect_tx_input.clone(),
+            buyers_claim_tx_input: nonces.buyers_claim_tx_input.clone(),
+            sellers_claim_tx_input: nonces.sellers_claim_tx_input.clone(),
+        };
+        (half_deposit_psbt, addresses, nonces)
+    }
+
+    /// The engine calls of the `GetPartialSignatures` handler, without the ready-to-release flag.
+    fn receive_nonce_shares(
+        trade_model: &mut TradeModel,
+        (peers_half_deposit_psbt, peers_addresses, peers_nonce_shares): SentNonceShares,
+        redirection_receivers: [(&str, u64); 3],
+    ) -> Result<()> {
+        trade_model.set_peer_half_deposit_psbt(peers_half_deposit_psbt);
+        trade_model.compute_unsigned_deposit_tx()?;
+        trade_model.set_redirection_receivers(
+            receivers(redirection_receivers)
+                .into_iter()
+                .map(Ok::<_, ProtocolErrorKind>),
+        )?;
+        trade_model.check_redirect_tx_params()?;
+        trade_model.set_peer_addresses(peers_addresses)?;
+        trade_model.compute_unsigned_prepared_txs()?;
+        trade_model.set_peer_nonce_shares(peers_nonce_shares);
+        trade_model.aggregate_nonce_shares()?;
+        trade_model.sign_partial()
+    }
+
+    fn sent_partial_signatures(trade_model: &TradeModel) -> ExchangedSigs<'static, ByVal> {
+        let sigs = trade_model
+            .my_partial_signatures_on_peer_txs()
+            .expect("signatures exist");
+        ExchangedSigs {
+            peers_warning_tx_buyer_input_partial_signature: *sigs
+                .peers_warning_tx_buyer_input_partial_signature,
+            peers_warning_tx_seller_input_partial_signature: *sigs
+                .peers_warning_tx_seller_input_partial_signature,
+            peers_redirect_tx_input_partial_signature: *sigs
+                .peers_redirect_tx_input_partial_signature,
+            peers_claim_tx_input_partial_signature: *sigs.peers_claim_tx_input_partial_signature,
+            swap_tx_input_partial_signature: sigs.swap_tx_input_partial_signature.copied(),
+            swap_tx_input_sighash: sigs.swap_tx_input_sighash.copied(),
+            contractual_txids: None,
+        }
+    }
+
+    /// The engine calls of the `SignDepositTx` handler.
+    fn receive_partial_signatures(
+        trade_model: &mut TradeModel,
+        peers_partial_signatures: &ExchangedSigs<ByVal>,
+    ) -> Result<()> {
+        if trade_model.am_buyer() {
+            let sighash = peers_partial_signatures
+                .swap_tx_input_sighash
+                .expect("seller sends the sighash of the swap transaction");
+            trade_model.sign_swap_tx_input_partial(sighash)?;
+        }
+        trade_model.set_peer_partial_signatures_on_my_txs(peers_partial_signatures);
+        trade_model.aggregate_partial_signatures()?;
+        trade_model.compute_my_signed_prepared_txs()?;
+        trade_model.sign_deposit_psbt()?;
+        Ok(())
+    }
+
+    /// Two trade models that exchanged key shares, nonce shares and partial signatures, but did
+    /// not yet process the partial signatures of the peer. Both are in state `Init`.
+    fn trade_models_before_deposit_signature(
+        (my_role, peers_role): (Role, Role),
+        peers_redirection_receivers: [(&str, u64); 3],
+        prepare_peer: impl FnOnce(&mut TradeModel),
+    ) -> (TradeModel, TradeModel) {
+        let mut me = new_trade_model(my_role);
+        let mut peer = new_trade_model(peers_role);
+        prepare_peer(&mut peer);
+        receive_key_shares(&mut me, &sent_key_shares(&peer)).expect("valid key shares");
+        receive_key_shares(&mut peer, &sent_key_shares(&me)).expect("valid key shares");
+        receive_nonce_shares(&mut me, sent_nonce_shares(&peer), REDIRECTION_RECEIVERS)
+            .expect("valid nonce shares");
+        receive_nonce_shares(
+            &mut peer,
+            sent_nonce_shares(&me),
+            peers_redirection_receivers,
+        )
+        .expect("valid nonce shares");
+        (me, peer)
+    }
+
+    fn random_partial_signature() -> PartialSignature {
+        Scalar::random(&mut rand::rng()).into()
+    }
+
+    /// Checks that the trade model did not sign the deposit transaction.
+    #[track_caller]
+    fn assert_deposit_not_signed(trade_model: &TradeModel) {
+        assert_eq!(trade_model.state(), TradeState::Init);
+        assert!(matches!(
+            trade_model.deposit_psbt(),
+            Err(ProtocolErrorKind::AccessDenied)
+        ));
+        let psbt = trade_model
+            .deposit_tx
+            .builder
+            .psbt()
+            .expect("unsigned PSBT exists");
+        assert!(
+            psbt.inputs
+                .iter()
+                .all(|input| input.final_script_witness.is_none())
+        );
+    }
+
+    #[track_caller]
+    fn assert_invalid_signature(result: &Result<()>, context: &str) {
+        assert!(
+            matches!(
+                result,
+                Err(ProtocolErrorKind::Multisig(MultisigErrorKind::Verify(_)))
+            ),
+            "{context}: unexpected result {result:?}"
+        );
+    }
+
+    /// The setup with valid data succeeds for every role. This checks the helpers of this module.
+    #[test]
+    fn valid_setup_signs_the_deposit() {
+        for roles in ROLE_PAIRS {
+            let (mut me, mut peer) =
+                trade_models_before_deposit_signature(roles, REDIRECTION_RECEIVERS, |_| {});
+            let peers_partial_signatures = sent_partial_signatures(&peer);
+            receive_partial_signatures(&mut peer, &sent_partial_signatures(&me))
+                .expect("valid signatures");
+            receive_partial_signatures(&mut me, &peers_partial_signatures)
+                .expect("valid signatures");
+            assert_eq!(me.state(), TradeState::Deposit);
+            assert_eq!(peer.state(), TradeState::Deposit);
+            assert_eq!(
+                me.deposit_psbt().expect("signed").unsigned_tx,
+                peer.deposit_psbt().expect("signed").unsigned_tx
+            );
+        }
+    }
+
+    /// G1: the peer uses one key share for both payouts.
+    #[test]
+    #[ignore = "G1: equal key shares of the peer for both payouts are accepted"]
+    fn g1_peers_key_shares_are_equal() {
+        for (my_role, peers_role) in ROLE_PAIRS {
+            let mut me = new_trade_model(my_role);
+            let peers_key_shares = sent_key_shares(&new_trade_model(peers_role));
+            let equal_key_shares = ExchangedKeys {
+                seller_payout: peers_key_shares.buyer_payout,
+                ..peers_key_shares
+            };
+            assert!(
+                receive_key_shares(&mut me, &equal_key_shares).is_err(),
+                "{my_role:?}"
+            );
+            assert_eq!(me.state(), TradeState::Init);
+        }
+    }
+
+    /// G1: the peer sends our own key share back as its key share for the same payout.
+    #[test]
+    #[ignore = "G1: a key share of the peer that equals our own key share is accepted"]
+    fn g1_peers_key_share_is_equal_to_own() {
+        for (my_role, peers_role) in ROLE_PAIRS {
+            for for_buyer_payout in [true, false] {
+                let mut me = new_trade_model(my_role);
+                let my_key_shares = sent_key_shares(&me);
+                let peers_key_shares = sent_key_shares(&new_trade_model(peers_role));
+                let key_shares_with_own = if for_buyer_payout {
+                    ExchangedKeys {
+                        buyer_payout: my_key_shares.buyer_payout,
+                        ..peers_key_shares
+                    }
+                } else {
+                    ExchangedKeys {
+                        seller_payout: my_key_shares.seller_payout,
+                        ..peers_key_shares
+                    }
+                };
+                assert!(
+                    receive_key_shares(&mut me, &key_shares_with_own).is_err(),
+                    "{my_role:?}"
+                );
+                assert_eq!(me.state(), TradeState::Init);
+            }
+        }
+    }
+
+    /// G4: the peer uses one nonce for two signatures.
+    #[test]
+    #[ignore = "G4: a nonce of the peer that is used for two signatures is accepted"]
+    fn g4_peers_nonce_is_repeated() {
+        for (my_role, peers_role) in ROLE_PAIRS {
+            let mut me = new_trade_model(my_role);
+            let mut peer = new_trade_model(peers_role);
+            receive_key_shares(&mut me, &sent_key_shares(&peer)).expect("valid key shares");
+            receive_key_shares(&mut peer, &sent_key_shares(&me)).expect("valid key shares");
+
+            let (half_deposit_psbt, addresses, nonces) = sent_nonce_shares(&peer);
+            let repeated_nonces = ExchangedNonces {
+                buyers_redirect_tx_input: nonces.sellers_redirect_tx_input.clone(),
+                ..nonces
+            };
+            let result = receive_nonce_shares(
+                &mut me,
+                (half_deposit_psbt, addresses, repeated_nonces),
+                REDIRECTION_RECEIVERS,
+            );
+            assert!(result.is_err(), "{my_role:?}");
+            assert_eq!(me.state(), TradeState::Init);
+        }
+    }
+
+    /// G5: an invalid partial signature of the peer for the warning transaction, the redirect
+    /// transaction or the swap transaction makes the aggregation fail. The deposit transaction is
+    /// not signed.
+    #[test]
+    fn g5_invalid_partial_signature() {
+        type Change = fn(&mut ExchangedSigs<ByVal>);
+        let changes: [(&str, Change); 4] = [
+            ("warning transaction, buyer input", |sigs| {
+                sigs.peers_warning_tx_buyer_input_partial_signature = random_partial_signature();
+            }),
+            ("warning transaction, seller input", |sigs| {
+                sigs.peers_warning_tx_seller_input_partial_signature = random_partial_signature();
+            }),
+            ("redirect transaction", |sigs| {
+                sigs.peers_redirect_tx_input_partial_signature = random_partial_signature();
+            }),
+            // Only the seller sends this signature during the setup, so only the buyer checks it.
+            ("swap transaction", |sigs| {
+                sigs.swap_tx_input_partial_signature = Some(random_partial_signature());
+            }),
+        ];
+        for roles in ROLE_PAIRS {
+            for (name, change) in changes {
+                let (mut me, peer) =
+                    trade_models_before_deposit_signature(roles, REDIRECTION_RECEIVERS, |_| {});
+                if name == "swap transaction" && !me.am_buyer() {
+                    continue;
+                }
+                let mut peers_partial_signatures = sent_partial_signatures(&peer);
+                change(&mut peers_partial_signatures);
+
+                let result = receive_partial_signatures(&mut me, &peers_partial_signatures);
+                assert_invalid_signature(&result, &format!("{:?}, {name}", roles.0));
+                assert_deposit_not_signed(&me);
+            }
+        }
+    }
+
+    /// G6: the peer signed transactions with other outputs. The peer computed its redirect
+    /// transactions with other receiver amounts, so its partial signature is for another message.
+    #[test]
+    fn g6_partial_signature_for_other_outputs() {
+        for roles in ROLE_PAIRS {
+            let (mut me, peer) =
+                trade_models_before_deposit_signature(roles, OTHER_REDIRECTION_RECEIVERS, |_| {});
+
+            let result = receive_partial_signatures(&mut me, &sent_partial_signatures(&peer));
+            assert_invalid_signature(&result, &format!("{:?}", roles.0));
+            assert_deposit_not_signed(&me);
+        }
+    }
+
+    /// G6: the peer signed transactions with another lock time. The peer computed its warning
+    /// transactions with another lock time, so its partial signatures are for other messages.
+    #[test]
+    fn g6_partial_signature_for_other_lock_time() {
+        for roles in ROLE_PAIRS {
+            let (mut me, peer) =
+                trade_models_before_deposit_signature(roles, REDIRECTION_RECEIVERS, |peer| {
+                    // The lock time of a builder cannot be changed, so replace the builders.
+                    for txs in [&mut peer.buyer_txs, &mut peer.seller_txs] {
+                        txs.warning.builder = WarningTxBuilder::default();
+                        txs.warning
+                            .builder
+                            .set_lock_time(relative::LockTime::from_height(6));
+                    }
+                });
+
+            let result = receive_partial_signatures(&mut me, &sent_partial_signatures(&peer));
+            assert_invalid_signature(&result, &format!("{:?}", roles.0));
+            assert_deposit_not_signed(&me);
+        }
+    }
+
+    /// F4: `close_trade` returns an error for the closure types that are not implemented. It
+    /// does not panic and does not change the state.
+    #[test]
+    #[ignore = "F4: close_trade panics with todo!() for the closure types of the dispute outcomes"]
+    fn f4_close_trade_with_dispute_closure_type() {
+        for roles in ROLE_PAIRS {
+            let (mut me, peer) =
+                trade_models_before_deposit_signature(roles, REDIRECTION_RECEIVERS, |_| {});
+            receive_partial_signatures(&mut me, &sent_partial_signatures(&peer))
+                .expect("valid signatures");
+            for closure_type in [
+                ClosureType::BuyersRedirect,
+                ClosureType::SellersRedirect,
+                ClosureType::BuyersClaim,
+                ClosureType::SellersClaim,
+                ClosureType::BuyersPenaltyTx,
+                ClosureType::SellersPenaltyTx,
+            ] {
+                assert!(me.close_trade(closure_type).is_err(), "{closure_type:?}");
+                assert_eq!(me.state(), TradeState::Deposit);
+            }
+        }
+    }
+}
