@@ -37,10 +37,6 @@ pub fn test_password() -> Password {
 pub struct MockedBDKElectrum;
 
 impl ChainDataSource for MockedBDKElectrum {
-    const RECOVERY_HEIGHT: usize = 10;
-    const BATCH_SIZE: usize = 10;
-    const STOP_GAP: usize = 10;
-
     #[expect(
         clippy::unused_async_trait_impl,
         reason = "the ChainDataSource trait requires an async method"
@@ -80,10 +76,6 @@ impl ChainDataSource for MockedBDKElectrum {
 pub struct MockedBDKElectrumWithPending;
 
 impl ChainDataSource for MockedBDKElectrumWithPending {
-    const RECOVERY_HEIGHT: usize = 10;
-    const BATCH_SIZE: usize = 10;
-    const STOP_GAP: usize = 10;
-
     #[expect(
         clippy::unused_async_trait_impl,
         reason = "the ChainDataSource trait requires an async method"
@@ -140,10 +132,6 @@ impl ChainDataSource for MockedBDKElectrumWithPending {
 pub struct MockedBDKElectrumWithSpend;
 
 impl ChainDataSource for MockedBDKElectrumWithSpend {
-    const RECOVERY_HEIGHT: usize = 10;
-    const BATCH_SIZE: usize = 1;
-    const STOP_GAP: usize = 1;
-
     #[expect(
         clippy::unused_async_trait_impl,
         reason = "the ChainDataSource trait requires an async method"
@@ -183,10 +171,6 @@ pub struct MockedBDKElectrumWithSpendOf {
 }
 
 impl ChainDataSource for MockedBDKElectrumWithSpendOf {
-    const RECOVERY_HEIGHT: usize = 10;
-    const BATCH_SIZE: usize = 1;
-    const STOP_GAP: usize = 1;
-
     #[expect(
         clippy::unused_async_trait_impl,
         reason = "the ChainDataSource trait requires an async method"
@@ -228,10 +212,6 @@ pub struct MockedBDKElectrumWithEvictedSpend {
 }
 
 impl ChainDataSource for MockedBDKElectrumWithEvictedSpend {
-    const RECOVERY_HEIGHT: usize = 10;
-    const BATCH_SIZE: usize = 1;
-    const STOP_GAP: usize = 1;
-
     #[expect(
         clippy::unused_async_trait_impl,
         reason = "the ChainDataSource trait requires an async method"
@@ -270,10 +250,6 @@ pub struct MockedBDKElectrumWithCoinbase {
 }
 
 impl ChainDataSource for MockedBDKElectrumWithCoinbase {
-    const RECOVERY_HEIGHT: usize = 1;
-    const BATCH_SIZE: usize = 1;
-    const STOP_GAP: usize = 1;
-
     #[expect(
         clippy::unused_async_trait_impl,
         reason = "the ChainDataSource trait requires an async method"

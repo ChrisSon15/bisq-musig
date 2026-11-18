@@ -10,10 +10,6 @@ use crate::persisted::BMPWalletPersister;
 
 #[trait_variant::make(Send)]
 pub trait ChainDataSource {
-    const RECOVERY_HEIGHT: usize;
-    const BATCH_SIZE: usize;
-    const STOP_GAP: usize;
-
     async fn sync(
         &self,
         _persister: Vec<&mut PersistedWallet<impl BMPWalletPersister>>,
@@ -21,10 +17,6 @@ pub trait ChainDataSource {
 }
 
 impl ChainDataSource for CBFScanner {
-    const RECOVERY_HEIGHT: usize = 190_000;
-    const BATCH_SIZE: usize = 16;
-    const STOP_GAP: usize = 10;
-
     async fn sync(
         &self,
         mut wallets: Vec<&mut PersistedWallet<impl BMPWalletPersister>>,

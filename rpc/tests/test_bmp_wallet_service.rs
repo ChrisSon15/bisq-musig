@@ -437,10 +437,6 @@ impl CountingChainSource {
 }
 
 impl ChainDataSource for CountingChainSource {
-    const RECOVERY_HEIGHT: usize = 0;
-    const BATCH_SIZE: usize = 1;
-    const STOP_GAP: usize = 1;
-
     #[expect(
         clippy::unused_async_trait_impl,
         reason = "the ChainDataSource trait requires an async method"

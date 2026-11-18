@@ -1058,10 +1058,6 @@ mod tests {
     struct NoopChainDataSource;
 
     impl ChainDataSource for NoopChainDataSource {
-        const RECOVERY_HEIGHT: usize = 0;
-        const BATCH_SIZE: usize = 1;
-        const STOP_GAP: usize = 1;
-
         #[expect(
             clippy::unused_async_trait_impl,
             reason = "the ChainDataSource trait requires an async method"
@@ -1081,10 +1077,6 @@ mod tests {
     }
 
     impl ChainDataSource for FailingChainDataSource {
-        const RECOVERY_HEIGHT: usize = 0;
-        const BATCH_SIZE: usize = 1;
-        const STOP_GAP: usize = 1;
-
         #[expect(
             clippy::unused_async_trait_impl,
             reason = "the ChainDataSource trait requires an async method"
