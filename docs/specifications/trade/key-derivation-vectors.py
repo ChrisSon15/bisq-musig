@@ -90,6 +90,15 @@ def key_share(root, trade_id, label):
     assert s != 0
     return s
 
+# Worked example with all intermediate values.
+example_root = trade_root(seed, 1)
+example_id = 'trade-1'.encode('utf-8')
+example_message = example_root.to_bytes(32, 'big') + struct.pack('>I', len(example_id)) + example_id + bytes([0])
+print('worked example (coin type 1, trade ID "trade-1", label 00)')
+print('  tag hash:', hashlib.sha256(TAG.encode()).hexdigest())
+print('  message:', example_message.hex())
+print('  tagged hash:', tagged_hash(TAG, example_message).hex())
+print('  key share:', key_share(example_root, 'trade-1', 0).to_bytes(32, 'big').hex())
 print('mnemonic:', MNEMONIC)
 print('seed:', seed.hex())
 for coin_type, name in ((1, "m/86'/1'/0'/2' (testnet, signet, regtest)"), (0, "m/86'/0'/0'/2' (mainnet)")):

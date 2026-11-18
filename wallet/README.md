@@ -26,6 +26,17 @@ template. Therefore `tr(P)` and `tr(P, tap_tree)` represent the same imported ke
 form is imported, another import with the same `P` is a duplicate and must not create a second
 wallet entry.
 
+## Derivation paths
+
+The HD wallet follows BIP86: receive addresses are derived at `m/86'/coin_type'/0'/0/*` and change
+addresses at `m/86'/coin_type'/0'/1/*`.
+
+The path `m/86'/coin_type'/0'/2'` is reserved for the key shares of the trade protocol. The wallet
+must never use it for an address. The rule for deriving the key shares, with test vectors, is
+specified in
+[docs/specifications/trade/key-derivation.md](../docs/specifications/trade/key-derivation.md). The
+derivation is not implemented yet.
+
 # Running tests
 
 `cargo test -p wallet`
