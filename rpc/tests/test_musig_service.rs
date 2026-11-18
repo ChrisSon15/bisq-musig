@@ -1663,10 +1663,10 @@ async fn c4_seller_gets_no_swap_tx_before_payment_started() {
     }
 }
 
-/// A request that the service rejected ends the use of the trade (D17): after an invalid partial
-/// signature for the swap transaction, the seller's service refuses the valid one too. Today this
-/// follows from the stored invalid signature, not from the blocked mark of the trade, so the
-/// second error is checked by its code only.
+/// Invalid data of the peer ends the use of the trade (D17): after an invalid partial signature
+/// for the swap transaction, the seller's service refuses the valid one too. Today this follows
+/// from the stored invalid signature, not from the terminated mark of the trade, so the second
+/// error is checked by its code only.
 #[tokio::test]
 async fn rejected_swap_tx_signature_blocks_the_trade() {
     for trade_type in TRADE_TYPES {
@@ -1848,11 +1848,9 @@ async fn d5_custom_payout_with_changed_peer_psbt() {
                 assert_refused(result, Code::Internal, "different unsigned transaction");
                 assert_eq!(party.state(), TradeState::CustomPayoutSigned);
             }
-            let result = party.custom_close_trade(b"no PSBT").await;
-            assert_refused(result, Code::InvalidArgument, "could not decode PSBT");
-            assert_eq!(party.state(), TradeState::CustomPayoutSigned);
         }
-        // The rejected PSBTs did not damage the trades.
+        // A PSBT for another transaction can have a harmless cause, for example another fee rate
+        // of the peer's client. It is refused, and the trade continues (D17).
         trade.close_by_custom_payout().await;
     }
 }
@@ -1894,7 +1892,10 @@ async fn g1_g4_invalid_encodings_are_rejected() {
         }
     }
 
-    // The rejected key shares did not damage the trades.
+    // The nonce shares are checked with a new trade, because invalid data of the peer ends the
+    // use of a trade (D17).
+    let mut trade = Trade::new(TradeType::TakerIsBuyer).await;
+    trade.init_trades().await;
     trade.exchange_nonce_shares().await;
     for (side, peer_side) in [(Side::Buyer, Side::Seller), (Side::Seller, Side::Buyer)] {
         let peers_nonce_shares = trade
@@ -1912,12 +1913,10 @@ async fn g1_g4_invalid_encodings_are_rejected() {
         assert_refused(result, Code::InvalidArgument, "could not decode pub nonce");
         assert_eq!(party.state(), TradeState::Init);
     }
-    trade.exchange_partial_signatures().await;
-    trade.sign_deposit_tx().await;
 }
 
 /// G4: nonce shares of the peer in which one nonce is used for two signatures are rejected. The
-/// rejection blocks the trade (D17): the valid nonce shares are refused afterwards.
+/// rejection terminates the trade (D17): the valid nonce shares are refused afterwards.
 #[tokio::test]
 async fn g4_repeated_nonce_is_rejected() {
     type Change = fn(&mut NonceSharesMessage, &NonceSharesMessage);
@@ -1972,10 +1971,9 @@ async fn g10_wrong_key_share_at_close() {
             "could not decode nonzero scalar",
         );
         assert_eq!(trade.buyer.state(), TradeState::BuyerReadyToRelease);
-        // The rejected key shares did not damage the trade.
-        trade.buyer_closes_cooperatively().await;
 
         // The seller receives a wrong message G.
+        let mut trade = Trade::at(trade_type, Stage::BuyerClosedCooperatively).await;
         let result = trade
             .seller
             .close_trade_with_key_share(&random_scalar())
@@ -1989,6 +1987,120 @@ async fn g10_wrong_key_share_at_close() {
             .await;
         assert_refused(result, Code::Internal, "public-private key mismatch");
         assert_eq!(trade.seller.state(), TradeState::SellerReadyToRelease);
+    }
+}
+
+/// G13: data of the peer that an unmodified client never produces terminates the trade (D17). The
+/// valid data is refused afterwards.
+///
+/// The service terminates a trade only for repeated nonces so far
+/// (`g4_repeated_nonce_is_rejected`). In the cases of this test it accepts the valid data after
+/// the invalid data.
+#[tokio::test]
+#[ignore = "D17: only the nonce check terminates the trade so far"]
+async fn g13_invalid_peer_data_terminates_the_trade() {
+    for trade_type in TRADE_TYPES {
+        // A public key share that is no point of the curve.
+        let mut trade = Trade::new(trade_type).await;
+        trade.init_trades().await;
+        let sellers_key_shares = trade.seller.key_shares.clone().expect("message A/B");
+        let invalid_key_shares = PubKeySharesResponse {
+            buyer_output_pub_key_share: [&[2][..], &[0xff; 32]].concat(),
+            ..sellers_key_shares.clone()
+        };
+        let result = trade.buyer.get_nonce_shares(&invalid_key_shares).await;
+        assert_refused(result, Code::InvalidArgument, "could not decode");
+        let result = trade.buyer.get_nonce_shares(&sellers_key_shares).await;
+        assert!(result.is_err(), "valid key shares after invalid ones");
+
+        // A wrong private key share in message F.
+        let mut trade = Trade::at(trade_type, Stage::SellerReleased).await;
+        let sellers_key_share = trade.sellers_key_share();
+        let result = trade
+            .buyer
+            .close_trade_with_key_share(&random_scalar())
+            .await;
+        assert_refused(result, Code::Internal, "public-private key mismatch");
+        let result = trade
+            .buyer
+            .close_trade_with_key_share(&sellers_key_share)
+            .await;
+        assert!(result.is_err(), "valid message F after an invalid one");
+        assert_eq!(trade.buyer.state(), TradeState::BuyerReadyToRelease);
+
+        // A wrong private key share in message G.
+        let mut trade = Trade::at(trade_type, Stage::BuyerClosedCooperatively).await;
+        let buyers_key_share = trade.buyers_key_share();
+        let result = trade
+            .seller
+            .close_trade_with_key_share(&random_scalar())
+            .await;
+        assert_refused(result, Code::Internal, "public-private key mismatch");
+        let result = trade
+            .seller
+            .close_trade_with_key_share(&buyers_key_share)
+            .await;
+        assert!(result.is_err(), "valid message G after an invalid one");
+        assert_eq!(trade.seller.state(), TradeState::SellerReadyToRelease);
+
+        // A custom payout PSBT of the peer that cannot be decoded.
+        let mut trade = Trade::at(trade_type, Stage::CustomPayoutSigned).await;
+        let buyers_psbt = trade.buyer.custom_payout_psbt.clone().expect("signed").psbt;
+        let result = trade.seller.custom_close_trade(b"no PSBT").await;
+        assert_refused(result, Code::InvalidArgument, "could not decode PSBT");
+        let result = trade.seller.custom_close_trade(&buyers_psbt).await;
+        assert!(result.is_err(), "valid PSBT after an invalid one");
+        assert_eq!(trade.seller.state(), TradeState::CustomPayoutSigned);
+    }
+}
+
+/// G15: a request that is refused for a reason that an honest peer and a correct network can also
+/// cause does not end the use of the trade. The trade closes normally afterwards (D17).
+#[tokio::test]
+async fn g15_refused_request_can_be_repeated() {
+    for trade_type in TRADE_TYPES {
+        let mut trade = Trade::at(trade_type, Stage::DepositSigned).await;
+
+        // Requests that come too early, or from the wrong role.
+        let result = trade.seller.release_payout().await;
+        assert_refused(result, Code::Internal, "missing aggregated signature");
+        let result = trade.seller.close_trade_without_arguments().await;
+        assert_refused(result, Code::Internal, "missing transaction");
+        let result = trade.seller.start_payment().await;
+        assert_refused(result, Code::FailedPrecondition, "only available for buyer");
+        let result = trade.buyer.close_trade_without_arguments().await;
+        assert_refused(result, Code::Internal, "missing private key");
+        let result = trade.buyer.release_payout().await;
+        assert_refused(
+            result,
+            Code::FailedPrecondition,
+            "only available for seller",
+        );
+        trade.assert_states(TradeState::Deposit, TradeState::Deposit);
+
+        // Requests that are repeated with the same data. The response of the publisher of the
+        // deposit now also contains the signatures of the peer, so only the transactions are
+        // compared.
+        let deposit_tx = trade.deposit_tx();
+        for (side, peer_side) in [(Side::Buyer, Side::Seller), (Side::Seller, Side::Buyer)] {
+            let peers_signatures = trade
+                .party(peer_side)
+                .partial_signatures
+                .clone()
+                .expect("message C/D");
+            let repeated = trade
+                .party_mut(side)
+                .sign_deposit_tx(&peers_signatures)
+                .await
+                .expect("repeated SignDepositTx succeeds");
+            assert_eq!(psbt(&repeated.deposit_psbt).unsigned_tx, deposit_tx);
+        }
+        trade.assert_states(TradeState::Deposit, TradeState::Deposit);
+
+        trade.buyer_starts_payment().await;
+        trade.seller_receives_payment_start().await;
+        trade.release_payout().await;
+        trade.buyer_closes_cooperatively().await;
         trade.seller_closes_cooperatively().await;
     }
 }
