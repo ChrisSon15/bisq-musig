@@ -17,8 +17,9 @@ use bdk_wallet::bitcoin::address::NetworkUnchecked;
 use bdk_wallet::bitcoin::{
     Amount, BlockHash, FeeRate, Network, OutPoint, Transaction, Txid, XOnlyPublicKey,
 };
-use chain::client::{ChainClient, TrustedPeer};
+use chain::client::{ChainClient, ClientError, TrustedPeer};
 use musig2::secp::Scalar;
+use protocol::chain_facts::{ChainFacts, TradeEvent, TxKind};
 use protocol::params::{EngineConfig, TradeParams};
 use protocol::receiver::Receiver;
 use protocol::script_paths::{deposit_payout_descriptor, deposit_payout_tap_tree};
@@ -173,6 +174,57 @@ impl Trader {
         for (outpoint, script) in outputs {
             self.chain.client.watch_output(outpoint, script);
         }
+    }
+
+    /// Passes the facts about the chain to the engine, as the trade service does before every
+    /// request and after every new block. The facts come from the client of the trader.
+    fn observe(&mut self, env: &TestEnv) -> Vec<TradeEvent> {
+        self.chain.wait_for_tip(env);
+        let client = &self.chain.client;
+        let outputs = self.model.outputs_to_watch().expect("deposit is signed");
+        let facts = ChainFacts::collect(
+            client.tip_height().expect("the client knows the chain"),
+            &self.model.deposit_txid().expect("deposit is signed"),
+            outputs.into_iter().map(|(outpoint, _)| outpoint),
+            |txid| client.confirmations(txid),
+            |outpoint| client.spending_tx(outpoint).map(|found| found.tx),
+        );
+        self.model.observe_chain(&mut self.wallet, facts)
+    }
+
+    /// One round of the trade service for this trader: the engine looks at the chain, and the
+    /// transactions that it wants to send go to the network through the client of the trader.
+    /// Returns the kinds of the transactions that were sent.
+    fn react(&mut self, env: &TestEnv) -> Vec<TxKind> {
+        self.observe(env);
+        let to_send = self.model.transactions_to_send(FEE_RATE);
+        for to_send in &to_send {
+            let txid = to_send.tx.compute_txid();
+            // A transaction of an earlier round that is still unconfirmed is not sent again in
+            // these tests. The node would not ask for it.
+            if env.mempool_contains(&txid).expect("RPC") {
+                continue;
+            }
+            let sent = self
+                .chain
+                .runtime
+                .block_on(self.chain.client.broadcast(to_send.tx.clone()));
+            assert!(
+                matches!(sent, Ok(_) | Err(ClientError::NotRequested(_))),
+                "{:?}: {sent:?}",
+                to_send.kind
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !env.mempool_contains(&txid).expect("RPC") {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the node accepts the {:?} transaction {txid}",
+                    to_send.kind
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        to_send.into_iter().map(|to_send| to_send.kind).collect()
     }
 
     /// The coins that are reserved for the trade are locked in the wallet.
@@ -332,12 +384,15 @@ impl Trade {
         buyer.watch_trade();
         seller.watch_trade();
 
-        // The taker holds all signatures and publishes the deposit transaction.
+        // The taker holds all signatures. His engine names the deposit transaction, and it
+        // reaches the node over the peer-to-peer network (M1). The maker has nothing to send.
         let sellers_deposit_psbt = seller.model.deposit_psbt()?.clone();
         let deposit_tx = buyer
             .model
             .receive_deposit_psbt(&mut buyer.wallet, Ok(sellers_deposit_psbt))?;
-        let deposit_txid = send_to_node(&env, &deposit_tx).map_err(anyhow::Error::msg)?;
+        let deposit_txid = deposit_tx.compute_txid();
+        assert_eq!(seller.react(&env), vec![]);
+        assert_eq!(buyer.react(&env), vec![TxKind::Deposit]);
         env.mine_block()?;
 
         let payout = |amount: Amount| {
@@ -358,6 +413,38 @@ impl Trade {
         assert_eq!(trade.confirmations(trade.buyer_payout), Some(1));
         assert_eq!(trade.confirmations(trade.seller_payout), Some(1));
         Ok(trade)
+    }
+
+    /// Both engines look at the chain.
+    fn observe(&mut self) {
+        self.buyer.observe(&self.env);
+        self.seller.observe(&self.env);
+    }
+
+    /// Mines one block. Then both engines look at the chain and send what they want to send.
+    /// Returns the kinds of the transactions of the buyer and of the seller.
+    fn mine_and_react(&mut self) -> anyhow::Result<(Vec<TxKind>, Vec<TxKind>)> {
+        self.env.mine_block()?;
+        Ok((self.buyer.react(&self.env), self.seller.react(&self.env)))
+    }
+
+    /// Mines blocks until the deposit transaction counts as confirmed (D6), and tells the
+    /// engines.
+    fn confirm_deposit(&mut self) -> anyhow::Result<()> {
+        let confirmations = self
+            .confirmations(self.buyer_payout)
+            .expect("deposit is unspent");
+        self.env
+            .mine_blocks(3_usize.saturating_sub(confirmations as usize))?;
+        self.observe();
+        Ok(())
+    }
+
+    /// Mines blocks until a warning transaction is valid, and tells the engines.
+    fn wait_for_warning_lock_time(&mut self) -> anyhow::Result<()> {
+        self.mine_until_warning_is_valid()?;
+        self.observe();
+        Ok(())
     }
 
     /// Runs the chain sync of both wallets.
@@ -433,6 +520,7 @@ impl Trade {
     /// The buyer starts the payment (message E) and the seller confirms it. Returns the seller's
     /// key share of message F.
     fn start_payment_and_release(&mut self) -> anyhow::Result<Scalar> {
+        self.confirm_deposit()?;
         self.buyer.model.start_payment()?;
         let swap_tx_signature = *self
             .buyer
@@ -553,7 +641,7 @@ fn c1_c2_forced_close_with_swap_tx() -> anyhow::Result<()> {
     );
     // The buyer's payout stays in the deposit output. The buyer now holds its full key, and the
     // key is imported into his wallet (F5).
-    assert_eq!(trade.confirmations(trade.buyer_payout), Some(2));
+    assert_eq!(trade.confirmations(trade.buyer_payout), Some(4));
     trade.sync_wallets();
     assert_eq!(
         trade.buyer.wallet.imported_balance().confirmed,
@@ -729,8 +817,8 @@ fn b1_b2_cooperative_close_and_payout_in_the_wallet() -> anyhow::Result<()> {
     trade.close_cooperatively()?;
     // No transaction is needed for the cooperative close. The payouts stay in the deposit.
     trade.env.mine_block()?;
-    assert_eq!(trade.confirmations(trade.buyer_payout), Some(2));
-    assert_eq!(trade.confirmations(trade.seller_payout), Some(2));
+    assert_eq!(trade.confirmations(trade.buyer_payout), Some(4));
+    assert_eq!(trade.confirmations(trade.seller_payout), Some(4));
 
     trade.sync_wallets();
     let buyers_payout = TRADE_AMOUNT + BUYERS_SECURITY_DEPOSIT;
@@ -1043,6 +1131,7 @@ fn f1_penalty_after_cooperative_close() -> anyhow::Result<()> {
 #[test]
 fn d1_custom_payout() -> anyhow::Result<()> {
     let mut trade = Trade::with_confirmed_deposit()?;
+    trade.confirm_deposit()?;
     let sellers_amount = Amount::from_sat(3_000_000);
     // 15 sat per vbyte.
     let fee_rate = FeeRate::from_sat_per_kwu(3_750);
@@ -1121,4 +1210,372 @@ fn imported_payout_key_matches_deposit_payout_descriptor() {
     let desc = deposit_payout_descriptor(&internal_key, buyer_pub_key, seller_pub_key).unwrap();
     assert_eq!(w.imported_keys()[0].script_pubkey(), desc.script_pubkey());
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---- Outcomes of a trade, driven by the reactions of the engines (WP4) ----
+//
+// In the tests below no test code builds or selects a transaction of the trade. After every
+// block each engine gets the facts about the chain from the client of its trader and names the
+// transactions that it wants to send, and these go to the node over the peer-to-peer network.
+
+const fn closed(closure_type: ClosureType) -> TradeState {
+    TradeState::TradeClosed(closure_type)
+}
+
+/// The trader who publishes the warning transaction in a test.
+fn publisher(trade: &mut Trade, buyer_warns: bool) -> &mut Trader {
+    if buyer_warns {
+        &mut trade.buyer
+    } else {
+        &mut trade.seller
+    }
+}
+
+/// The wallet of the trader received `amount` from the transaction that created `outpoint`.
+fn assert_wallet_received(trader: &Trader, outpoint: OutPoint) {
+    assert!(
+        trader
+            .wallet
+            .list_utxos()
+            .iter()
+            .any(|utxo| OutPoint::new(utxo.tx_id, utxo.vout) == outpoint),
+        "the wallet holds the output {outpoint}"
+    );
+}
+
+/// The confirmed transaction that spends `outpoint`, as the client of the trader found it.
+fn spending_tx(trader: &Trader, outpoint: OutPoint) -> Transaction {
+    let found = trader
+        .chain
+        .client
+        .spending_tx(&outpoint)
+        .expect("the client found the spend");
+    (*found.tx).clone()
+}
+
+/// C1, C2, C4 (D7): the seller releases and the buyer does not answer. The seller's engine
+/// publishes the swap transaction on its own when the release safety margin is reached. The
+/// buyer's engine reads the key share from the spend, and the buyer's wallet holds the payout.
+#[test]
+fn outcome_forced_close() -> anyhow::Result<()> {
+    let mut trade = Trade::with_confirmed_deposit()?;
+    trade.start_payment_and_release()?;
+    assert_eq!(trade.seller.model.state(), TradeState::SellerReadyToRelease);
+
+    // The deposit has 3 confirmations and the warning lock time is 5 blocks: 2 blocks remain.
+    // After the next block 1 block remains, which is the release safety margin.
+    let (buyers, sellers) = trade.mine_and_react()?;
+    assert_eq!((buyers, sellers), (vec![], vec![TxKind::Swap]));
+    assert_eq!(trade.seller.model.state(), closed(ClosureType::Forced));
+    assert_eq!(trade.buyer.model.state(), TradeState::BuyerReadyToRelease);
+
+    let (buyers, sellers) = trade.mine_and_react()?;
+    assert_eq!((buyers, sellers), (vec![], vec![]));
+    assert_eq!(trade.buyer.model.state(), closed(ClosureType::Forced));
+    assert_eq!(trade.confirmations(trade.seller_payout), None);
+
+    trade.sync_wallets();
+    assert_eq!(
+        trade.buyer.wallet.imported_balance().confirmed,
+        TRADE_AMOUNT + BUYERS_SECURITY_DEPOSIT
+    );
+    let swap_tx = spending_tx(&trade.seller, trade.seller_payout);
+    assert_eq!(
+        swap_tx.output[0].value,
+        SELLERS_SECURITY_DEPOSIT - fee(FORWARDING_TX_WEIGHT)
+    );
+    assert_wallet_received(&trade.seller, OutPoint::new(swap_tx.compute_txid(), 0));
+
+    // Final after 3 confirmations of the swap transaction.
+    assert!(!trade.seller.model.is_final());
+    trade.env.mine_blocks(2)?;
+    trade.observe();
+    assert!(trade.buyer.model.is_final() && trade.seller.model.is_final());
+    Ok(())
+}
+
+/// D1, D5: both traders sign the custom payout, one of them finalises it, and his engine
+/// publishes it. Both trades close when it is confirmed, and both wallets receive their amount.
+#[test]
+fn outcome_custom_payout() -> anyhow::Result<()> {
+    for seller_finalises in [true, false] {
+        let mut trade = Trade::with_confirmed_deposit()?;
+        trade.confirm_deposit()?;
+        let sellers_amount = Amount::from_sat(3_000_000);
+        for trader in [&mut trade.buyer, &mut trade.seller] {
+            trader
+                .model
+                .sign_custom_payout(&mut trader.wallet, sellers_amount, FEE_RATE)?;
+        }
+        let (finaliser, other) = if seller_finalises {
+            (&mut trade.seller, &mut trade.buyer)
+        } else {
+            (&mut trade.buyer, &mut trade.seller)
+        };
+        let others_psbt = other.model.custom_payout_psbt()?.clone();
+        let custom_payout_tx = finaliser
+            .model
+            .finalize_custom_payout(&mut finaliser.wallet, Ok(others_psbt))?;
+        assert_eq!(finaliser.model.state(), closed(ClosureType::Custom));
+        assert_eq!(other.model.state(), TradeState::CustomPayoutSigned);
+
+        assert_eq!(
+            finaliser.react(&trade.env),
+            vec![TxKind::CustomPayout],
+            "the engine of the trader who finalised publishes the transaction"
+        );
+        assert_eq!(other.react(&trade.env), vec![]);
+        let (buyers, sellers) = trade.mine_and_react()?;
+        assert_eq!((buyers, sellers), (vec![], vec![]));
+        assert_eq!(trade.buyer.model.state(), closed(ClosureType::Custom));
+        assert_eq!(trade.seller.model.state(), closed(ClosureType::Custom));
+
+        trade.sync_wallets();
+        let txid = custom_payout_tx.compute_txid();
+        assert_wallet_received(&trade.buyer, OutPoint::new(txid, 0));
+        assert_wallet_received(&trade.seller, OutPoint::new(txid, 1));
+    }
+    Ok(())
+}
+
+/// E1, E2: a trader asks for his warning transaction, his engine publishes it, and the engine of
+/// the peer answers with the redirect transaction when the warning is confirmed. All funds go to
+/// the redirection receiver.
+#[test]
+fn outcome_redirect() -> anyhow::Result<()> {
+    for buyer_warns in [true, false] {
+        let mut trade = Trade::with_confirmed_deposit()?;
+        trade.confirm_deposit()?;
+        let (warning_state, closure) = if buyer_warns {
+            (TradeState::BuyersWarning, ClosureType::SellersRedirect)
+        } else {
+            (TradeState::SellersWarning, ClosureType::BuyersRedirect)
+        };
+        // The engine refuses the request while the warning transaction is not valid.
+        let refusal = publisher(&mut trade, buyer_warns)
+            .model
+            .start_warning()
+            .expect_err("the warning lock time has not passed");
+        assert!(
+            refusal.to_string().contains("valid in 2 blocks"),
+            "{refusal}"
+        );
+
+        trade.wait_for_warning_lock_time()?;
+        let warning_tx = publisher(&mut trade, buyer_warns).model.start_warning()?;
+        let sent = if buyer_warns {
+            trade.buyer.react(&trade.env)
+        } else {
+            trade.seller.react(&trade.env)
+        };
+        assert_eq!(sent, vec![TxKind::Warning]);
+
+        // The warning is confirmed: the peer's engine answers with the redirect.
+        let (buyers, sellers) = trade.mine_and_react()?;
+        let (publishers, peers) = if buyer_warns {
+            (buyers, sellers)
+        } else {
+            (sellers, buyers)
+        };
+        assert_eq!((publishers, peers), (vec![], vec![TxKind::Redirect]));
+        assert_eq!(trade.buyer.model.state(), warning_state);
+        assert_eq!(trade.seller.model.state(), warning_state);
+
+        let (buyers, sellers) = trade.mine_and_react()?;
+        assert_eq!((buyers, sellers), (vec![], vec![]));
+        assert_eq!(trade.buyer.model.state(), closed(closure));
+        assert_eq!(trade.seller.model.state(), closed(closure));
+        let redirect_tx = spending_tx(&trade.buyer, Trade::escrow(&warning_tx));
+        assert_eq!(
+            trade.unspent_output(OutPoint::new(redirect_tx.compute_txid(), 0)),
+            Some((trade.redirection_receiver.amount, 1)),
+            "the redirection receiver gets the funds"
+        );
+    }
+    Ok(())
+}
+
+/// E3, E4, E5 (D3): a trader publishes his warning transaction, and the peer does not react. The
+/// publisher's engine claims the funds through the script path when the claim lock time has
+/// passed, and his wallet receives them. The peer's engine reports the loss when it runs again.
+#[test]
+fn outcome_claim() -> anyhow::Result<()> {
+    for buyer_warns in [true, false] {
+        let mut trade = Trade::with_confirmed_deposit()?;
+        trade.confirm_deposit()?;
+        trade.wait_for_warning_lock_time()?;
+        let closure = if buyer_warns {
+            ClosureType::BuyersClaim
+        } else {
+            ClosureType::SellersClaim
+        };
+        let Trade {
+            env, buyer, seller, ..
+        } = &mut trade;
+        let (publisher, peer) = if buyer_warns {
+            (buyer, seller)
+        } else {
+            (seller, buyer)
+        };
+        let warning_tx = publisher.model.start_warning()?;
+        assert_eq!(publisher.react(env), vec![TxKind::Warning]);
+
+        // The peer is not running. The claim is valid when the warning has as many
+        // confirmations as the claim lock time.
+        for _ in 1..CLAIM_LOCK_TIME {
+            env.mine_block()?;
+            assert_eq!(
+                publisher.react(env),
+                vec![],
+                "the claim lock time has not passed"
+            );
+        }
+        env.mine_block()?;
+        assert_eq!(publisher.react(env), vec![TxKind::Claim]);
+        env.mine_block()?;
+        assert_eq!(publisher.react(env), vec![]);
+        assert_eq!(publisher.model.state(), closed(closure));
+
+        let escrow = Trade::escrow(&warning_tx);
+        let claim_tx = spending_tx(publisher, escrow);
+        assert_eq!(claim_tx.input[0].witness.len(), 3, "script path spend");
+        let wallet = &mut publisher.wallet;
+        publisher.chain.sync(env, wallet);
+        assert_wallet_received(publisher, OutPoint::new(claim_tx.compute_txid(), 0));
+
+        // The peer starts again and learns what happened.
+        let events = peer.observe(env);
+        assert_eq!(peer.model.state(), closed(closure));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TradeEvent::Loss(_))),
+            "{events:?}"
+        );
+        assert_eq!(peer.model.transactions_to_send(FEE_RATE), vec![]);
+    }
+    Ok(())
+}
+
+/// F1, M1 (D8): after a cooperative close one trader publishes his warning transaction. The
+/// engine of the other trader, which still watches the closed trade, answers with the penalty
+/// transaction and takes all funds.
+#[test]
+fn outcome_penalty() -> anyhow::Result<()> {
+    for buyer_cheats in [true, false] {
+        let mut trade = Trade::with_confirmed_deposit()?;
+        trade.close_cooperatively()?;
+        trade.wait_for_warning_lock_time()?;
+        let closure = if buyer_cheats {
+            ClosureType::SellersPenaltyTx
+        } else {
+            ClosureType::BuyersPenaltyTx
+        };
+        let cheater = if buyer_cheats {
+            &mut trade.buyer
+        } else {
+            &mut trade.seller
+        };
+        // The engine refuses to publish the warning of a closed trade, so the cheater sends the
+        // transaction to the node in another way.
+        assert!(cheater.model.start_warning().is_err());
+        let warning_tx = cheater.model.my_signed_warning_tx()?.clone();
+        trade.broadcast(&warning_tx).map_err(anyhow::Error::msg)?;
+
+        let (buyers, sellers) = trade.mine_and_react()?;
+        let (cheaters, victims) = if buyer_cheats {
+            (buyers, sellers)
+        } else {
+            (sellers, buyers)
+        };
+        assert_eq!((cheaters, victims), (vec![], vec![TxKind::Penalty]));
+
+        let (buyers, sellers) = trade.mine_and_react()?;
+        assert_eq!((buyers, sellers), (vec![], vec![]));
+        assert_eq!(trade.buyer.model.state(), closed(closure));
+        assert_eq!(trade.seller.model.state(), closed(closure));
+
+        trade.sync_wallets();
+        let victim = if buyer_cheats {
+            &trade.seller
+        } else {
+            &trade.buyer
+        };
+        let penalty_tx = spending_tx(victim, Trade::escrow(&warning_tx));
+        assert_eq!(
+            penalty_tx.output[0].value,
+            escrow_amount() - fee(FORWARDING_TX_WEIGHT)
+        );
+        assert_wallet_received(victim, OutPoint::new(penalty_tx.compute_txid(), 0));
+    }
+    Ok(())
+}
+
+/// A13, J2: after both traders signed the deposit transaction, the seller spends his deposit coin
+/// in another transaction, and that transaction is confirmed. The deposit can never confirm. The
+/// buyer's engine closes the trade as `DepositAborted`, and the buyer's coin is free again.
+#[test]
+fn outcome_deposit_aborted_by_a_conflicting_spend() -> anyhow::Result<()> {
+    let mut env = TestEnv::new()?;
+    let mut buyer = Trader::new(&mut env, Role::BuyerAsTaker);
+    let mut seller = Trader::new(&mut env, Role::SellerAsMaker);
+    seller.receive_key_shares(&buyer);
+    buyer.receive_key_shares(&seller);
+    let redirection_amount_msat = buyer.model.redirection_amount_msat()?;
+    let receivers = Receiver::compute_receivers_from_shares(
+        vec![(env.new_address()?, 1.0)],
+        redirection_amount_msat,
+        FEE_RATE,
+    )
+    .expect("the redirection amount is large enough for one receiver");
+    let receiver = Receiver {
+        address: receivers[0].address.as_unchecked().clone(),
+        amount: receivers[0].amount,
+    };
+    buyer.receive_nonce_shares(&seller, std::slice::from_ref(&receiver));
+    seller.receive_nonce_shares(&buyer, std::slice::from_ref(&receiver));
+    let buyers_partial_signatures = buyer.sent_partial_signatures();
+    let sellers_partial_signatures = seller.sent_partial_signatures();
+    seller.receive_partial_signatures(buyers_partial_signatures);
+    buyer.receive_partial_signatures(sellers_partial_signatures);
+    buyer.watch_trade();
+    seller.watch_trade();
+    buyer.assert_coins_reserved(true);
+    assert_eq!(buyer.observe(&env), vec![]);
+
+    // The seller releases his coin by hand and pays it to another address.
+    let sellers_coin = seller.model.reserved_coins()[0];
+    seller.wallet.unlock_utxo(sellers_coin)?;
+    let payment =
+        seller
+            .wallet
+            .send_to_address(&env.new_address()?, Amount::from_sat(100_000), FEE_RATE)?;
+    assert!(
+        payment
+            .input
+            .iter()
+            .any(|input| input.previous_output == sellers_coin)
+    );
+    send_to_node(&env, &payment).map_err(anyhow::Error::msg)?;
+    env.mine_block()?;
+
+    let events = buyer.observe(&env);
+    let aborted = closed(ClosureType::DepositAborted);
+    assert_eq!(
+        events,
+        vec![TradeEvent::StateChanged {
+            from: TradeState::Deposit,
+            to: aborted,
+        }]
+    );
+    assert_eq!(buyer.model.state(), aborted);
+    buyer.assert_coins_reserved(false);
+    assert_eq!(buyer.model.transactions_to_send(FEE_RATE), vec![]);
+    // The buyer can use his coin again.
+    let buyers_payment =
+        buyer
+            .wallet
+            .send_to_address(&env.new_address()?, Amount::from_sat(100_000), FEE_RATE)?;
+    send_to_node(&env, &buyers_payment).map_err(anyhow::Error::msg)?;
+    Ok(())
 }

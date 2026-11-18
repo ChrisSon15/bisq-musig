@@ -6,7 +6,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .serde_serialized_types(&[
             "ReceiverAddressAndAmount", "PartialSignaturesRequest", "DepositTxSignatureRequest",
             "PublishDepositTxRequest", "SubscribeTxConfirmationStatusRequest", "ContractualTxIds",
-            "CustomPayoutPsbtRequest", "AbandonTradeRequest", "AbandonTradeResponse"
+            "CustomPayoutPsbtRequest", "AbandonTradeRequest", "AbandonTradeResponse",
+            "PublishWarningTxRequest", "SubscribeTradeEventsRequest", "TradeEvent"
         ])
         .serde_serialized_type("PubKeySharesRequest", &[
             enum_field("myRole", "Role")
@@ -59,6 +60,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ])
         .serde_serialized_type("CustomCloseTradeResponse", &[
             hex("customPayoutTx")
+        ])
+        .serde_serialized_type("PublishWarningTxResponse", &[
+            hex("warningTx")
         ])
 
         // ...and for the bisq2-facing `wallet` (BMPWallet) types.

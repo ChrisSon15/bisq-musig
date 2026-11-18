@@ -25,6 +25,16 @@ service Musig {
   // Ends a trade whose deposit transaction the trader has not signed yet, and releases the coins of the wallet that
   // were reserved for it. Refused in every later state.
   rpc AbandonTrade (AbandonTradeRequest) returns (AbandonTradeResponse);
+
+  // Starts a dispute: the trader decides to publish his warning transaction. Refused unless the trade is open, the
+  // deposit transaction has as many confirmations as the warning lock time, and both payouts are unspent. The service
+  // sends the transaction and sends it again until a warning transaction is confirmed.
+  rpc PublishWarningTx (PublishWarningTxRequest) returns (PublishWarningTxResponse);
+
+  // The events of one trade. The first event reports the current state of the trade. Later events report every change
+  // of the state, every transaction that the service sends for the trade, a loss, an event on the chain that the
+  // service does not expect, and the start and the end of a problem with the peers of the Bitcoin network.
+  rpc SubscribeTradeEvents (SubscribeTradeEventsRequest) returns (stream TradeEvent);
 }
 
 // TODO: Same as 'trade.TradeRole' from Bisq2 protos (minus 'UNSPECIFIED' variant, which should probably be added):
@@ -186,4 +196,86 @@ message AbandonTradeRequest {
 }
 
 message AbandonTradeResponse {
+}
+
+message PublishWarningTxRequest {
+  string tradeId = 1;
+}
+
+message PublishWarningTxResponse {
+  bytes warningTx = 1;
+}
+
+message SubscribeTradeEventsRequest {
+  string tradeId = 1;
+}
+
+enum TradeEventType {
+  // The state of the trade: the first event of a stream, and every change of the state. After a reorganisation of the
+  // chain the new state can be an earlier state of the trade.
+  STATE = 0;
+  // The service sent a transaction of the trade to the network. This does not mean that a node accepted it.
+  TX_SENT = 1;
+  // The peer took funds of the trader with a claim or a penalty transaction.
+  LOSS = 2;
+  // Something happened on the chain that the service does not expect. No state changed.
+  UNEXPECTED = 3;
+  // No peer of the Bitcoin network is reachable, or no peer serves compact block filters. The chain is not observed
+  // and nothing can be sent until the event CHAIN_PROBLEM_OVER.
+  CHAIN_PROBLEM = 4;
+  CHAIN_PROBLEM_OVER = 5;
+}
+
+enum TradeStateKind {
+  INIT = 0;
+  DEPOSIT = 1;
+  BUYER_READY_TO_RELEASE = 2;
+  SELLER_READY_TO_RELEASE = 3;
+  CUSTOM_PAYOUT_SIGNED = 4;
+  BUYERS_WARNING = 5;
+  SELLERS_WARNING = 6;
+  TRADE_CLOSED = 7;
+}
+
+enum ClosureKind {
+  COOPERATIVE = 0;
+  FORCED = 1;
+  CUSTOM = 2;
+  BUYERS_REDIRECT = 3;
+  SELLERS_REDIRECT = 4;
+  BUYERS_CLAIM = 5;
+  SELLERS_CLAIM = 6;
+  BUYERS_PENALTY_TX = 7;
+  SELLERS_PENALTY_TX = 8;
+  ABANDONED = 9;
+  DEPOSIT_ABORTED = 10;
+}
+
+enum TradeTxKind {
+  DEPOSIT_TX = 0;
+  DEPOSIT_ABORT_TX = 1;
+  SWAP_TX = 2;
+  CUSTOM_PAYOUT_TX = 3;
+  WARNING_TX = 4;
+  REDIRECT_TX = 5;
+  CLAIM_TX = 6;
+  PENALTY_TX = 7;
+}
+
+message TradeEvent {
+  string tradeId = 1;
+  TradeEventType type = 2;
+  // The height of the chain as the service sees it, or 0 if the chain is not known.
+  uint32 currentBlockHeight = 3;
+  // The state of the trade after the event. It is set in every event.
+  TradeStateKind state = 4;
+  // Set if the state is TRADE_CLOSED.
+  optional ClosureKind closureType = 5;
+  // Whether nothing can change for the trade any more.
+  bool final = 6;
+  // Set in an event of the type TX_SENT.
+  optional TradeTxKind txKind = 7;
+  optional string txId = 8;
+  // A description, in an event of the type LOSS, UNEXPECTED or CHAIN_PROBLEM.
+  optional string message = 9;
 }

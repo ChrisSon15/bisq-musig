@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::marker::Send;
@@ -8,13 +9,14 @@ use std::time::Duration;
 
 use bdk_wallet::bitcoin::{Amount, FeeRate, Psbt, Transaction, Txid, consensus};
 use bdk_wallet::serde_json;
-use chain::client::{ChainAccess, ClientError};
+use chain::client::{ChainAccess, ClientError, PeerProblem};
 use drop_stream::DropStreamExt as _;
-use futures_util::stream::{self, BoxStream, Stream, TryStream, TryStreamExt as _};
+use futures_util::stream::{self, BoxStream, Stream, StreamExt as _, TryStream, TryStreamExt as _};
 use musig2::PartialSignature;
 use musig2::secp::Scalar;
-use protocol::params::{EngineConfig, TradeParams};
-use protocol::state::TradeState;
+use protocol::chain_facts::{ChainFacts, TradeEvent as EngineEvent, TxKind, TxToSend};
+use protocol::params::{EngineConfig, TradeParams, engine_fee_rate};
+use protocol::state::{ClosureType, TradeState};
 use protocol::storage::ByVal;
 use protocol::trade_model::{
     ExchangedKeys, ExchangedSigs, PeerData, ProtocolErrorKind, TradeModel, TradeModelStore,
@@ -22,6 +24,7 @@ use protocol::trade_model::{
 };
 use serde::Serialize;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{Notify, broadcast};
 use tonic::{Request, Response, Result, Status};
 use tracing::{Span, debug, error, info, instrument, trace, warn};
 use wallet::protocol_wallet_api::ProtocolWalletApi;
@@ -29,12 +32,14 @@ use wallet::protocol_wallet_api::ProtocolWalletApi;
 use crate::pb::convert::{CheckInSignedRange as _, TryProtoInto};
 pub use crate::pb::musigrpc::musig_server::MusigServer;
 use crate::pb::musigrpc::{
-    AbandonTradeRequest, AbandonTradeResponse, CloseTradeRequest, CloseTradeResponse,
+    AbandonTradeRequest, AbandonTradeResponse, CloseTradeRequest, CloseTradeResponse, ClosureKind,
     CustomCloseTradeRequest, CustomCloseTradeResponse, CustomPayoutPsbt, CustomPayoutPsbtRequest,
     DepositPsbt, DepositTxSignatureRequest, NonceSharesMessage, NonceSharesRequest,
     PartialSignaturesMessage, PartialSignaturesRequest, PubKeySharesRequest, PubKeySharesResponse,
-    PublishDepositTxRequest, SubscribeTxConfirmationStatusRequest, SwapTxSignatureRequest,
-    SwapTxSignatureResponse, TxConfirmationStatus, musig_server,
+    PublishDepositTxRequest, PublishWarningTxRequest, PublishWarningTxResponse,
+    SubscribeTradeEventsRequest, SubscribeTxConfirmationStatusRequest, SwapTxSignatureRequest,
+    SwapTxSignatureResponse, TradeEvent, TradeEventType, TradeStateKind, TradeTxKind,
+    TxConfirmationStatus, musig_server,
 };
 
 /// An operation of the trade service that needs the wallet of the trader.
@@ -70,7 +75,14 @@ pub struct MusigImpl {
     /// The access to the chain. Without it the service can set up a trade, but it cannot
     /// publish or observe the deposit transaction.
     chain: Option<Arc<dyn ChainAccess>>,
+    /// The events of all trades, for the streams of `SubscribeTradeEvents`.
+    events: broadcast::Sender<TradeEvent>,
+    /// Wakes the task that watches the trades, after a request has changed a trade.
+    wake_watcher: Arc<Notify>,
 }
+
+/// The number of trade events that a slow subscriber can fall behind before it loses events.
+const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 impl MusigImpl {
     pub fn new(
@@ -83,12 +95,25 @@ impl MusigImpl {
             wallet,
             config,
             chain: None,
+            events: broadcast::channel(EVENT_CHANNEL_CAPACITY).0,
+            wake_watcher: Arc::new(Notify::new()),
         }
     }
 
-    /// Supplies the access to the chain.
+    /// Supplies the access to the chain, and starts the task that watches the trades on the
+    /// chain and sends their transactions.
+    ///
+    /// # Panics
+    /// If it is called outside of a Tokio runtime.
     #[must_use]
     pub fn with_chain(mut self, chain: Arc<dyn ChainAccess>) -> Self {
+        tokio::spawn(watch_trades(
+            Arc::clone(&self.trades),
+            Arc::clone(&self.wallet),
+            Arc::clone(&chain),
+            self.events.clone(),
+            Arc::clone(&self.wake_watcher),
+        ));
         self.chain = Some(chain);
         self
     }
@@ -175,7 +200,20 @@ impl MusigImpl {
                             ))
                         })?;
                 let mut trade_model = trade_model.lock().unwrap();
+                let state_before = trade_model.state();
+                // The engine checks the chain conditions of a request against the facts that it
+                // was told last, so it is told the current facts first.
+                if let Some(chain) = &self.chain {
+                    observe_chain(&**chain, &mut trade_model, wallet, &self.events);
+                }
                 let result = handler(request, &mut trade_model, wallet);
+                if trade_model.state() != state_before {
+                    let event =
+                        trade_event(&trade_model, self.chain.as_deref(), TradeEventType::State);
+                    let _ = self.events.send(event);
+                }
+                // A request can give the trade a transaction to send.
+                self.wake_watcher.notify_one();
                 // A setup that the engine terminated in this request is abandoned, which
                 // releases its reserved coins.
                 if let Err(error) = trade_model.abandon_terminated_setup(wallet) {
@@ -340,7 +378,6 @@ impl musig_server::Musig for MusigImpl {
         // Checked first: without a peer that the transaction can be sent to, the request changes
         // nothing.
         let chain = self.chain_for_sending()?;
-        let deposit_timeout = self.config.deposit_timeout();
         self.handle_trade_request(request, move |request, trade_model, wallet| {
             let peers_deposit_psbt = request
                 .peers_deposit_psbt
@@ -351,12 +388,9 @@ impl musig_server::Musig for MusigImpl {
             for (outpoint, script) in trade_model.outputs_to_watch()? {
                 chain.watch_output(outpoint, script);
             }
-            // The sending continues when the caller drops the stream of this response.
-            tokio::spawn(send_until_confirmed(
-                Arc::clone(&chain),
-                deposit_tx.clone(),
-                u32::from(deposit_timeout),
-            ));
+            // The task that watches the trades sends the transaction, and sends it again until
+            // it is confirmed or the deposit timeout has passed. This does not depend on the
+            // stream of this response.
 
             Ok(tx_confirmation_status_stream(
                 chain,
@@ -449,9 +483,8 @@ impl musig_server::Musig for MusigImpl {
             } else {
                 // Peer unresponsive -- force-close our trade by publishing the swap tx. For seller
                 // only.
+                // The task that watches the trades sends the swap transaction.
                 trade_model.close_by_force()?;
-
-                info!("*** BROADCAST SWAP TX ***"); // TODO: Implement broadcast.
             }
             let my_prv_key_share = trade_model.my_private_key_share_for_peer_output().ok();
             // We could use `oneof` in the proto for these fields, instead of a (wire-compatible)
@@ -508,9 +541,8 @@ impl musig_server::Musig for MusigImpl {
                 .peers_custom_payout_psbt
                 .try_proto_into()
                 .peer_data();
+            // The task that watches the trades sends the custom payout transaction.
             let custom_payout_tx = trade_model.finalize_custom_payout(wallet, peers_psbt)?;
-
-            info!("*** BROADCAST CUSTOM PAYOUT TX ***"); // TODO: Implement broadcast.
 
             Ok(CustomCloseTradeResponse {
                 custom_payout_tx: consensus::serialize(&custom_payout_tx),
@@ -531,6 +563,41 @@ impl musig_server::Musig for MusigImpl {
         })
         .await
     }
+
+    #[instrument(skip_all)]
+    async fn publish_warning_tx(
+        &self,
+        request: Request<PublishWarningTxRequest>,
+    ) -> Result<Response<PublishWarningTxResponse>> {
+        // Checked first: the decision to start a dispute is not taken while the transaction
+        // cannot be sent.
+        self.chain_for_sending()?;
+        self.handle_trade_request(request, |_request, trade_model, _wallet| {
+            // The task that watches the trades sends the warning transaction.
+            let warning_tx = trade_model.start_warning()?;
+
+            Ok(PublishWarningTxResponse {
+                warning_tx: consensus::serialize(&warning_tx),
+            })
+        })
+        .await
+    }
+
+    type SubscribeTradeEventsStream = TracedResultStream<TradeEvent>;
+
+    #[instrument(skip_all)]
+    async fn subscribe_trade_events(
+        &self,
+        request: Request<SubscribeTradeEventsRequest>,
+    ) -> Result<Response<Self::SubscribeTradeEventsStream>> {
+        // Subscribed before the state is read, so that no change of the state is lost.
+        let events = self.events.subscribe();
+        self.handle_trade_request(request, move |request, trade_model, _wallet| {
+            let first = trade_event(trade_model, self.chain.as_deref(), TradeEventType::State);
+            Ok(trade_event_stream(request.trade_id, first, events).box_traced())
+        })
+        .await
+    }
 }
 
 /// The number of confirmations at which a transaction counts as confirmed.
@@ -538,64 +605,255 @@ const MIN_CONFIRMATIONS: u32 = protocol::params::MIN_CONFIRMATIONS as u32;
 
 /// The pause before a transaction that could not be sent is sent again.
 const SEND_RETRY_DELAY: Duration = Duration::from_secs(5);
+/// The longest time between two looks at the trades, also without an event of the chain.
+const WATCH_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Sends a transaction to the network, and again after every new block in which it was not
-/// confirmed, because a broadcast has no result: the engine does not learn whether a node
-/// accepted the transaction. A sending that fails, for example while no peer is reachable, is
-/// tried again after a pause. The sending ends when the transaction counts as confirmed, or
-/// after `max_blocks` blocks without that.
-async fn send_until_confirmed(chain: Arc<dyn ChainAccess>, tx: Transaction, max_blocks: u32) {
-    let txid = tx.compute_txid();
-    let mut events = chain.subscribe();
-    let start_height = chain.tip_height();
-    let mut last_sent_at = None;
+/// Reads the facts about the chain for one trade. `None` if the chain is not known yet, or if
+/// the trader has not signed the deposit transaction, so that there is nothing to observe.
+fn chain_facts(chain: &dyn ChainAccess, trade_model: &TradeModel) -> Option<ChainFacts> {
+    let tip_height = chain.tip_height()?;
+    let deposit_txid = trade_model.deposit_txid().ok()?;
+    let outputs = trade_model.outputs_to_watch().ok()?;
+    Some(ChainFacts::collect(
+        tip_height,
+        &deposit_txid,
+        outputs.into_iter().map(|(outpoint, _)| outpoint),
+        |txid| chain.confirmations(txid),
+        |outpoint| chain.spending_tx(outpoint).map(|found| found.tx),
+    ))
+}
+
+/// Tells the engine the current facts about the chain for one trade, and publishes the events
+/// that follow.
+fn observe_chain(
+    chain: &dyn ChainAccess,
+    trade_model: &mut TradeModel,
+    wallet: &mut dyn ProtocolWalletApi,
+    events: &broadcast::Sender<TradeEvent>,
+) {
+    let Some(facts) = chain_facts(chain, trade_model) else {
+        return;
+    };
+    for event in trade_model.observe_chain(wallet, facts) {
+        let (event_type, message) = match event {
+            EngineEvent::StateChanged { .. } => (TradeEventType::State, None),
+            EngineEvent::Loss(loss) => (TradeEventType::Loss, Some(loss)),
+            EngineEvent::Unexpected(what) => (TradeEventType::Unexpected, Some(what)),
+            _ => continue,
+        };
+        if let Some(message) = &message {
+            warn!(
+                trade_id = trade_model.trade_id(),
+                ?event_type,
+                message,
+                "Trade event."
+            );
+        }
+        // An error means that nobody is subscribed.
+        let _ = events.send(TradeEvent {
+            message,
+            ..trade_event(trade_model, Some(chain), event_type)
+        });
+    }
+}
+
+/// An event of a trade with the current state of the trade.
+fn trade_event(
+    trade_model: &TradeModel,
+    chain: Option<&dyn ChainAccess>,
+    event_type: TradeEventType,
+) -> TradeEvent {
+    let (state, closure_type) = match trade_model.state() {
+        TradeState::Init => (TradeStateKind::Init, None),
+        TradeState::Deposit => (TradeStateKind::Deposit, None),
+        TradeState::BuyerReadyToRelease => (TradeStateKind::BuyerReadyToRelease, None),
+        TradeState::SellerReadyToRelease => (TradeStateKind::SellerReadyToRelease, None),
+        TradeState::CustomPayoutSigned => (TradeStateKind::CustomPayoutSigned, None),
+        TradeState::BuyersWarning => (TradeStateKind::BuyersWarning, None),
+        TradeState::SellersWarning => (TradeStateKind::SellersWarning, None),
+        TradeState::TradeClosed(closure_type) => (
+            TradeStateKind::TradeClosed,
+            Some(match closure_type {
+                ClosureType::Cooperative => ClosureKind::Cooperative,
+                ClosureType::Forced => ClosureKind::Forced,
+                ClosureType::Custom => ClosureKind::Custom,
+                ClosureType::BuyersRedirect => ClosureKind::BuyersRedirect,
+                ClosureType::SellersRedirect => ClosureKind::SellersRedirect,
+                ClosureType::BuyersClaim => ClosureKind::BuyersClaim,
+                ClosureType::SellersClaim => ClosureKind::SellersClaim,
+                ClosureType::BuyersPenaltyTx => ClosureKind::BuyersPenaltyTx,
+                ClosureType::SellersPenaltyTx => ClosureKind::SellersPenaltyTx,
+                ClosureType::Abandoned => ClosureKind::Abandoned,
+                ClosureType::DepositAborted => ClosureKind::DepositAborted,
+            }),
+        ),
+    };
+    TradeEvent {
+        trade_id: trade_model.trade_id().to_owned(),
+        r#type: event_type.into(),
+        current_block_height: chain.and_then(ChainAccess::tip_height).unwrap_or(0),
+        state: state.into(),
+        closure_type: closure_type.map(Into::into),
+        r#final: trade_model.is_final(),
+        tx_kind: None,
+        tx_id: None,
+        message: None,
+    }
+}
+
+const fn tx_kind(kind: TxKind) -> TradeTxKind {
+    match kind {
+        TxKind::Deposit => TradeTxKind::DepositTx,
+        TxKind::DepositAbort => TradeTxKind::DepositAbortTx,
+        TxKind::Swap => TradeTxKind::SwapTx,
+        TxKind::CustomPayout => TradeTxKind::CustomPayoutTx,
+        TxKind::Warning => TradeTxKind::WarningTx,
+        TxKind::Redirect => TradeTxKind::RedirectTx,
+        TxKind::Claim => TradeTxKind::ClaimTx,
+        TxKind::Penalty => TradeTxKind::PenaltyTx,
+    }
+}
+
+/// Watches all trades on the chain for the lifetime of the service (D7, D8).
+///
+/// After every event of the chain, after every request for a trade, and at least every
+/// [`WATCH_INTERVAL`], each trade that is not final is told the facts about the chain. The
+/// transactions that its engine then names are sent to the network: the deposit, the reactions to
+/// a warning transaction of the peer, the claim, the swap transaction, the custom payout.
+///
+/// A broadcast has no result (N2), so a transaction is sent again after every new block, as long
+/// as the engine names it. A sending that fails, for example while no peer is reachable, is
+/// tried again after [`SEND_RETRY_DELAY`].
+async fn watch_trades(
+    trades: Arc<dyn TradeModelStore>,
+    wallet: Arc<dyn TradeWalletProvider>,
+    chain: Arc<dyn ChainAccess>,
+    events: broadcast::Sender<TradeEvent>,
+    wake: Arc<Notify>,
+) {
+    let mut chain_events = chain.subscribe();
+    // The height of the chain at which a transaction was sent last.
+    let mut sent_at: HashMap<Txid, Option<u32>> = HashMap::new();
+    let mut reported_problem: Option<PeerProblem> = None;
     loop {
+        let problem = chain.peer_problem();
+        if problem != reported_problem {
+            report_chain_problem(&*trades, &*chain, &events, problem);
+            reported_problem = problem;
+        }
+
+        // The wallet is locked before a trade, as in the requests.
+        let mut to_send: Vec<(TradeEvent, TxToSend)> = Vec::new();
+        wallet
+            .with_trade_wallet(&mut |wallet| {
+                for trade_model in trades.trade_models() {
+                    let mut trade_model = trade_model.lock().unwrap();
+                    if trade_model.is_final() {
+                        continue;
+                    }
+                    observe_chain(&*chain, &mut trade_model, wallet, &events);
+                    for tx in trade_model.transactions_to_send(engine_fee_rate()) {
+                        let event =
+                            trade_event(&trade_model, Some(&*chain), TradeEventType::TxSent);
+                        to_send.push((event, tx));
+                    }
+                }
+            })
+            .await;
+
         let height = chain.tip_height();
-        let confirmations = chain.confirmations(&txid);
-        if confirmations >= MIN_CONFIRMATIONS {
-            info!(%txid, "The transaction is confirmed.");
-            return;
-        }
-        let blocks_passed = start_height
-            .zip(height)
-            .map_or(0, |(start, height)| height.saturating_sub(start));
-        if blocks_passed > max_blocks {
-            warn!(%txid, max_blocks, "The transaction is not confirmed. Sending ends.");
-            return;
-        }
         let mut failed = false;
-        if confirmations == 0 && last_sent_at != Some(height) {
-            match chain.broadcast(tx.clone()).await {
+        for (event, TxToSend { kind, tx }) in to_send {
+            let txid = tx.compute_txid();
+            if sent_at.get(&txid) == Some(&height) {
+                continue;
+            }
+            match chain.broadcast(tx).await {
                 // "Sent" does not mean that a node accepted the transaction.
                 Ok(_) => {
-                    info!(%txid, ?height, "Sent the transaction to the network.");
-                    last_sent_at = Some(height);
+                    info!(trade_id = event.trade_id, ?kind, %txid, ?height, "Sent a transaction.");
+                    sent_at.insert(txid, height);
+                    let _ = events.send(TradeEvent {
+                        tx_kind: Some(tx_kind(kind).into()),
+                        tx_id: Some(txid.to_string()),
+                        ..event
+                    });
                 }
                 // The peer has the transaction already, or it has rejected it since the last
                 // block. It is announced again after the next block.
                 Err(ClientError::NotRequested(_)) => {
                     debug!(%txid, ?height, "No peer asked for the announced transaction.");
-                    last_sent_at = Some(height);
+                    sent_at.insert(txid, height);
                 }
                 Err(error) => {
-                    warn!(%txid, %error, "Could not send the transaction. Trying again.");
+                    warn!(?kind, %txid, %error, "Could not send a transaction. Trying again.");
                     failed = true;
                 }
             }
         }
-        let event = if failed {
-            match tokio::time::timeout(SEND_RETRY_DELAY, events.recv()).await {
-                Ok(event) => event,
-                Err(_) => continue,
-            }
+
+        let pause = if failed {
+            SEND_RETRY_DELAY
         } else {
-            events.recv().await
+            WATCH_INTERVAL
         };
-        match event {
-            Ok(_) | Err(RecvError::Lagged(_)) => {}
-            Err(RecvError::Closed) => return,
+        tokio::select! {
+            event = chain_events.recv() => {
+                if matches!(event, Err(RecvError::Closed)) {
+                    return;
+                }
+            }
+            () = wake.notified() => {}
+            () = tokio::time::sleep(pause) => {}
         }
     }
+}
+
+/// Tells the subscribers of all trades that are not final about the start or the end of a
+/// problem with the peers (D21): while it lasts, the chain is not observed.
+fn report_chain_problem(
+    trades: &dyn TradeModelStore,
+    chain: &dyn ChainAccess,
+    events: &broadcast::Sender<TradeEvent>,
+    problem: Option<PeerProblem>,
+) {
+    let event_type = if problem.is_some() {
+        TradeEventType::ChainProblem
+    } else {
+        TradeEventType::ChainProblemOver
+    };
+    for trade_model in trades.trade_models() {
+        let trade_model = trade_model.lock().unwrap();
+        if trade_model.is_final() {
+            continue;
+        }
+        let _ = events.send(TradeEvent {
+            message: problem.map(|problem| problem.to_string()),
+            ..trade_event(&trade_model, Some(chain), event_type)
+        });
+    }
+}
+
+/// The events of one trade: first the event `first`, then the events of the trade as they
+/// happen.
+fn trade_event_stream(
+    trade_id: String,
+    first: TradeEvent,
+    events: broadcast::Receiver<TradeEvent>,
+) -> impl Stream<Item = Result<TradeEvent>> {
+    let later = stream::unfold((events, trade_id), |(mut events, trade_id)| async move {
+        loop {
+            match events.recv().await {
+                Ok(event) if event.trade_id == trade_id => {
+                    return Some((Ok(event), (events, trade_id)));
+                }
+                // An event of another trade, or events that this subscriber lost.
+                Ok(_) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => return None,
+            }
+        }
+    });
+    stream::once(async move { Ok(first) }).chain(later)
 }
 
 /// The events about the confirmation of a transaction: one event for every change of its number
@@ -730,6 +988,8 @@ impl_musig_req!(SwapTxSignatureRequest);
 impl_musig_req!(CloseTradeRequest);
 impl_musig_req!(CustomPayoutPsbtRequest);
 impl_musig_req!(CustomCloseTradeRequest);
+impl_musig_req!(PublishWarningTxRequest);
+impl_musig_req!(SubscribeTradeEventsRequest);
 
 /// The error of a `musigrpc.Musig` handler. The trade engine does not know gRPC, so its errors
 /// are converted to a status here, when the response is sent.

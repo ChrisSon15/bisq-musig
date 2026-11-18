@@ -1,3 +1,4 @@
+pub mod chain_facts;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mocks;
 pub mod multisig;

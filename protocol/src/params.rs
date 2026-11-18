@@ -120,6 +120,16 @@ impl EngineConfig {
         LockTime::from_height(self.claim_lock_time)
     }
 
+    /// The warning lock time as a number of blocks.
+    pub const fn warning_lock_time_blocks(&self) -> u16 {
+        self.warning_lock_time
+    }
+
+    /// The claim lock time as a number of blocks.
+    pub const fn claim_lock_time_blocks(&self) -> u16 {
+        self.claim_lock_time
+    }
+
     pub const fn deposit_timeout(&self) -> u16 {
         self.deposit_timeout
     }

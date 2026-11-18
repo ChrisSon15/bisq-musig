@@ -23,8 +23,9 @@ use thiserror::Error;
 use tracing::{error, info, instrument};
 use wallet::protocol_wallet_api::ProtocolWalletApi;
 
+use crate::chain_facts::{ChainFacts, Spend, TradeEvent, TxKind, TxToSend};
 use crate::multisig::{KeyCtx, KeyPair, PointExt as _, SigCtx};
-use crate::params::{EngineConfig, REDIRECT_LOCK_TIME, TradeParams};
+use crate::params::{EngineConfig, MIN_CONFIRMATIONS, REDIRECT_LOCK_TIME, TradeParams};
 use crate::receiver::{Receiver, ReceiverList};
 use crate::script_paths;
 use crate::state::{ClosureType, TradeState};
@@ -45,6 +46,9 @@ pub trait TradeModelStore: Send + Sync {
     fn add_trade_model(&self, trade_model: TradeModel) -> Result<()>;
 
     fn get_trade_model(&self, trade_id: &str) -> Option<Arc<Mutex<TradeModel>>>;
+
+    /// All trades of the store.
+    fn trade_models(&self) -> Vec<Arc<Mutex<TradeModel>>>;
 
     /// The ID of the trade that has reserved the coin `coin` of the wallet for its deposit, if
     /// there is one. A coin of such a trade must be released through the trade
@@ -87,6 +91,10 @@ impl TradeModelStore for MemoryTradeStore {
     fn get_trade_model(&self, trade_id: &str) -> Option<Arc<Mutex<TradeModel>>> {
         self.0.lock().unwrap().get(trade_id).map(Arc::clone)
     }
+
+    fn trade_models(&self) -> Vec<Arc<Mutex<TradeModel>>> {
+        self.0.lock().unwrap().values().cloned().collect()
+    }
 }
 
 #[derive(Clone)]
@@ -94,7 +102,18 @@ pub struct TradeModel {
     trade_id: String,
     my_role: Role,
     network: Network,
+    /// The state that the requests of the caller and the engine's own decisions gave the trade.
+    /// [`Self::state`] is this state, unless the chain shows a later one.
     state: TradeState,
+    /// The state that follows from the confirmed transactions of the trade, if it differs from
+    /// `state`. It is computed again from every observation of the chain, so it goes back when a
+    /// reorganisation removes the transaction that caused it.
+    observed_state: Option<TradeState>,
+    /// The facts about the chain that the engine was told last.
+    chain: ChainFacts,
+    /// The height of the chain tip at the first observation after the trader signed the deposit
+    /// transaction. The deposit timeout is counted from here.
+    deposit_watch_start: Option<u32>,
     /// Set, with the reason, when the peer sent data that an unmodified client never produces.
     /// A terminated trade accepts no further data. Its state changes only once more, and only
     /// if it was terminated during the setup: then the trade is abandoned.
@@ -347,7 +366,7 @@ macro_rules! access {
             use TradeState::*;
             #[expect(path_statements, reason="HACK to prevent `unused_imports` warning")]
             Cooperative;
-            match $name.state {
+            match $name.state() {
                 $pattern $(if $guard)? => Ok(()),
                 _ => Err(ProtocolErrorKind::AccessDenied)
             }
@@ -384,6 +403,9 @@ impl TradeModel {
             my_role,
             network: wallet.network(),
             state: TradeState::Init,
+            observed_state: None,
+            chain: ChainFacts::default(),
+            deposit_watch_start: None,
             terminated: None,
             reserved_coins: Vec::new(),
             deposit_signing_height: None,
@@ -416,8 +438,10 @@ impl TradeModel {
         self.keys.am_buyer
     }
 
-    pub const fn state(&self) -> TradeState {
-        self.state
+    /// The state of the trade: the state that the requests gave it, or the later state that
+    /// the confirmed transactions of the trade show.
+    pub fn state(&self) -> TradeState {
+        self.observed_state.unwrap_or(self.state)
     }
 
     /// The reason why the trade was terminated, if it was.
@@ -483,11 +507,40 @@ impl TradeModel {
     }
 
     fn require_state(&self, allowed: &[TradeState]) -> Result<()> {
-        if allowed.contains(&self.state) {
+        let state = self.state();
+        if allowed.contains(&state) {
             Ok(())
         } else {
-            Err(ProtocolErrorKind::NotAllowedInState(self.state))
+            Err(ProtocolErrorKind::NotAllowedInState(state))
         }
+    }
+
+    /// The deposit transaction counts as confirmed at [`MIN_CONFIRMATIONS`] confirmations. Before
+    /// that, no signature for the swap transaction, no key share and no signature for a custom
+    /// payout leaves the engine (D6, F9).
+    fn require_confirmed_deposit(&self) -> Result<()> {
+        let confirmations = self.chain.deposit_confirmations;
+        if confirmations >= u32::from(MIN_CONFIRMATIONS) {
+            Ok(())
+        } else {
+            Err(ProtocolErrorKind::ChainCondition(format!(
+                "the deposit transaction has {confirmations} of {MIN_CONFIRMATIONS} confirmations"
+            )))
+        }
+    }
+
+    fn config(&self) -> Result<EngineConfig> {
+        self.received
+            .config
+            .ok_or(ProtocolErrorKind::OutOfOrder("the trade is not set up"))
+    }
+
+    /// The number of blocks that remain before the buyer's warning transaction becomes valid:
+    /// it is valid when the deposit transaction has as many confirmations as the warning lock
+    /// time.
+    fn blocks_before_warning_is_valid(&self) -> Result<u32> {
+        let warning_lock_time = u32::from(self.config()?.warning_lock_time_blocks());
+        Ok(warning_lock_time.saturating_sub(self.chain.deposit_confirmations))
     }
 
     #[instrument(skip_all)]
@@ -760,6 +813,7 @@ impl TradeModel {
                 return Ok(());
             }
             trade.require_state(&[TradeState::Deposit])?;
+            trade.require_confirmed_deposit()?;
             // Make sure we have the adaptor signature of the swap transaction before proceeding:
             trade.swap_tx.input_sig_ctx.aggregated_sig()?;
             trade.update_state(TradeState::BuyerReadyToRelease)?;
@@ -802,15 +856,25 @@ impl TradeModel {
 
     /// The seller confirms the payment. Returns his secret key share for the buyer's payout.
     pub fn release_payout(&mut self) -> Result<Scalar> {
-        // NOTE: It is somewhat unsafe for the seller to start closing the trade near to (or after)
-        //  the timelock expiry of the buyer's Warning Tx, since in case of an unresponsive buyer
-        //  and subsequent force-closure, the Swap Tx could then be replaced by it, without the
-        //  seller realising, but the seller won't have a signed Penalty Tx in that case.
-        // TODO: Consider adding a protection against such late closures.
         self.atomically(|trade| {
             trade.require_seller()?;
-            match trade.state {
+            match trade.state() {
                 TradeState::BuyerReadyToRelease => {
+                    trade.require_confirmed_deposit()?;
+                    // After the release the buyer holds the key of his payout. If he then
+                    // publishes his warning transaction, the seller cannot use the penalty. The
+                    // seller is safe only if his swap transaction confirms before the buyer's
+                    // warning transaction becomes valid. The margin is the time for that (F6).
+                    let remaining = trade.blocks_before_warning_is_valid()?;
+                    let margin = u32::from(trade.config()?.release_safety_margin());
+                    if remaining < margin {
+                        return Err(ProtocolErrorKind::ChainCondition(format!(
+                            "{remaining} blocks remain before the buyer's warning transaction \
+                             becomes valid, which is less than the release safety margin of \
+                             {margin} blocks"
+                        ))
+                        .into());
+                    }
                     // Make sure we have the final Swap Tx before the key share leaves the engine:
                     trade.compute_signed_swap_tx()?;
                     trade.update_state(TradeState::SellerReadyToRelease)?;
@@ -839,6 +903,7 @@ impl TradeModel {
                 } else {
                     trade.require_state(&[TradeState::SellerReadyToRelease])?;
                 }
+                trade.require_confirmed_deposit()?;
             }
             let peers_key_share = decoded(peers_key_share)?;
             let peers_pub_key_share = *trade.keys.my_payout_ctx().peers_key_share()?.pub_key();
@@ -932,6 +997,7 @@ impl TradeModel {
                 return Ok(());
             }
             trade.require_state(&[TradeState::Deposit, TradeState::BuyerReadyToRelease])?;
+            trade.require_confirmed_deposit()?;
             trade
                 .custom_payout_tx
                 .builder
@@ -1059,6 +1125,543 @@ impl TradeModel {
         let start_height = self.deposit_signing_height.unwrap_or(0);
         wallet.import_private_key_since(payout_key, Some(tap_tree), start_height)?;
         Ok(())
+    }
+}
+
+// ---- The chain: what the engine observes and how it reacts ----
+
+/// What the confirmed transactions say about the outputs of a trade.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Situation {
+    /// A confirmed transaction that is not the deposit transaction spends an input of the
+    /// deposit transaction. The deposit can never confirm.
+    DepositConflict { confirmations: u32 },
+    /// Both payouts are unspent.
+    PayoutsUnspent,
+    /// The warning transaction of one trader spent the payouts.
+    Warning {
+        of_buyer: bool,
+        confirmations: u32,
+        escrow: EscrowSpend,
+    },
+    /// The custom payout transaction spent the payouts.
+    CustomPayout { confirmations: u32 },
+    /// A transaction spent the seller's payout with the key path: the swap transaction, or a
+    /// payment of the seller after a cooperative close.
+    SellerPayoutSpent { spend: Spend },
+    /// A transaction spent the buyer's payout, and the seller's payout is unspent: a payment of
+    /// the buyer after he got the key.
+    BuyerPayoutSpent { confirmations: u32 },
+    /// A transaction that the engine cannot assign spent a payout.
+    Unknown { txid: Txid, confirmations: u32 },
+}
+
+/// What happened to the escrow output of a confirmed warning transaction.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum EscrowSpend {
+    Unspent,
+    /// The redirect transaction of the trader who did not publish the warning.
+    Redirect {
+        confirmations: u32,
+    },
+    /// A spend through the script path: the claim of the trader who published the warning.
+    Claim {
+        confirmations: u32,
+    },
+    /// Another spend through the key path: the penalty of the trader who did not publish the
+    /// warning.
+    Penalty {
+        confirmations: u32,
+    },
+}
+
+impl TradeModel {
+    /// Takes the facts about the chain, lets the engine perform the steps that it takes on its
+    /// own, and derives the state of the trade from the confirmed transactions. Returns what
+    /// changed.
+    ///
+    /// The caller passes the facts before every request for the trade and after every change of
+    /// the chain, and then sends the transactions of [`Self::transactions_to_send`].
+    pub fn observe_chain(
+        &mut self,
+        wallet: &mut dyn ProtocolWalletApi,
+        facts: ChainFacts,
+    ) -> Vec<TradeEvent> {
+        let mut events = Vec::new();
+        let before = self.state();
+        self.chain = facts;
+        let not_started = TradeState::Init;
+        let abandoned = TradeState::TradeClosed(ClosureType::Abandoned);
+        if self.state == not_started || self.state == abandoned {
+            return events;
+        }
+        self.deposit_watch_start
+            .get_or_insert(self.chain.tip_height);
+
+        let situation = match self.situation() {
+            Ok(situation) => situation,
+            Err(error) => {
+                events.push(TradeEvent::Unexpected(format!(
+                    "the chain cannot be evaluated for the trade: {error}"
+                )));
+                return events;
+            }
+        };
+        self.read_key_share_from_spend(wallet, &situation, &mut events);
+        self.close_by_force_before_the_warning_is_valid(&situation);
+
+        let observed = self.state_from(&situation);
+        self.observed_state = (observed != self.state).then_some(observed);
+        let after = self.state();
+        if after != before {
+            info!(trade_id = self.trade_id, from = %before, to = %after, "The chain changed the trade state.");
+            events.push(TradeEvent::StateChanged {
+                from: before,
+                to: after,
+            });
+            if after == TradeState::TradeClosed(ClosureType::DepositAborted) {
+                self.release_reserved_coins(wallet, &mut events);
+            }
+            if let Some(loss) = self.loss(after) {
+                error!(trade_id = self.trade_id, loss, "The trader lost funds.");
+                events.push(TradeEvent::Loss(loss));
+            }
+        }
+        if let Situation::Unknown { txid, .. } = situation {
+            events.push(TradeEvent::Unexpected(format!(
+                "the transaction {txid} spent a payout of the deposit transaction, and it is no \
+                 transaction of the trade"
+            )));
+        }
+        events
+    }
+
+    /// The facts about the chain that the engine was told last.
+    pub const fn chain_facts(&self) -> &ChainFacts {
+        &self.chain
+    }
+
+    /// Whether nothing can change for the trade any more: it was abandoned, or the transaction
+    /// that closed it has [`MIN_CONFIRMATIONS`] confirmations. A trade that was closed
+    /// cooperatively is final when a transaction that spends a payout has that depth, because
+    /// then no warning transaction can confirm any more.
+    pub fn is_final(&self) -> bool {
+        if self.state == TradeState::TradeClosed(ClosureType::Abandoned) {
+            return true;
+        }
+        if !matches!(self.state(), TradeState::TradeClosed(_)) {
+            return false;
+        }
+        let confirmations = match self.situation() {
+            Ok(
+                Situation::DepositConflict { confirmations }
+                | Situation::CustomPayout { confirmations }
+                | Situation::BuyerPayoutSpent { confirmations }
+                | Situation::Unknown { confirmations, .. },
+            ) => confirmations,
+            Ok(Situation::SellerPayoutSpent { spend }) => spend.confirmations,
+            Ok(Situation::Warning {
+                escrow:
+                    EscrowSpend::Redirect { confirmations }
+                    | EscrowSpend::Claim { confirmations }
+                    | EscrowSpend::Penalty { confirmations },
+                ..
+            }) => confirmations,
+            Ok(
+                Situation::Warning {
+                    escrow: EscrowSpend::Unspent,
+                    ..
+                }
+                | Situation::PayoutsUnspent,
+            )
+            | Err(_) => 0,
+        };
+        confirmations >= u32::from(MIN_CONFIRMATIONS)
+    }
+
+    /// The trader decides to publish his warning transaction. Afterwards
+    /// [`Self::transactions_to_send`] names it, until a warning transaction is confirmed.
+    ///
+    /// The request is refused unless the trade is open, the deposit transaction has as many
+    /// confirmations as the warning lock time, and both payouts are unspent. A terminated trade
+    /// keeps this action, because the trader can perform it alone.
+    pub fn start_warning(&mut self) -> Result<Transaction> {
+        let own_warning = if self.am_buyer() {
+            TradeState::BuyersWarning
+        } else {
+            TradeState::SellersWarning
+        };
+        if self.state == own_warning {
+            // The request was processed before.
+            return Ok(self.my_txs().warning.builder.signed_tx()?.clone());
+        }
+        self.require_state(&[
+            TradeState::Deposit,
+            TradeState::BuyerReadyToRelease,
+            TradeState::CustomPayoutSigned,
+        ])?;
+        let remaining = self.blocks_before_warning_is_valid()?;
+        if remaining > 0 {
+            return Err(ProtocolErrorKind::ChainCondition(format!(
+                "the warning transaction is valid in {remaining} blocks: the deposit transaction \
+                 has {} confirmations, and the warning lock time is {} blocks",
+                self.chain.deposit_confirmations,
+                self.config()?.warning_lock_time_blocks()
+            )));
+        }
+        if self.situation()? != Situation::PayoutsUnspent {
+            return Err(ProtocolErrorKind::ChainCondition(
+                "a payout of the deposit transaction is spent".to_owned(),
+            ));
+        }
+        let warning_tx = self.my_txs().warning.builder.signed_tx()?.clone();
+        self.set_state(own_warning)?;
+        Ok(warning_tx)
+    }
+
+    /// The transactions of the trader that should be on the network at the moment, according to
+    /// the state of the trade and the facts about the chain. `fee_rate` is the fee rate of the
+    /// transactions that the engine builds on its own.
+    ///
+    /// This is where the engine reacts to the chain (D7): it names the redirect or the penalty
+    /// transaction when the warning transaction of the peer is confirmed, and the claim when the
+    /// claim lock time of the trader's own warning has passed.
+    pub fn transactions_to_send(&self, fee_rate: FeeRate) -> Vec<TxToSend> {
+        let to_send = |kind, tx: Result<Transaction>| {
+            tx.ok()
+                .map(|tx| TxToSend { kind, tx })
+                .into_iter()
+                .collect()
+        };
+        let abandoned = TradeState::TradeClosed(ClosureType::Abandoned);
+        if self.state == TradeState::Init || self.state == abandoned {
+            return Vec::new();
+        }
+        let Ok(situation) = self.situation() else {
+            return Vec::new();
+        };
+        if self.chain.deposit_confirmations == 0 {
+            // Only the trader who holds all signatures can send the deposit transaction.
+            let waiting = situation == Situation::PayoutsUnspent && !self.deposit_timed_out();
+            return if waiting {
+                to_send(TxKind::Deposit, self.signed_deposit_tx())
+            } else {
+                Vec::new()
+            };
+        }
+        let seller_closed_by_force =
+            !self.am_buyer() && self.state == TradeState::TradeClosed(ClosureType::Forced);
+        match situation {
+            Situation::PayoutsUnspent => {
+                let own_warning = if self.am_buyer() {
+                    TradeState::BuyersWarning
+                } else {
+                    TradeState::SellersWarning
+                };
+                if self.state == own_warning {
+                    let valid = self.blocks_before_warning_is_valid().is_ok_and(|n| n == 0);
+                    if valid {
+                        return to_send(TxKind::Warning, self.my_signed_warning_tx().cloned());
+                    }
+                    Vec::new()
+                } else if seller_closed_by_force {
+                    to_send(TxKind::Swap, self.signed_swap_tx().cloned())
+                } else if self.state == TradeState::TradeClosed(ClosureType::Custom) {
+                    to_send(TxKind::CustomPayout, self.signed_custom_payout_tx())
+                } else {
+                    Vec::new()
+                }
+            }
+            // The buyer spent his payout. The swap transaction of the seller is still valid.
+            Situation::BuyerPayoutSpent { .. } if seller_closed_by_force => {
+                to_send(TxKind::Swap, self.signed_swap_tx().cloned())
+            }
+            Situation::Warning {
+                of_buyer,
+                confirmations,
+                escrow: EscrowSpend::Unspent,
+            } => {
+                if of_buyer == self.am_buyer() {
+                    // The trader's own warning: the claim, when its lock time has passed.
+                    let claim_lock_time = self
+                        .config()
+                        .map_or(u32::MAX, |config| config.claim_lock_time_blocks().into());
+                    if confirmations >= claim_lock_time {
+                        return to_send(TxKind::Claim, self.my_claim_tx(fee_rate));
+                    }
+                    Vec::new()
+                } else if let Ok(penalty_tx) = self.penalty_tx.builder.signed_tx() {
+                    // The trader holds the full key of the escrow of the peer's warning.
+                    to_send(TxKind::Penalty, Ok(penalty_tx.clone()))
+                } else {
+                    to_send(TxKind::Redirect, self.my_signed_redirect_tx().cloned())
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether the deposit timeout has passed without a confirmation of the deposit
+    /// transaction.
+    fn deposit_timed_out(&self) -> bool {
+        let Some(start) = self.deposit_watch_start else {
+            return false;
+        };
+        let timeout = self
+            .received
+            .config
+            .unwrap_or_default()
+            .deposit_timeout()
+            .into();
+        self.chain.deposit_confirmations == 0
+            && self.chain.tip_height.saturating_sub(start) > timeout
+    }
+
+    /// Sorts the confirmed spends of the outputs of the trade.
+    fn situation(&self) -> Result<Situation> {
+        let facts = &self.chain;
+        let deposit_txid = *self.deposit_tx.builder.txid()?;
+        if facts.deposit_confirmations == 0 {
+            let conflict = self
+                .deposit_inputs()?
+                .into_iter()
+                .filter_map(|(outpoint, _)| facts.spends.get(&outpoint))
+                .find(|spend| spend.tx.compute_txid() != deposit_txid);
+            return Ok(match conflict {
+                Some(spend) => Situation::DepositConflict {
+                    confirmations: spend.confirmations,
+                },
+                None => Situation::PayoutsUnspent,
+            });
+        }
+        let buyer_payout = self.deposit_tx.builder.buyer_payout()?;
+        let seller_payout = self.deposit_tx.builder.seller_payout()?;
+        let buyer_payout_spend = facts.spends.get(&buyer_payout.outpoint);
+        let seller_payout_spend = facts.spends.get(&seller_payout.outpoint);
+        let Some(spend) = seller_payout_spend.or(buyer_payout_spend) else {
+            return Ok(Situation::PayoutsUnspent);
+        };
+        let txid = spend.tx.compute_txid();
+        let confirmations = spend.confirmations;
+
+        for (of_buyer, txs, peer_txs) in [
+            (true, &self.buyer_txs, &self.seller_txs),
+            (false, &self.seller_txs, &self.buyer_txs),
+        ] {
+            if txid != *txs.warning.builder.txid()? {
+                continue;
+            }
+            let escrow = txs.warning.builder.escrow()?;
+            let escrow = match facts.spends.get(&escrow.outpoint) {
+                None => EscrowSpend::Unspent,
+                Some(spend) => {
+                    let confirmations = spend.confirmations;
+                    // The redirect transaction of the peer of the publisher spends this escrow.
+                    if spend.tx.compute_txid() == *peer_txs.redirect.builder.txid()? {
+                        EscrowSpend::Redirect { confirmations }
+                    } else if spend.tx.find_key_spend_signature(&escrow).is_ok() {
+                        EscrowSpend::Penalty { confirmations }
+                    } else {
+                        EscrowSpend::Claim { confirmations }
+                    }
+                }
+            };
+            return Ok(Situation::Warning {
+                of_buyer,
+                confirmations,
+                escrow,
+            });
+        }
+        let custom_payout_txid = self
+            .custom_payout_tx
+            .builder
+            .psbt()
+            .ok()
+            .map(|psbt| psbt.unsigned_tx.compute_txid());
+        if custom_payout_txid == Some(txid) {
+            return Ok(Situation::CustomPayout { confirmations });
+        }
+        if let Some(spend) = seller_payout_spend {
+            return Ok(
+                if spend.tx.find_key_spend_signature(seller_payout).is_ok() {
+                    Situation::SellerPayoutSpent {
+                        spend: spend.clone(),
+                    }
+                } else {
+                    Situation::Unknown {
+                        txid,
+                        confirmations,
+                    }
+                },
+            );
+        }
+        Ok(Situation::BuyerPayoutSpent { confirmations })
+    }
+
+    /// The state that follows from the state that the requests gave the trade and from the
+    /// confirmed transactions.
+    fn state_from(&self, situation: &Situation) -> TradeState {
+        use ClosureType::{
+            BuyersClaim, BuyersPenaltyTx, BuyersRedirect, Cooperative, Custom, DepositAborted,
+            Forced, SellersClaim, SellersPenaltyTx, SellersRedirect,
+        };
+        use TradeState::{BuyersWarning, SellerReadyToRelease, SellersWarning, TradeClosed};
+
+        match *situation {
+            Situation::DepositConflict { .. } => TradeClosed(DepositAborted),
+            Situation::Warning {
+                of_buyer,
+                escrow: EscrowSpend::Unspent,
+                ..
+            } => {
+                // After a cooperative close the trader answers with the penalty. The trade stays
+                // closed until the penalty or the claim of the peer confirms.
+                if self.state == TradeClosed(Cooperative) {
+                    self.state
+                } else if of_buyer {
+                    BuyersWarning
+                } else {
+                    SellersWarning
+                }
+            }
+            // The closure types are named after the trader who published the closing transaction:
+            // the redirect and the penalty come from the peer of the publisher of the warning,
+            // the claim from the publisher.
+            Situation::Warning {
+                of_buyer, escrow, ..
+            } => TradeClosed(match (escrow, of_buyer) {
+                (EscrowSpend::Redirect { .. }, true) => SellersRedirect,
+                (EscrowSpend::Redirect { .. }, false) => BuyersRedirect,
+                (EscrowSpend::Penalty { .. }, true) => SellersPenaltyTx,
+                (EscrowSpend::Penalty { .. }, false) => BuyersPenaltyTx,
+                (EscrowSpend::Claim { .. } | EscrowSpend::Unspent, true) => BuyersClaim,
+                (EscrowSpend::Claim { .. } | EscrowSpend::Unspent, false) => SellersClaim,
+            }),
+            Situation::CustomPayout { .. } => TradeClosed(Custom),
+            // The seller's own swap transaction. After a cooperative close it is a payment of
+            // the seller, which changes nothing. The buyer reads the key share from the spend
+            // (`read_key_share_from_spend`), which closes his trade for good.
+            Situation::SellerPayoutSpent { .. }
+                if !self.am_buyer() && self.state == SellerReadyToRelease =>
+            {
+                TradeClosed(Forced)
+            }
+            Situation::SellerPayoutSpent { .. }
+            | Situation::BuyerPayoutSpent { .. }
+            | Situation::PayoutsUnspent
+            | Situation::Unknown { .. } => self.state,
+        }
+    }
+
+    /// The buyer reads the seller's key share from a confirmed transaction that spends the
+    /// seller's payout with the key path, and closes the trade with it. The buyer does not know
+    /// the swap transaction, so every such transaction is examined.
+    ///
+    /// This close stays when a reorganisation removes the transaction: the buyer holds the key
+    /// of his payout from then on.
+    fn read_key_share_from_spend(
+        &mut self,
+        wallet: &mut dyn ProtocolWalletApi,
+        situation: &Situation,
+        events: &mut Vec<TradeEvent>,
+    ) {
+        let Situation::SellerPayoutSpent { spend } = situation else {
+            return;
+        };
+        let waiting = [
+            TradeState::BuyerReadyToRelease,
+            TradeState::CustomPayoutSigned,
+        ];
+        if !self.am_buyer() || !waiting.contains(&self.state) {
+            return;
+        }
+        let mut draft = self.clone();
+        let result = draft
+            .recover_seller_private_key_share_for_buyer_output(&spend.tx)
+            .and_then(|()| draft.sign_penalty_tx(None))
+            .and_then(|()| draft.close_trade(ClosureType::Forced))
+            .and_then(|_| draft.import_my_payout_key(wallet));
+        match result {
+            Ok(()) => *self = draft,
+            Err(error) => events.push(TradeEvent::Unexpected(format!(
+                "the transaction {} spent the seller's payout, and the seller's key share cannot \
+                 be read from it: {error}",
+                spend.tx.compute_txid()
+            ))),
+        }
+    }
+
+    /// The seller publishes the swap transaction on his own when the number of blocks before
+    /// the buyer's warning transaction becomes valid has fallen to the release safety margin
+    /// (D7). He has released the key of the buyer's payout, so he must have his own payout
+    /// before the buyer can publish the warning.
+    fn close_by_force_before_the_warning_is_valid(&mut self, situation: &Situation) {
+        if self.am_buyer()
+            || self.state != TradeState::SellerReadyToRelease
+            || *situation != Situation::PayoutsUnspent
+            || self.chain.deposit_confirmations == 0
+        {
+            return;
+        }
+        let margin = self
+            .received
+            .config
+            .unwrap_or_default()
+            .release_safety_margin();
+        if self
+            .blocks_before_warning_is_valid()
+            .is_ok_and(|remaining| remaining <= u32::from(margin))
+        {
+            info!(
+                trade_id = self.trade_id,
+                "The buyer did not answer the release in time. Closing by force."
+            );
+            if let Err(error) = self.close_trade(ClosureType::Forced) {
+                error!(trade_id = self.trade_id, %error, "Could not close the trade by force.");
+            }
+        }
+    }
+
+    /// Releases the coins that are reserved for the deposit, when the deposit can never confirm.
+    fn release_reserved_coins(
+        &mut self,
+        wallet: &mut dyn ProtocolWalletApi,
+        events: &mut Vec<TradeEvent>,
+    ) {
+        for outpoint in std::mem::take(&mut self.reserved_coins) {
+            if let Err(error) = wallet.unlock_utxo(outpoint) {
+                events.push(TradeEvent::Unexpected(format!(
+                    "the reserved coin {outpoint} could not be released: {error}"
+                )));
+            }
+        }
+    }
+
+    /// The description of the loss, if `state` means that the peer took funds of the trader.
+    fn loss(&self, state: TradeState) -> Option<String> {
+        use ClosureType::{BuyersClaim, BuyersPenaltyTx, SellersClaim, SellersPenaltyTx};
+        let TradeState::TradeClosed(closure_type) = state else {
+            return None;
+        };
+        let by_peer = if self.am_buyer() {
+            [SellersClaim, SellersPenaltyTx]
+        } else {
+            [BuyersClaim, BuyersPenaltyTx]
+        };
+        if !by_peer.contains(&closure_type) {
+            return None;
+        }
+        Some(
+            if closure_type == by_peer[0] {
+                "the peer published his warning transaction and claimed all funds of the trade, \
+                 because no redirect or penalty transaction of the trader was confirmed within \
+                 the claim lock time"
+            } else {
+                "the peer took all funds of the trade with his penalty transaction, after the \
+                 warning transaction of the trader was confirmed"
+            }
+            .to_owned(),
+        )
     }
 }
 
@@ -1197,9 +1800,12 @@ impl TradeModel {
     }
 
     /// The outputs that must be watched on the chain for this trade, from the moment the trader
-    /// signed the deposit transaction: the payouts of the buyer and of the seller in the deposit
-    /// transaction, and the escrow outputs of the buyer's and of the seller's warning
-    /// transaction. Every transaction that can end the trade spends one of them.
+    /// signed the deposit transaction:
+    /// - the payouts of the buyer and of the seller in the deposit transaction, and the escrow
+    ///   outputs of the buyer's and of the seller's warning transaction. Every transaction that can
+    ///   end the trade spends one of them;
+    /// - the inputs of the deposit transaction. A confirmed transaction that spends one of them and
+    ///   is not the deposit transaction means that the deposit can never confirm.
     pub fn outputs_to_watch(&self) -> Result<Vec<(OutPoint, ScriptBuf)>> {
         access!(self, _ if self.state >= Deposit)?;
         let outputs = [
@@ -1208,9 +1814,26 @@ impl TradeModel {
             self.buyer_txs.warning.builder.escrow()?,
             self.seller_txs.warning.builder.escrow()?,
         ];
-        Ok(outputs
+        let mut outputs = outputs
             .into_iter()
             .map(|output| (output.outpoint, output.prevout.script_pubkey))
+            .collect::<Vec<_>>();
+        outputs.extend(self.deposit_inputs()?);
+        Ok(outputs)
+    }
+
+    /// The inputs of the deposit transaction, of both traders, with their scripts.
+    fn deposit_inputs(&self) -> Result<Vec<(OutPoint, ScriptBuf)>> {
+        let psbt = self.deposit_tx.builder.psbt()?;
+        Ok(psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .zip(&psbt.inputs)
+            .filter_map(|(tx_in, input)| {
+                let script = input.witness_utxo.as_ref()?.script_pubkey.clone();
+                Some((tx_in.previous_output, script))
+            })
             .collect())
     }
 
@@ -1294,9 +1917,11 @@ impl TradeModel {
             |sighash| {
                 // The key of the script is the x-only form of the public key share. The signing
                 // function negates the secret key when the public key has an odd Y coordinate.
+                // The signature has no random part, so the engine builds the same transaction
+                // every time it is asked for the same fee rate, and sends one claim, not many.
                 let message = Message::from_digest(sighash.to_byte_array());
                 Ok(taproot::Signature {
-                    signature: secp.sign_schnorr(&message, &keypair),
+                    signature: secp.sign_schnorr_no_aux_rand(&message, &keypair),
                     sighash_type: TapSighashType::Default,
                 })
             },
@@ -1930,9 +2555,10 @@ impl TradeModel {
                 // TODO: Make sure we are committed to broadcasting the Custom Payout Tx, unless we
                 //  have already seen it on the network.
             }
-            // No call starts a warning, redirect, claim or penalty transaction yet, so these
-            // closure types cannot be reached. A trade is abandoned by `abandon`.
+            // These closure types follow from confirmed transactions only. The engine derives
+            // them from the chain (`observe_chain`). A trade is abandoned by `abandon`.
             ClosureType::Abandoned
+            | ClosureType::DepositAborted
             | ClosureType::BuyersRedirect
             | ClosureType::SellersRedirect
             | ClosureType::BuyersClaim
@@ -1942,7 +2568,9 @@ impl TradeModel {
                 return Err(ProtocolErrorKind::UnsupportedClosureType(closure_type));
             }
         }
-        self.update_state(TradeState::TradeClosed(closure_type))
+        // Not `update_state`: a terminated trade keeps the closes that the trader can perform
+        // alone. The requests of a cooperative close are refused for it before they get here.
+        self.set_state(TradeState::TradeClosed(closure_type))
     }
 
     fn compute_custom_payout_tx(&mut self) -> Result<()> {
@@ -2099,6 +2727,8 @@ pub enum ProtocolErrorKind {
     NotAllowedInState(TradeState),
     #[error("request is out of order: {0}")]
     OutOfOrder(&'static str),
+    #[error("the state of the chain does not allow the request yet: {0}")]
+    ChainCondition(String),
     #[error("request differs from an earlier request for this trade: {0}")]
     ConflictingRequest(&'static str),
     #[error("trade was terminated, because the peer did not follow the protocol: {0}")]
@@ -2151,6 +2781,7 @@ impl ProtocolErrorKind {
             Self::WrongRole(_)
                 | Self::NotAllowedInState(_)
                 | Self::OutOfOrder(_)
+                | Self::ChainCondition(_)
                 | Self::ConflictingRequest(_)
                 | Self::UnusableSwapTx(_)
                 | Self::OtherCustomPayoutTx { .. }
@@ -2191,7 +2822,7 @@ mod tests {
         ("2N2x2bA28AsLZZEHss4SjFoyToQV5YYZsJM", 15_055),
     ];
 
-    const ROLE_PAIRS: [(Role, Role); 4] = [
+    pub(super) const ROLE_PAIRS: [(Role, Role); 4] = [
         (Role::BuyerAsTaker, Role::SellerAsMaker),
         (Role::BuyerAsMaker, Role::SellerAsTaker),
         (Role::SellerAsTaker, Role::BuyerAsMaker),
@@ -2199,9 +2830,9 @@ mod tests {
     ];
 
     /// One trader: his trade model and his wallet.
-    struct Trader {
-        model: TradeModel,
-        wallet: Box<dyn ProtocolWalletApi>,
+    pub(super) struct Trader {
+        pub(super) model: TradeModel,
+        pub(super) wallet: Box<dyn ProtocolWalletApi>,
     }
 
     fn params() -> TradeParams {
@@ -2217,7 +2848,7 @@ mod tests {
 
     /// The configuration of the engines of both traders. Its lock times differ from the default
     /// values, so the tests show that the engine uses the configuration.
-    fn config() -> EngineConfig {
+    pub(super) fn config() -> EngineConfig {
         EngineConfig::new(20, 10, 144, 6).expect("valid configuration")
     }
 
@@ -2378,7 +3009,7 @@ mod tests {
     }
 
     /// The two traders after both signed the deposit transaction.
-    fn traders_after_deposit_signature(roles: (Role, Role)) -> (Trader, Trader) {
+    pub(super) fn traders_after_deposit_signature(roles: (Role, Role)) -> (Trader, Trader) {
         let (mut me, mut peer) =
             traders_before_deposit_signature(roles, REDIRECTION_RECEIVERS, |_| {});
         let peers_partial_signatures = sent_partial_signatures(&peer);
@@ -3005,3 +3636,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "trade_model_chain_tests.rs"]
+mod chain_tests;

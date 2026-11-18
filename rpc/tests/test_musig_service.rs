@@ -39,13 +39,14 @@ use protocol::state::{ClosureType, TradeState};
 use protocol::trade_model::{MemoryTradeStore, TradeModelStore as _};
 use rpc::pb::musigrpc::musig_client::MusigClient;
 use rpc::pb::musigrpc::{
-    AbandonTradeRequest, AbandonTradeResponse, CloseTradeRequest, CloseTradeResponse,
+    AbandonTradeRequest, AbandonTradeResponse, CloseTradeRequest, CloseTradeResponse, ClosureKind,
     ContractualTxIds, CustomCloseTradeRequest, CustomCloseTradeResponse, CustomPayoutPsbt,
     CustomPayoutPsbtRequest, DepositPsbt, DepositTxSignatureRequest, NonceSharesMessage,
     NonceSharesRequest, PartialSignaturesMessage, PartialSignaturesRequest, PubKeySharesRequest,
-    PubKeySharesResponse, PublishDepositTxRequest, ReceiverAddressAndAmount, Role,
+    PubKeySharesResponse, PublishDepositTxRequest, PublishWarningTxRequest,
+    PublishWarningTxResponse, ReceiverAddressAndAmount, Role, SubscribeTradeEventsRequest,
     SubscribeTxConfirmationStatusRequest, SwapTxSignatureRequest, SwapTxSignatureResponse,
-    TxConfirmationStatus,
+    TradeEvent, TradeEventType, TradeStateKind, TradeTxKind, TxConfirmationStatus,
 };
 use rpc::server::{MusigImpl, MusigServer, TradeWalletProvider, WalletOperation};
 use tokio::net::TcpListener;
@@ -670,6 +671,26 @@ impl Party {
         self.close_trade(CloseTradeRequest::default()).await
     }
 
+    async fn publish_warning_tx(&mut self) -> Result<PublishWarningTxResponse, Status> {
+        let request = PublishWarningTxRequest {
+            trade_id: self.trade_id.clone(),
+        };
+        self.client
+            .publish_warning_tx(request)
+            .await
+            .map(Response::into_inner)
+    }
+
+    async fn subscribe_trade_events(&mut self) -> Result<Streaming<TradeEvent>, Status> {
+        let request = SubscribeTradeEventsRequest {
+            trade_id: self.trade_id.clone(),
+        };
+        self.client
+            .subscribe_trade_events(request)
+            .await
+            .map(Response::into_inner)
+    }
+
     async fn sign_custom_payout_tx(
         &mut self,
         sellers_payout_amount_excluding_fee: u64,
@@ -931,11 +952,33 @@ impl Trade {
         confirmations
     }
 
-    /// Signs and publishes the deposit transaction without waiting for the confirmation event.
+    /// Signs and publishes the deposit transaction, and confirms it on the chains of both
+    /// services, so that it counts as confirmed (D6).
     async fn sign_and_publish_deposit_tx(&mut self) {
         self.sign_deposit_tx().await;
-        // The mock event arrives after 5 seconds. No later step depends on it.
         drop(self.publish_deposit_tx().await);
+        self.confirm_deposit().await;
+    }
+
+    /// Mines the deposit transaction that the taker's service sent, and two more blocks, on the
+    /// chains of both services.
+    async fn confirm_deposit(&mut self) {
+        let takers_chain = Arc::clone(&self.party(self.taker_side()).chain);
+        assert!(
+            sent_count_reaches(&takers_chain, 1).await,
+            "the taker's service sends the deposit transaction"
+        );
+        let deposit_tx = takers_chain.sent().remove(0);
+        self.mine(std::slice::from_ref(&deposit_tx));
+        self.mine(&[]);
+        self.mine(&[]);
+    }
+
+    /// Adds a block with the transactions `txs` to the chains of both services.
+    fn mine(&self, txs: &[Transaction]) {
+        for side in SIDES {
+            self.party(side).chain.mine(txs);
+        }
     }
 
     /// The buyer reports the started payment. The response is message E.
@@ -1589,14 +1632,15 @@ async fn check_deposit(trade: &mut Trade) {
         trade_fee_output.script_pubkey,
         address(TRADE_FEE_RECEIVER.0).script_pubkey()
     );
-    // From the moment a trader has signed the deposit, the two payouts and the escrow outputs
-    // of both warning transactions are watched.
-    let expected_watch_list = vec![
+    // From the moment a trader has signed the deposit, the two payouts, the escrow outputs of
+    // both warning transactions and the inputs of the deposit transaction are watched.
+    let mut expected_watch_list = vec![
         trade.buyer_payout().0,
         trade.seller_payout().0,
         OutPoint::new(txid(&ids.buyers_warning_tx_id), 0),
         OutPoint::new(txid(&ids.sellers_warning_tx_id), 0),
     ];
+    expected_watch_list.extend(deposit_tx.input.iter().map(|input| input.previous_output));
     for party in [&trade.buyer, &trade.seller] {
         assert_eq!(party.chain.watched_outputs(), expected_watch_list);
     }
@@ -1892,6 +1936,246 @@ async fn j9_deposit_that_never_confirms_is_sent_on_schedule_and_never_reported()
         "no confirmation event for a transaction that is in no block"
     );
     trade.assert_states(TradeState::Deposit, TradeState::Deposit);
+}
+
+/// Reads the next event of a trade, with a limit for the waiting time.
+async fn next_trade_event(events: &mut Streaming<TradeEvent>) -> TradeEvent {
+    tokio::time::timeout(std::time::Duration::from_secs(10), events.next())
+        .await
+        .expect("the stream answers in time")
+        .expect("the stream is open")
+        .expect("event without error")
+}
+
+/// Reads events of a trade until one has the type `event_type`.
+async fn trade_event_of_type(
+    events: &mut Streaming<TradeEvent>,
+    event_type: TradeEventType,
+) -> TradeEvent {
+    loop {
+        let event = next_trade_event(events).await;
+        if event.r#type() == event_type {
+            return event;
+        }
+    }
+}
+
+/// The last transaction that the chain of a service got to send, when it has got `count`.
+async fn sent_tx(chain: &FakeChain, count: usize) -> Transaction {
+    assert!(
+        sent_count_reaches(chain, count).await,
+        "the service sends transaction number {count}"
+    );
+    chain.sent().remove(count - 1)
+}
+
+/// C1, C2 and the event stream of a trade: the seller asks for the forced close, and his
+/// service sends the swap transaction. When a block contains it, the buyer's service reads the
+/// seller's key share from it and closes the buyer's trade, without a request of the caller.
+#[tokio::test]
+async fn c1_swap_tx_is_sent_and_the_buyer_closes_from_the_chain() {
+    let mut trade = Trade::at(TradeType::TakerIsBuyer, Stage::SellerReleased).await;
+    let mut buyers_events = trade.buyer.subscribe_trade_events().await.unwrap();
+    let mut sellers_events = trade.seller.subscribe_trade_events().await.unwrap();
+    // The first event of a stream is the current state.
+    let first = next_trade_event(&mut buyers_events).await;
+    assert_eq!(first.r#type(), TradeEventType::State);
+    assert_eq!(first.state(), TradeStateKind::BuyerReadyToRelease);
+    assert_eq!(first.trade_id, trade.buyer.trade_id);
+    assert!(!first.r#final);
+    let first = next_trade_event(&mut sellers_events).await;
+    assert_eq!(first.state(), TradeStateKind::SellerReadyToRelease);
+
+    let sellers_chain = Arc::clone(&trade.seller.chain);
+    let sent_before = sellers_chain.sent().len();
+    trade.seller_closes_by_force().await;
+    let swap_tx = sent_tx(&sellers_chain, sent_before + 1).await;
+    assert_eq!(consensus::serialize(&swap_tx), trade.swap_tx());
+    let event = trade_event_of_type(&mut sellers_events, TradeEventType::State).await;
+    assert_eq!(event.state(), TradeStateKind::TradeClosed);
+    assert_eq!(event.closure_type(), ClosureKind::Forced);
+    let event = trade_event_of_type(&mut sellers_events, TradeEventType::TxSent).await;
+    assert_eq!(event.tx_kind(), TradeTxKind::SwapTx);
+    assert_eq!(event.tx_id, Some(swap_tx.compute_txid().to_string()));
+
+    // The buyer's service knows nothing of the swap transaction before a block contains it.
+    assert_eq!(trade.buyer.state(), TradeState::BuyerReadyToRelease);
+    trade.mine(std::slice::from_ref(&swap_tx));
+    let event = trade_event_of_type(&mut buyers_events, TradeEventType::State).await;
+    assert_eq!(event.state(), TradeStateKind::TradeClosed);
+    assert_eq!(event.closure_type(), ClosureKind::Forced);
+    assert_eq!(
+        trade.buyer.state(),
+        TradeState::TradeClosed(ClosureType::Forced)
+    );
+
+    // Final at 3 confirmations of the swap transaction.
+    trade.mine(&[]);
+    trade.mine(&[]);
+    for party in [&trade.buyer, &trade.seller] {
+        let stored = party.trades.get_trade_model(&party.trade_id).unwrap();
+        for _ in 0..200 {
+            if stored.lock().unwrap().is_final() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(stored.lock().unwrap().is_final());
+    }
+    // The confirmed transaction was sent once.
+    assert_eq!(sellers_chain.sent().len(), sent_before + 1);
+}
+
+/// C4 (D7): the seller released and the buyer does not answer. The seller's service sends the
+/// swap transaction on its own when the number of blocks before the buyer's warning transaction
+/// becomes valid has fallen to the release safety margin.
+#[tokio::test]
+async fn c4_swap_tx_is_sent_without_a_request_at_the_safety_margin() {
+    let trade = Trade::at(TradeType::TakerIsSeller, Stage::SellerReleased).await;
+    let sellers_chain = Arc::clone(&trade.seller.chain);
+    let sent_before = sellers_chain.sent().len();
+    // The deposit has 3 confirmations. The margin of 6 blocks is reached at 14 confirmations.
+    for _ in 3..13 {
+        trade.mine(&[]);
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(sellers_chain.sent().len(), sent_before);
+    assert_eq!(trade.seller.state(), TradeState::SellerReadyToRelease);
+
+    trade.mine(&[]);
+    let swap_tx = sent_tx(&sellers_chain, sent_before + 1).await;
+    assert_eq!(
+        trade.seller.state(),
+        TradeState::TradeClosed(ClosureType::Forced)
+    );
+    assert_eq!(
+        swap_tx.input[0].previous_output,
+        trade.seller_payout().0,
+        "the swap transaction spends the seller's payout"
+    );
+}
+
+/// E1, E2, E14 through the service: `PublishWarningTx` is refused before the warning lock time
+/// has passed. Afterwards the service of the trader sends the warning transaction, and the
+/// service of the peer answers the confirmed warning with the redirect transaction, without a
+/// request. Both trades close when the redirect is confirmed.
+#[tokio::test]
+async fn e1_e2_publish_warning_tx_and_redirect() {
+    for buyer_warns in [true, false] {
+        let mut trade = Trade::at(TradeType::TakerIsBuyer, Stage::DepositSigned).await;
+        let (publisher_side, peer_side) = if buyer_warns {
+            (Side::Buyer, Side::Seller)
+        } else {
+            (Side::Seller, Side::Buyer)
+        };
+        let result = trade.party_mut(publisher_side).publish_warning_tx().await;
+        assert_refused(result, Code::FailedPrecondition, "valid in 17 blocks");
+        trade.assert_states(TradeState::Deposit, TradeState::Deposit);
+
+        for _ in 3..WARNING_LOCK_TIME {
+            trade.mine(&[]);
+        }
+        let mut peers_events = trade
+            .party_mut(peer_side)
+            .subscribe_trade_events()
+            .await
+            .unwrap();
+        let publishers_chain = Arc::clone(&trade.party(publisher_side).chain);
+        let peers_chain = Arc::clone(&trade.party(peer_side).chain);
+        let (publishers_sent, peers_sent) =
+            (publishers_chain.sent().len(), peers_chain.sent().len());
+
+        let response = trade
+            .party_mut(publisher_side)
+            .publish_warning_tx()
+            .await
+            .expect("the warning lock time has passed");
+        let warning_tx = sent_tx(&publishers_chain, publishers_sent + 1).await;
+        assert_eq!(consensus::serialize(&warning_tx), response.warning_tx);
+        let ids = trade.contractual_tx_ids();
+        let (warning_txid, redirect_txid, warning_state, closure) = if buyer_warns {
+            (
+                &ids.buyers_warning_tx_id,
+                &ids.sellers_redirect_tx_id,
+                TradeState::BuyersWarning,
+                ClosureType::SellersRedirect,
+            )
+        } else {
+            (
+                &ids.sellers_warning_tx_id,
+                &ids.buyers_redirect_tx_id,
+                TradeState::SellersWarning,
+                ClosureType::BuyersRedirect,
+            )
+        };
+        assert_eq!(warning_tx.compute_txid(), txid(warning_txid));
+        assert_eq!(trade.party(publisher_side).state(), warning_state);
+        assert_eq!(trade.party(peer_side).state(), TradeState::Deposit);
+        // A repeated request returns the same transaction.
+        let repeated = trade.party_mut(publisher_side).publish_warning_tx().await;
+        assert_eq!(repeated.unwrap().warning_tx, response.warning_tx);
+
+        // The warning is confirmed: the peer's service sends the redirect on its own.
+        trade.mine(std::slice::from_ref(&warning_tx));
+        let redirect_tx = sent_tx(&peers_chain, peers_sent + 1).await;
+        assert_eq!(redirect_tx.compute_txid(), txid(redirect_txid));
+        assert_eq!(trade.party(peer_side).state(), warning_state);
+        let event = trade_event_of_type(&mut peers_events, TradeEventType::TxSent).await;
+        assert_eq!(event.tx_kind(), TradeTxKind::RedirectTx);
+
+        trade.mine(std::slice::from_ref(&redirect_tx));
+        loop {
+            let event = trade_event_of_type(&mut peers_events, TradeEventType::State).await;
+            if event.state() == TradeStateKind::TradeClosed {
+                break;
+            }
+        }
+        let closed = TradeState::TradeClosed(closure);
+        for _ in 0..200 {
+            if trade.party(publisher_side).state() == closed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(trade.party(publisher_side).state(), closed);
+        assert_eq!(trade.party(peer_side).state(), closed);
+        // A seller or a buyer in a closed trade cannot start a dispute.
+        let result = trade.party_mut(peer_side).publish_warning_tx().await;
+        assert_refused(result, Code::FailedPrecondition, "not allowed in state");
+    }
+}
+
+/// D21: a problem with the peers and its end are reported as events of a trade, also to a
+/// stream that was open before the problem. `PublishWarningTx` must send, so it is refused
+/// while the problem lasts.
+#[tokio::test]
+async fn d21_problem_with_the_peers_is_an_event_of_the_trade() {
+    let mut trade = Trade::at(TradeType::TakerIsBuyer, Stage::DepositSigned).await;
+    let mut events = trade.buyer.subscribe_trade_events().await.unwrap();
+    assert_eq!(
+        next_trade_event(&mut events).await.state(),
+        TradeStateKind::Deposit
+    );
+
+    trade
+        .buyer
+        .chain
+        .set_peer_problem(Some(PeerProblem::NoPeerReachable));
+    let event = trade_event_of_type(&mut events, TradeEventType::ChainProblem).await;
+    assert!(
+        event
+            .message
+            .as_deref()
+            .is_some_and(|m| m.contains("no peer")),
+        "{event:?}"
+    );
+    assert_eq!(event.state(), TradeStateKind::Deposit);
+    let result = trade.buyer.publish_warning_tx().await;
+    assert_refused(result, Code::Unavailable, "no peer");
+
+    trade.buyer.chain.set_peer_problem(None);
+    let event = trade_event_of_type(&mut events, TradeEventType::ChainProblemOver).await;
+    assert_eq!(event.message, None);
 }
 
 #[tokio::test]

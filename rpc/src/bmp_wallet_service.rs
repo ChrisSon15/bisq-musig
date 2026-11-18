@@ -1186,6 +1186,10 @@ mod tests {
             None
         }
 
+        fn trade_models(&self) -> Vec<Arc<Mutex<TradeModel>>> {
+            Vec::new()
+        }
+
         fn trade_reserving(&self, coin: &OutPoint) -> Option<String> {
             (*coin == self.0).then(|| "trade-1".to_owned())
         }

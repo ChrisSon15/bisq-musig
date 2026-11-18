@@ -51,12 +51,16 @@ pub enum ClosureType {
     /// The trade ended in [`TradeState::Init`], before the trader signed the deposit transaction.
     /// No funds were bound, and the coins that were reserved for the deposit are free again.
     Abandoned,
+    /// The deposit transaction can never confirm, because a confirmed transaction spends one of
+    /// its inputs: the deposit abort of a trader, or another spend of a coin. The coins of the
+    /// trader are free again.
+    DepositAborted,
 }
 
 impl TradeState {
     /// All possible trade states, in (non-unique) topological order with respect to the
     /// [`PartialOrd`] impl of [`TradeState`].
-    pub const VALUES: [Self; 17] = [
+    pub const VALUES: [Self; 18] = [
         Self::Init,
         Self::Deposit,
         Self::BuyerReadyToRelease,
@@ -74,6 +78,7 @@ impl TradeState {
         Self::TradeClosed(ClosureType::BuyersPenaltyTx),
         Self::TradeClosed(ClosureType::SellersPenaltyTx),
         Self::TradeClosed(ClosureType::Abandoned),
+        Self::TradeClosed(ClosureType::DepositAborted),
     ];
 
     pub fn precedes_for_buyer(self, new_state: Self) -> bool {
@@ -112,9 +117,11 @@ impl TradeState {
         match self {
             Self::Init => &[],
             Self::Deposit | TradeClosed(ClosureType::Abandoned) => &[Self::Init],
-            Self::BuyerReadyToRelease | CustomPayoutSigned | BuyersWarning | SellersWarning => {
-                &[Self::Deposit]
-            }
+            Self::BuyerReadyToRelease
+            | CustomPayoutSigned
+            | BuyersWarning
+            | SellersWarning
+            | TradeClosed(ClosureType::DepositAborted) => &[Self::Deposit],
             Self::SellerReadyToRelease | TradeClosed(Cooperative | ClosureType::Forced) => {
                 &[Self::BuyerReadyToRelease]
             }
@@ -147,6 +154,8 @@ impl TradeState {
             Self::TradeClosed(ClosureType::SellersPenaltyTx) /*-*/ => 0x247, // 1. .1.. .111
             // A bit of its own: the state follows `Init` only, and no state follows it.
             Self::TradeClosed(ClosureType::Abandoned) /*       -*/ => 0x400,
+            // A bit of its own: the state follows `Deposit` only, and no state follows it.
+            Self::TradeClosed(ClosureType::DepositAborted) /*  -*/ => 0x801,
         }
     }
 }
@@ -192,6 +201,7 @@ const TRADE_STATE_TRANSITION_GRAPH: &str = r#"digraph transitions {
     "Deposit" -> "CustomPayoutSigned" [style=dashed]
     "Deposit" -> "BuyersWarning" [style=dashed]
     "Deposit" -> "SellersWarning" [style=dashed]
+    "Deposit" -> "TradeClosed\n(DepositAborted)"
     "BuyerReadyToRelease" -> "SellerReadyToRelease" [color=red]
     "BuyerReadyToRelease" -> "CustomPayoutSigned"
     "BuyerReadyToRelease" -> "BuyersWarning" [style=dashed]
