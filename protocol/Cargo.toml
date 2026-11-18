@@ -22,7 +22,6 @@ bdk_wallet = { workspace = true, features = ["test-utils"] }
 wallet = { workspace = true, features = ["test-utils"] }
 anyhow = { workspace = true }
 bdk_bitcoind_rpc = { workspace = true }
-bdk_electrum = { workspace = true }
 bmp_tracing = { workspace = true }
 chain = { workspace = true }
 const_format = { workspace = true }

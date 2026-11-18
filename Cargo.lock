@@ -1806,7 +1806,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bdk_bitcoind_rpc",
- "bdk_electrum",
  "bdk_wallet",
  "bmp_tracing",
  "chain",
