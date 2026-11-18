@@ -805,7 +805,16 @@ impl TradeModel {
                 // TODO: Make sure we are committed to broadcasting the Custom Payout Tx, unless we
                 //  have already seen it on the network.
             }
-            _ => todo!("unimplemented closure type")
+            // No call starts a warning, redirect, claim or penalty transaction yet, so these
+            // closure types cannot be reached.
+            ClosureType::BuyersRedirect
+            | ClosureType::SellersRedirect
+            | ClosureType::BuyersClaim
+            | ClosureType::SellersClaim
+            | ClosureType::BuyersPenaltyTx
+            | ClosureType::SellersPenaltyTx => {
+                return Err(ProtocolErrorKind::UnsupportedClosureType(closure_type));
+            }
         }
         self.update_state(TradeState::TradeClosed(closure_type))
     }
@@ -922,6 +931,8 @@ pub enum ProtocolErrorKind {
     AccessDenied,
     #[error("trade with id {0} already exists")]
     DuplicateTradeId(String),
+    #[error("unsupported closure type: {0:?}")]
+    UnsupportedClosureType(ClosureType),
     #[error("illegal state transition for {role:?}: {old_state} -> {new_state}")]
     IllegalStateTransition {
         role: Role,
@@ -1350,7 +1361,6 @@ mod tests {
     /// F4: `close_trade` returns an error for the closure types that are not implemented. It
     /// does not panic and does not change the state.
     #[test]
-    #[ignore = "F4: close_trade panics with todo!() for the closure types of the dispute outcomes"]
     fn f4_close_trade_with_dispute_closure_type() {
         for roles in ROLE_PAIRS {
             let (mut me, peer) =
@@ -1365,7 +1375,13 @@ mod tests {
                 ClosureType::BuyersPenaltyTx,
                 ClosureType::SellersPenaltyTx,
             ] {
-                assert!(me.close_trade(closure_type).is_err(), "{closure_type:?}");
+                assert!(
+                    matches!(
+                        me.close_trade(closure_type),
+                        Err(ProtocolErrorKind::UnsupportedClosureType(c)) if c == closure_type
+                    ),
+                    "{closure_type:?}"
+                );
                 assert_eq!(me.state(), TradeState::Deposit);
             }
         }
