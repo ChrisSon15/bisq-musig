@@ -1211,6 +1211,12 @@ impl WalletApi for BMPWallet {
             };
 
             if let Some(signing_key) = self.imported_keys.get(&txout.script_pubkey) {
+                // The signer finds its input by the internal key and needs the script tree for
+                // the tweak of the key. A PSBT of the trade protocol comes without them: they
+                // are removed before the PSBT goes to the peer. The wallet knows both.
+                let input = &mut psbt.inputs[input_index];
+                input.tap_internal_key = Some(signing_key.internal_key());
+                input.tap_merkle_root = signing_key.merkle_root();
                 let signer =
                     PrivateKey::from_slice(&signing_key.secret().serialize(), self.network())
                         .map_err(|_e| SignerError::External("Invalid signing key".to_owned()))?;

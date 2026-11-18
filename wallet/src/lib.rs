@@ -1056,6 +1056,62 @@ mod tests {
         Ok(())
     }
 
+    /// The trade protocol removes the Taproot key data from the inputs of a half deposit PSBT
+    /// before the PSBT goes to the peer, and signs the PSBT of the deposit transaction later. The
+    /// wallet must sign a coin of an imported key in such a PSBT from what it knows itself: the
+    /// internal key and the script tree of the imported key.
+    #[tokio::test]
+    async fn sign_imported_coin_in_a_psbt_without_taproot_key_data() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut bmp_wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        let pk = new_private_key();
+        let (a, b) = (
+            derive_public_key(&new_private_key()),
+            derive_public_key(&new_private_key()),
+        );
+        bmp_wallet.import_private_key(pk, Some(sample_tap_tree(&a, &b)))?;
+        let merkle_root = bmp_wallet.imported_keys()[0].merkle_root();
+        bmp_wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let to_address = "bcrt1pgsj9aw0wvs5h6zj780djnu267v6jazmfekwm4g4q4s6ax3w3t0lseqqnjc";
+        let to_address = to_address.parse::<Address<_>>()?.assume_checked();
+        let mut psbt = bmp_wallet.create_psbt(
+            vec![(to_address.script_pubkey(), Amount::from_sat(100_000))],
+            FeeRate::from_sat_per_kwu(2_500),
+        )?;
+        assert_eq!(
+            psbt.inputs.len(),
+            1,
+            "the imported coin pays for the output"
+        );
+        for input in &mut psbt.inputs {
+            input.tap_internal_key = None;
+            input.tap_merkle_root = None;
+            input.tap_key_origins.clear();
+        }
+
+        bmp_wallet.sign_selected_inputs(&mut psbt, &|_| true)?;
+
+        let witness = psbt.inputs[0]
+            .final_script_witness
+            .as_ref()
+            .expect("the imported coin is signed");
+        let sig = taproot::Signature::from_slice(&witness[0])?;
+        let secp = Secp256k1::new();
+        let output_key = derive_public_key(&pk)
+            .tap_tweak(&secp, merkle_root)
+            .0
+            .to_x_only_public_key();
+        let prevouts = [psbt.inputs[0].witness_utxo.clone().unwrap()];
+        let sighash = SighashCache::new(&psbt.unsigned_tx).taproot_key_spend_signature_hash(
+            0,
+            &Prevouts::All(&prevouts),
+            sig.sighash_type,
+        )?;
+        secp.verify_schnorr(&sig.signature, &Message::from(sighash), &output_key)?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_selection_with_main_and_imported() -> anyhow::Result<()> {
         let client = MockedBDKElectrum {};
