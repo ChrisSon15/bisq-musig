@@ -87,14 +87,42 @@ pub trait ProtocolWalletApi {
     fn record_transaction(&mut self, tx: &Transaction) -> Result<()>;
 
     /// Removes an unconfirmed transaction that [`Self::record_transaction`] recorded and that
-    /// can never confirm. The coins of the wallet that it spends count as unspent again, and its
-    /// outputs no longer count as incoming. A transaction that is unknown or confirmed is left
-    /// as it is.
+    /// can never confirm, together with every recorded unconfirmed transaction that spends one
+    /// of its outputs, directly or through other such transactions: these can never confirm
+    /// either. The coins of the wallet that the removed transactions spend count as unspent
+    /// again, and their outputs no longer count as incoming. A transaction that is unknown or
+    /// confirmed is left as it is.
     ///
     /// The wallet notices on its own when another transaction spends one of its coins. It
     /// cannot notice a transaction that spends a coin of somebody else, for example an input of
     /// the peer in the deposit transaction. The caller tells the wallet with this method.
     fn forget_transaction(&mut self, txid: Txid) -> Result<()>;
+
+    /// Raises the fee of the unconfirmed transaction `parent` with a child transaction: the
+    /// child spends the outputs of `parent` that belong to the wallet, adds coins of the wallet
+    /// if that is needed, and pays so much that parent and child together reach the fee rate
+    /// `package_fee_rate`. `parent_fee` is the fee that `parent` pays itself.
+    ///
+    /// The wallet records `parent` and the signed child as unconfirmed and returns the child. An
+    /// earlier child of `parent` is replaced. The caller sends parent and child to the network
+    /// as one package.
+    ///
+    /// The call fails, and records no child, if no output of `parent` belongs to the wallet, if
+    /// the wallet cannot pay the fee, or if the child would pay more than `max_child_fee`.
+    ///
+    /// The default implementation fits a wallet that cannot do this and returns an error.
+    fn create_fee_bump_child(
+        &mut self,
+        parent: &Transaction,
+        parent_fee: Amount,
+        package_fee_rate: FeeRate,
+        max_child_fee: Amount,
+    ) -> Result<Transaction> {
+        let _ = (parent, parent_fee, package_fee_rate, max_child_fee);
+        Err(WalletErrorKind::Unsupported(
+            "this wallet cannot build a child transaction that raises a fee",
+        ))
+    }
 
     /// Returns the two secret key shares of the trade `trade_id`, derived from the seed of the
     /// wallet as specified in `docs/specifications/trade/key-derivation.md`. The same seed and the
@@ -230,7 +258,13 @@ impl ProtocolWalletApi for Wallet {
     }
 
     fn forget_transaction(&mut self, txid: Txid) -> Result<()> {
-        self.apply_evicted_txs([(txid, seconds_since_epoch()?)]);
+        let evicted_at = seconds_since_epoch()?;
+        let mut evicted = self
+            .tx_graph()
+            .walk_descendants(txid, |_, descendant| Some(descendant))
+            .collect::<Vec<_>>();
+        evicted.push(txid);
+        self.apply_evicted_txs(evicted.into_iter().map(|txid| (txid, evicted_at)));
         Ok(())
     }
 

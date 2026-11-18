@@ -43,6 +43,10 @@ pub enum WalletErrorKind {
     InvalidTradeId(&'static str),
     #[error("this wallet does not support the operation: {0}")]
     Unsupported(&'static str),
+    #[error("the fee of the transaction cannot be raised with a child transaction: {0}")]
+    FeeBump(String),
+    AddUtxo(#[from] bdk_wallet::tx_builder::AddUtxoError),
+    PsbtFee(#[from] bdk_wallet::bitcoin::psbt::Error),
     Conversion(#[from] bdk_wallet::miniscript::descriptor::ConversionError),
     CreateTx(#[from] bdk_wallet::error::CreateTxError),
     #[error("imported key descriptor does not match its secret key")]

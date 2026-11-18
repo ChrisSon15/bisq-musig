@@ -2,12 +2,13 @@ use std::fs;
 use std::str::FromStr as _;
 
 use base64::Engine as _;
+use bdk_bitcoind_rpc::bitcoincore_rpc::RpcApi as _;
 use bdk_kyoto::bip157::tokio;
 use bdk_kyoto::{FeeRate, TrustedPeer};
-use bdk_wallet::bitcoin::{Address, Amount, Network};
+use bdk_wallet::bitcoin::{Address, Amount, Network, Transaction};
 use bdk_wallet::error::CreateTxError::OutputBelowDustLimit;
 use bdk_wallet::psbt::PsbtUtils as _;
-use bdk_wallet::{KeychainKind, SignOptions};
+use bdk_wallet::{KeychainKind, SignOptions, serde_json};
 use chain::client::{ChainClient, ClientError, PeerProblem};
 use rand::RngCore as _;
 use rusqlite::Connection;
@@ -1081,5 +1082,110 @@ fn trade_records_are_stored_in_the_wallet_database() -> anyhow::Result<()> {
     assert!(!contains(b"other trade") && !contains(b"trade-a"));
     let wrong_password: Password = "Wr0ng-Password!".parse().expect("valid password");
     assert!(BMPWallet::load_wallet(dir.path().into(), Network::Regtest, &wrong_password).is_err());
+    Ok(())
+}
+
+/// E9, E10 and F5 for the wallet: the fee of an unconfirmed transaction that pays a small
+/// output to the wallet, like the anchor of a warning transaction, is raised with a child
+/// transaction. The node holds parent and child with the fee rate that was asked for. A second
+/// call replaces the child with one that pays more. When the parent can never confirm, the
+/// wallet forgets parent and child, and the coins that the child spent are free again.
+#[tokio::test]
+async fn e9_fee_bump_child_for_a_transaction_with_a_low_fee() -> anyhow::Result<()> {
+    const FUNDING: Amount = Amount::from_sat(1_000_000);
+    const ANCHOR: Amount = Amount::from_sat(330);
+    let mut env = TestEnv::new()?;
+    let rpc = env.bitcoin_core_rpc_client()?;
+    let chain = scanner(&env);
+    let mut wallets = Vec::new();
+    for _ in 0..2 {
+        let dir = env.new_temp_path().to_path_buf();
+        let mut wallet = BMPWallet::new(dir.as_path().into(), &test_password(), Network::Regtest)?;
+        let address = wallet.next_unused_address(KeychainKind::External);
+        env.fund_address(&address, FUNDING)?;
+        wallets.push(wallet);
+    }
+    env.mine_block()?;
+    let mut payer = wallets.pop().expect("two wallets");
+    let mut wallet = wallets.pop().expect("two wallets");
+    sync_to_tip(&mut wallet, &chain, &env).await?;
+    sync_to_tip(&mut payer, &chain, &env).await?;
+
+    // The parent pays 1 sat per vbyte and has an output of 330 sat to the wallet.
+    let low_fee_rate = FeeRate::from_sat_per_vb(1).unwrap();
+    let anchor_address = wallet.get_new_address()?.address;
+    let parent = payer.send_to_address(&anchor_address, ANCHOR, low_fee_rate)?;
+    let parent_fee = FUNDING
+        - parent
+            .output
+            .iter()
+            .map(|output| output.value)
+            .sum::<Amount>();
+    let parent_txid = parent.compute_txid();
+    let package_fee_rate = |child: &Transaction, child_fee: Amount| {
+        (parent_fee + child_fee) / (parent.weight() + child.weight())
+    };
+    let fee_in_mempool =
+        |txid: &bdk_wallet::bitcoin::Txid| rpc.get_mempool_entry(txid).map(|entry| entry.fees.base);
+
+    // A child that would pay more than the limit is refused, and nothing is recorded.
+    let target = FeeRate::from_sat_per_vb(10).unwrap();
+    let refused = wallet.create_fee_bump_child(&parent, parent_fee, target, Amount::from_sat(100));
+    assert!(
+        matches!(&refused, Err(WalletErrorKind::FeeBump(reason)) if reason.contains("limit")),
+        "{refused:?}"
+    );
+    assert_eq!(wallet.unconfirmed_outgoing_transactions(), vec![]);
+
+    let limit = Amount::from_sat(50_000);
+    let child = wallet.create_fee_bump_child(&parent, parent_fee, target, limit)?;
+    assert!(
+        child
+            .input
+            .iter()
+            .any(|input| input.previous_output.txid == parent_txid),
+        "the child spends the output of the parent"
+    );
+    let package = [&parent, &child].map(bdk_wallet::bitcoin::consensus::encode::serialize_hex);
+    let _: serde_json::Value = rpc.call("submitpackage", &[serde_json::json!(package)])?;
+    let child_fee = fee_in_mempool(&child.compute_txid())?;
+    assert_eq!(fee_in_mempool(&parent_txid)?, parent_fee);
+    assert!(
+        package_fee_rate(&child, child_fee) >= target,
+        "parent and child pay {child_fee} + {parent_fee}"
+    );
+
+    // The next step of a fee schedule: the new child replaces the first one in the node.
+    let higher_target = FeeRate::from_sat_per_vb(20).unwrap();
+    let second_child = wallet.create_fee_bump_child(&parent, parent_fee, higher_target, limit)?;
+    assert_ne!(second_child.compute_txid(), child.compute_txid());
+    env.broadcast(&second_child)?;
+    assert!(fee_in_mempool(&child.compute_txid()).is_err(), "replaced");
+    let second_fee = fee_in_mempool(&second_child.compute_txid())?;
+    assert!(package_fee_rate(&second_child, second_fee) >= higher_target);
+    let to_send_again = wallet.unconfirmed_outgoing_transactions();
+    assert_eq!(to_send_again.len(), 1, "the first child is forgotten");
+    assert_eq!(to_send_again[0].compute_txid(), second_child.compute_txid());
+
+    // A refused call keeps the child that is on the network.
+    let refused = wallet.create_fee_bump_child(&parent, parent_fee, target, Amount::from_sat(100));
+    assert!(refused.is_err());
+    assert_eq!(wallet.unconfirmed_outgoing_transactions(), to_send_again);
+
+    env.mine_block()?;
+    sync_to_tip(&mut wallet, &chain, &env).await?;
+    assert_eq!(wallet.balance(), FUNDING + ANCHOR - second_fee);
+    assert_eq!(wallet.unconfirmed_outgoing_transactions(), vec![]);
+
+    // A parent that never confirms: the wallet forgets it together with its child.
+    let anchor_address = wallet.get_new_address()?.address;
+    let balance = wallet.balance();
+    let dead_parent = payer.send_to_address(&anchor_address, ANCHOR, low_fee_rate)?;
+    let dead_parent_fee = Amount::from_sat(200);
+    wallet.create_fee_bump_child(&dead_parent, dead_parent_fee, target, limit)?;
+    assert_eq!(wallet.unconfirmed_outgoing_transactions().len(), 1);
+    wallet.forget_transaction(dead_parent.compute_txid())?;
+    assert_eq!(wallet.unconfirmed_outgoing_transactions(), vec![]);
+    assert_eq!(wallet.balance(), balance);
     Ok(())
 }

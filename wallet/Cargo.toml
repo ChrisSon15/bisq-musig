@@ -26,6 +26,8 @@ test-utils = []
 
 [dev-dependencies]
 anyhow = { workspace = true }
+# The RPC interface of the test node, to look into its mempool.
+bdk_bitcoind_rpc = { workspace = true }
 bdk_wallet = { workspace = true, features = ["test-utils"] }
 bmp_tracing = { workspace = true }
 tempfile = { workspace = true }

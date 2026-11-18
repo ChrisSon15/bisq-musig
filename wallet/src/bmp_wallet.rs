@@ -824,10 +824,148 @@ impl BMPWallet {
         outgoing
     }
 
+    /// Removes the recorded unconfirmed transactions that spend an output of the transaction
+    /// `txid`, directly or through other such transactions, and with `with_parent` the
+    /// transaction itself. The wallet library keeps a transaction valid as long as a valid
+    /// transaction spends one of its outputs, so the descendants are removed one by one.
+    fn evict_with_descendants(&mut self, txid: Txid, with_parent: bool) -> Result<()> {
+        let evicted_at = seconds_since_epoch()?;
+        let wallets = std::iter::once(&mut self.wallet).chain(
+            self.imported_wallets
+                .iter_mut()
+                .map(|imported| &mut imported.wallet),
+        );
+        for wallet in wallets {
+            let mut evicted = wallet
+                .tx_graph()
+                .walk_descendants(txid, |_, descendant| Some(descendant))
+                .collect::<Vec<_>>();
+            if with_parent {
+                evicted.push(txid);
+            }
+            wallet.apply_evicted_txs(evicted.into_iter().map(|txid| (txid, evicted_at)));
+        }
+        Ok(())
+    }
+
+    /// Builds, signs and records a child transaction that raises the fee of `parent`. See
+    /// [`ProtocolWalletApi::create_fee_bump_child`].
+    pub fn create_fee_bump_child(
+        &mut self,
+        parent: &Transaction,
+        parent_fee: Amount,
+        package_fee_rate: FeeRate,
+        max_child_fee: Amount,
+    ) -> Result<Transaction> {
+        let failed = |reason: String| WalletErrorKind::FeeBump(reason);
+        let parent_txid = parent.compute_txid();
+        let own_outputs = (0u32..)
+            .zip(&parent.output)
+            .filter(|(_, output)| self.wallet.is_mine(output.script_pubkey.clone()))
+            .map(|(vout, _)| OutPoint::new(parent_txid, vout))
+            .collect::<Vec<_>>();
+        if own_outputs.is_empty() {
+            return Err(failed(format!(
+                "no output of the transaction {parent_txid} belongs to the wallet"
+            )));
+        }
+        // The wallet must know the parent to spend its outputs. An earlier child spends the
+        // same outputs, so it is removed first. If no new child can be built, the earlier
+        // child is recorded again: it can still be on the network.
+        let earlier_children = self
+            .wallet
+            .tx_graph()
+            .walk_descendants(parent_txid, |_, descendant| Some(descendant))
+            // Only a transaction that is valid for the wallet at the moment.
+            .filter_map(|descendant| self.wallet.get_tx(descendant))
+            .map(|descendant| Arc::clone(&descendant.tx_node.tx))
+            .collect::<Vec<_>>();
+        self.evict_with_descendants(parent_txid, false)?;
+        self.record_unconfirmed_transaction(parent)?;
+        let child =
+            self.build_fee_bump_child(parent, &own_outputs, parent_fee, package_fee_rate)?;
+        let result = child.and_then(|(child, paid)| {
+            if paid > max_child_fee {
+                return Err(failed(format!(
+                    "the child would pay {paid}, which is more than the limit of {max_child_fee}"
+                )));
+            }
+            self.record_unconfirmed_transaction(&child)?;
+            Ok(child)
+        });
+        if result.is_err() {
+            // The wallet library compares the time of the removal with the time at which a
+            // transaction was seen last, in seconds. The earlier child counts again only if it
+            // was seen after its removal.
+            let seen_after_removal = seconds_since_epoch()? + 1;
+            for earlier in earlier_children {
+                self.record_unconfirmed_transaction_at(&earlier, seen_after_removal)?;
+            }
+        }
+        result
+    }
+
+    /// Builds and signs the child of [`Self::create_fee_bump_child`]. Returns the child and the
+    /// fee that it pays, or the reason why the wallet cannot build it.
+    fn build_fee_bump_child(
+        &mut self,
+        parent: &Transaction,
+        own_outputs: &[OutPoint],
+        parent_fee: Amount,
+        package_fee_rate: FeeRate,
+    ) -> Result<Result<(Transaction, Amount)>> {
+        let failed = |reason: String| WalletErrorKind::FeeBump(reason);
+        let package_fee = |child: &Transaction| {
+            package_fee_rate
+                .checked_mul_by_weight(parent.weight() + child.weight())
+                .ok_or_else(|| failed("the fee is too large".to_owned()))
+        };
+        let change_script = self.next_address(KeychainKind::Internal)?.script_pubkey();
+        // The fee of the child depends on its weight, and its weight on the coins that pay the
+        // fee. The first round pays the fee rate for the child alone. Each further round pays
+        // what the round before lacked.
+        let mut child_fee = None;
+        for _ in 0..4 {
+            let mut builder = self.build_tx();
+            builder.add_utxos(own_outputs)?;
+            builder.drain_to(change_script.clone());
+            match child_fee {
+                Some(fee) => builder.fee_absolute(fee),
+                None => builder.fee_rate(package_fee_rate),
+            };
+            let mut psbt = match builder.finish() {
+                Ok(psbt) => psbt,
+                // For example: the coins of the wallet do not pay for the fee.
+                Err(error) => return Ok(Err(error.into())),
+            };
+            let paid = psbt.fee()?;
+            <Self as WalletApi>::sign(self, &mut psbt, SignOptions::default())?;
+            let child = psbt.extract_tx()?;
+            let needed = match package_fee(&child) {
+                Ok(fee) => fee.checked_sub(parent_fee).unwrap_or(Amount::ZERO),
+                Err(error) => return Ok(Err(error)),
+            };
+            if paid >= needed {
+                return Ok(Ok((child, paid)));
+            }
+            child_fee = Some(needed);
+        }
+        Ok(Err(failed(
+            "the fee of the child did not reach the fee rate".to_owned(),
+        )))
+    }
+
     /// Records a signed transaction as unconfirmed in the main wallet and in the wallets of the
     /// imported keys, and stores it. Its inputs count as spent from here on.
     pub fn record_unconfirmed_transaction(&mut self, tx: &Transaction) -> Result<()> {
-        let last_seen = seconds_since_epoch()?;
+        self.record_unconfirmed_transaction_at(tx, seconds_since_epoch()?)
+    }
+
+    fn record_unconfirmed_transaction_at(
+        &mut self,
+        tx: &Transaction,
+        last_seen: u64,
+    ) -> Result<()> {
         let tx_ref = Arc::new(tx.clone());
         let wallets = std::iter::once(&mut self.wallet).chain(
             self.imported_wallets
@@ -1037,17 +1175,19 @@ impl ProtocolWalletApi for BMPWallet {
     }
 
     fn forget_transaction(&mut self, txid: Txid) -> Result<()> {
-        let evicted_at = seconds_since_epoch()?;
-        let wallets = std::iter::once(&mut self.wallet).chain(
-            self.imported_wallets
-                .iter_mut()
-                .map(|imported| &mut imported.wallet),
-        );
-        for wallet in wallets {
-            wallet.apply_evicted_txs([(txid, evicted_at)]);
-        }
+        self.evict_with_descendants(txid, true)?;
         <Self as WalletApi>::persist(self)?;
         Ok(())
+    }
+
+    fn create_fee_bump_child(
+        &mut self,
+        parent: &Transaction,
+        parent_fee: Amount,
+        package_fee_rate: FeeRate,
+        max_child_fee: Amount,
+    ) -> Result<Transaction> {
+        self.create_fee_bump_child(parent, parent_fee, package_fee_rate, max_child_fee)
     }
 
     fn trade_key_shares(&self, trade_id: &str) -> Result<TradeKeyShares> {

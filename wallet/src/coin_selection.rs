@@ -19,36 +19,32 @@ impl CoinSelectionAlgorithm for AlwaysSpendImportedFirst {
         drain_script: &Script,
         rand: &mut R,
     ) -> Result<CoinSelectionResult, InsufficientFunds> {
-        let mut imported_utxos = self.0.clone();
-
-        // Attempt to build the tx with only imported if it fails before adding more utxos
-        let bnb = DefaultCoinSelectionAlgorithm::default();
-        let cs_result = bnb.coin_select(
-            imported_utxos.clone(),
-            optional_utxos.clone(),
+        // The imported coins are spent in every transaction, so they are required. The coins
+        // that the builder of the transaction requires stay required as well: a transaction that
+        // must spend a certain coin, like the child that raises the fee of its parent, is
+        // useless without it.
+        for imported in &self.0 {
+            let outpoint = imported.utxo.outpoint();
+            if required_utxos
+                .iter()
+                .all(|required| required.utxo.outpoint() != outpoint)
+            {
+                required_utxos.push(imported.clone());
+            }
+        }
+        optional_utxos.retain(|optional| {
+            required_utxos
+                .iter()
+                .all(|required| required.utxo.outpoint() != optional.utxo.outpoint())
+        });
+        DefaultCoinSelectionAlgorithm::default().coin_select(
+            required_utxos,
+            optional_utxos,
             fee_rate,
             target_amount,
             drain_script,
             rand,
-        );
-
-        if let Ok(res) = cs_result {
-            Ok(res)
-        } else {
-            // Take the required and put them inside the optional and replace the required with the
-            // imported utxos This is done so that imported utxos always get spent first
-            optional_utxos.append(&mut required_utxos);
-            required_utxos.append(&mut imported_utxos);
-
-            bnb.coin_select(
-                required_utxos,
-                optional_utxos,
-                fee_rate,
-                target_amount,
-                drain_script,
-                rand,
-            )
-        }
+        )
     }
 }
 
@@ -143,7 +139,7 @@ mod tests {
 
         let res = selection_strategy
             .coin_select(
-                imported_utxos.clone(),
+                Vec::new(),
                 local_utxos.clone(),
                 FeeRate::from_sat_per_kwu(50_000),
                 target_amount,
@@ -154,5 +150,38 @@ mod tests {
 
         assert_eq!(res.selected.len(), 1);
         assert!(matches!(res.excess, Excess::Change { amount: _, fee: _ }));
+
+        // A coin that the builder of the transaction requires is spent, also when the other
+        // coins would pay for the target: it stays required next to the imported coins.
+        let required = local_utxos[2].clone();
+        let imported_utxos = vec![
+            foreign_utxo(Amount::from_int_btc(1), 0),
+            foreign_utxo(Amount::from_btc(0.3).unwrap(), 1),
+        ];
+        let selection_strategy = AlwaysSpendImportedFirst(imported_utxos.clone());
+        let res = selection_strategy
+            .coin_select(
+                vec![required.clone()],
+                local_utxos.clone(),
+                FeeRate::from_sat_per_kwu(50_000),
+                target_amount,
+                &drain_script,
+                &mut thread_rng(),
+            )
+            .unwrap();
+        let selected = res
+            .selected
+            .iter()
+            .map(bdk_wallet::Utxo::outpoint)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected.len(),
+            3,
+            "the required coin and both imported coins"
+        );
+        assert!(selected.contains(&required.utxo.outpoint()));
+        for imported in &imported_utxos {
+            assert!(selected.contains(&imported.utxo.outpoint()));
+        }
     }
 }
