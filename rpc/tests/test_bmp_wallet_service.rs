@@ -216,6 +216,59 @@ async fn operations_before_open_are_refused_over_grpc() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `SubscribeWalletEvents` over gRPC: the stream is accepted before a wallet is open, and gets the
+/// state of the wallet when the wallet is opened. A stream that is opened afterwards starts with
+/// the state.
+#[tokio::test(flavor = "multi_thread")]
+async fn wallet_events_travel_over_grpc() -> anyhow::Result<()> {
+    use futures_util::StreamExt as _;
+    use rpc::pb::bmp_wallet::{SubscribeWalletEventsRequest, WalletEventType};
+
+    let dir = tempfile::tempdir()?;
+    let mut fixture = WalletServiceFixture::start(dir.path()).await?;
+    let mut events = fixture
+        .client
+        .subscribe_wallet_events(SubscribeWalletEventsRequest {})
+        .await?
+        .into_inner();
+    let nothing = tokio::time::timeout(Duration::from_millis(200), events.next()).await;
+    assert!(nothing.is_err(), "no event while no wallet is open");
+
+    fixture.open(PASSWORD).await?;
+    let state = tokio::time::timeout(Duration::from_secs(10), events.next())
+        .await?
+        .context("the stream is open")??;
+    assert_eq!(state.r#type(), WalletEventType::WalletState);
+    assert_eq!(state.chain_height, 0);
+    let balance = state.balance.context("the state contains the balance")?;
+    assert_eq!((balance.balance, balance.locked), (0, 0));
+    assert_eq!(state.tx_id, None);
+
+    let mut later = fixture
+        .client
+        .subscribe_wallet_events(SubscribeWalletEventsRequest {})
+        .await?
+        .into_inner();
+    let first = tokio::time::timeout(Duration::from_secs(10), later.next())
+        .await?
+        .context("the stream is open")??;
+    assert_eq!(first, state_event(&balance));
+    Ok(())
+}
+
+/// The event with the state of an empty wallet.
+fn state_event(
+    balance: &rpc::pb::bmp_wallet::GetBalanceResponse,
+) -> rpc::pb::bmp_wallet::WalletEvent {
+    rpc::pb::bmp_wallet::WalletEvent {
+        r#type: rpc::pb::bmp_wallet::WalletEventType::WalletState.into(),
+        chain_height: 0,
+        balance: Some(*balance),
+        tx_id: None,
+        block_height: None,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn wallet_existence_is_reported_without_a_password_over_grpc() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;

@@ -795,6 +795,24 @@ impl BMPWallet {
         Ok(Some(tx))
     }
 
+    /// The transactions that are valid for the wallet, of the seed wallet and of the imported
+    /// keys, each with the height of the block that contains it, or `None` while it is
+    /// unconfirmed.
+    pub fn transaction_block_heights(&self) -> HashMap<Txid, Option<u32>> {
+        let wallets = std::iter::once(&self.wallet).chain(
+            self.imported_wallets
+                .iter()
+                .map(|imported| &imported.wallet),
+        );
+        wallets
+            .flat_map(|wallet| wallet.transactions())
+            .map(|tx| {
+                let block_height = tx.chain_position.confirmation_height_upper_bound();
+                (tx.tx_node.txid, block_height)
+            })
+            .collect()
+    }
+
     /// The unconfirmed transactions that spend a coin of the seed wallet or of an imported key:
     /// payments, drain transactions and transactions of trades that the wallet recorded and that
     /// are in no block yet. The owner of the wallet sends them to the network again until they

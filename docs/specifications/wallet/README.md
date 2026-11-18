@@ -9,12 +9,15 @@ behaviour and the reasons. The behaviour of the trade protocol itself is specifi
 | [trade-keys.md](trade-keys.md) | Keys and addresses that the wallet issues to a trade; key shares |
 | [coin-reservation.md](coin-reservation.md) | Reservation of the coins of a deposit; recording of transactions that the wallet did not build |
 | [imported-keys.md](imported-keys.md) | Import of the key of a payout, start of its scan, spending order, drain, storage |
+| [events.md](events.md) | Events by which the wallet service reports a change of the wallet to its caller |
 
 Findings and decisions refer to `concept/CompletionPlan.md` (F12 to F19, D8, D10).
 
 ## Open points
 
-No point is open.
+| # | Question | Rule in the specification | File |
+|---|---|---|---|
+| W5 | Which transport carries the events of the wallet? An earlier design note proposed a publish and subscribe socket (ZeroMQ). | A stream of the gRPC service, like the events of a trade. No second transport. | [events.md](events.md) |
 
 ## Decided points
 

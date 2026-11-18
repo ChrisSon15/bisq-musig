@@ -77,6 +77,44 @@ service Wallet {
     // The transaction is stored in the wallet before it is sent. Coins that are locked for an
     // open trade are not moved. The wallet stays open. FAILED_PRECONDITION if no wallet is open.
     rpc Close (CloseRequest) returns (CloseResponse);
+    // Addition over bisq2's copy: the changes of the wallet, so that a client does not have to
+    // ask at intervals. The stream starts with the state of the wallet if a wallet is open;
+    // otherwise the state follows when the wallet is opened. An event is a hint: the state of
+    // the wallet is what the other requests return.
+    rpc SubscribeWalletEvents (SubscribeWalletEventsRequest) returns (stream WalletEvent);
+}
+
+message SubscribeWalletEventsRequest {}
+
+enum WalletEventType {
+    // The state of the wallet: the first event of a stream, the event when the wallet is
+    // opened, and the event after the stream has lost events. The client reads the transactions
+    // and the outputs of the wallet again.
+    WALLET_STATE = 0;
+    // The wallet has seen a new last block of the chain.
+    WALLET_CHAIN_TIP = 1;
+    // The balance changed.
+    WALLET_BALANCE = 2;
+    // A transaction of the wallet is new, or the block that contains it changed.
+    WALLET_TRANSACTION = 3;
+    // A transaction is no longer valid for the wallet: another transaction spent its coins, or
+    // the wallet was told to forget it.
+    WALLET_TRANSACTION_REMOVED = 4;
+}
+
+message WalletEvent {
+    WalletEventType type = 1;
+    // The height of the last block that the wallet has seen, after the change. Set in every
+    // event.
+    uint32 chainHeight = 2;
+    // Set in the events WALLET_STATE and WALLET_BALANCE, with the meaning of the response of
+    // GetBalance.
+    optional GetBalanceResponse balance = 3;
+    // Set in the events WALLET_TRANSACTION and WALLET_TRANSACTION_REMOVED.
+    optional string txId = 4;
+    // Set in the event WALLET_TRANSACTION if the transaction is in a block: the height of the
+    // block. Not set while the transaction is unconfirmed.
+    optional uint32 blockHeight = 5;
 }
 
 

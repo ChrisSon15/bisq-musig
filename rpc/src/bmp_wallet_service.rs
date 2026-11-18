@@ -50,10 +50,12 @@ use crate::pb::bmp_wallet::{
     GetWalletAddressesResponse, IsWalletReadyRequest, IsWalletReadyResponse,
     ListTransactionsRequest, ListTransactionsResponse, ListUtxosRequest, ListUtxosResponse,
     OpenOrCreateWalletRequest, OpenOrCreateWalletResponse, ReleaseUtxoRequest, ReleaseUtxoResponse,
-    SendToAddressRequest, SendToAddressResponse, wallet_server,
+    SendToAddressRequest, SendToAddressResponse, SubscribeWalletEventsRequest, WalletEvent,
+    WalletEventType, wallet_server,
 };
-use crate::server::handle_request_async;
+use crate::server::{TracedResultStream, TracedResultStreamExt as _, handle_request_async};
 use crate::wallet::{Result as WalletResult, TxConfidence, tx_confidence_entries};
+use crate::wallet_events::{WalletChange, WalletEvents};
 
 /// How often the wallet is re-synced against the chain data source.
 const DEFAULT_POLL_PERIOD: Duration = Duration::from_secs(30);
@@ -196,6 +198,11 @@ pub trait BmpWalletService {
     /// the call still succeeds. Locked coins, which belong to open trades, are not moved. The
     /// wallet stays open.
     async fn close(&self) -> anyhow::Result<Option<Txid>>;
+
+    /// The changes of the wallet from now on: a new last block, a changed balance, a new or
+    /// changed transaction. The stream starts with the state of the wallet if a wallet is open.
+    /// Otherwise the state follows when the wallet is opened.
+    fn wallet_events(&self) -> BoxStream<'static, WalletChange>;
 }
 
 /// A [`BmpWalletService`] whose every operation is forwarded to [`BMPWallet`].
@@ -223,6 +230,8 @@ pub struct BMPWalletServiceImpl<S> {
     broadcaster: Option<Arc<dyn ChainApi>>,
     /// The trades of the engine, to protect the coins that they have reserved.
     trade_store: Option<Arc<dyn TradeModelStore>>,
+    /// The events of the wallet for the subscribers of `SubscribeWalletEvents`.
+    events: WalletEvents,
     /// Set once `wallet` holds an open wallet (it is never closed again), so that the status
     /// can be read without waiting on the wallet lock, which a sync may hold for a long time.
     open: AtomicBool,
@@ -252,6 +261,7 @@ impl<S> BMPWalletServiceImpl<S> {
             chain_data_source: None,
             broadcaster: None,
             trade_store: None,
+            events: WalletEvents::default(),
             open: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             poll_period: DEFAULT_POLL_PERIOD,
@@ -319,6 +329,7 @@ impl<S: ChainDataSource + Sync> BMPWalletServiceImpl<S> {
             .lock()
             .unwrap()
             .sync(tx_confidence_entries(wallet));
+        self.events.publish_changes(wallet);
         Ok(true)
     }
 }
@@ -525,6 +536,7 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
             .lock()
             .unwrap()
             .sync(tx_confidence_entries(&wallet));
+        self.events.publish_changes(&wallet);
         *guard = Some(wallet);
         self.open.store(true, Ordering::Release);
 
@@ -597,6 +609,7 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
 
         let tx: Transaction =
             wallet.send_to_address(&address, amount, fee_rate.unwrap_or(DEFAULT_FEE_RATE))?;
+        self.events.publish_changes(wallet);
 
         // Broadcast while still holding the lock, so a concurrent send can't build a conflicting
         // transaction from the same UTXO set before this one is out. `transaction_broadcast` is
@@ -629,6 +642,7 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
             return Ok(false);
         }
         wallet.unlock_utxo(utxo)?;
+        self.events.publish_changes(wallet);
         info!(%utxo, "Released the reservation of a coin on request.");
         Ok(true)
     }
@@ -639,6 +653,7 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
         let Some(drain_tx) = wallet.drain_imported_coins(engine_fee_rate())? else {
             return Ok(None);
         };
+        self.events.publish_changes(wallet);
         let txid = drain_tx.compute_txid();
         // The transaction is stored in the wallet at this point. A failure to send it must not
         // fail the close: the wallet still knows the transaction and its coins count as spent.
@@ -659,6 +674,10 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
             ),
         }
         Ok(Some(txid))
+    }
+
+    fn wallet_events(&self) -> BoxStream<'static, WalletChange> {
+        self.events.subscribe()
     }
 
     async fn full_balance(&self) -> anyhow::Result<Balance> {
@@ -691,6 +710,9 @@ impl<S: Send + Sync> crate::server::TradeWalletProvider for BMPWalletServiceImpl
         match self.wallet.lock().await.as_mut() {
             Some(wallet) => {
                 operation(wallet);
+                // A request of a trade can reserve or release coins, import the key of a
+                // payout, and record or forget a transaction.
+                self.events.publish_changes(wallet);
                 true
             }
             None => false,
@@ -709,6 +731,22 @@ pub struct BmpWalletImpl {
 
 #[tonic::async_trait]
 impl wallet_server::Wallet for BmpWalletImpl {
+    type SubscribeWalletEventsStream = TracedResultStream<WalletEvent>;
+
+    #[instrument(skip_all)]
+    async fn subscribe_wallet_events(
+        &self,
+        request: Request<SubscribeWalletEventsRequest>,
+    ) -> Result<Response<Self::SubscribeWalletEventsStream>> {
+        handle_request_async(request, |_request| async {
+            let events = self.wallet_service.wallet_events();
+            Ok(events
+                .map(|change| Ok(WalletEvent::from(change)))
+                .box_traced())
+        })
+        .await
+    }
+
     #[instrument(skip_all)]
     async fn open_or_create_wallet(
         &self,
@@ -1000,6 +1038,50 @@ impl From<Balance> for GetBalanceResponse {
     }
 }
 
+impl From<WalletChange> for WalletEvent {
+    fn from(change: WalletChange) -> Self {
+        let event = |r#type: WalletEventType, chain_height| Self {
+            r#type: r#type.into(),
+            chain_height,
+            balance: None,
+            tx_id: None,
+            block_height: None,
+        };
+        match change {
+            WalletChange::State {
+                height,
+                available,
+                locked,
+            } => Self {
+                balance: Some(GetBalanceResponse::from_balances(&available, &locked)),
+                ..event(WalletEventType::WalletState, height)
+            },
+            WalletChange::Tip { height } => event(WalletEventType::WalletChainTip, height),
+            WalletChange::Balance {
+                height,
+                available,
+                locked,
+            } => Self {
+                balance: Some(GetBalanceResponse::from_balances(&available, &locked)),
+                ..event(WalletEventType::WalletBalance, height)
+            },
+            WalletChange::Transaction {
+                height,
+                txid,
+                block_height,
+            } => Self {
+                tx_id: Some(txid.to_string()),
+                block_height,
+                ..event(WalletEventType::WalletTransaction, height)
+            },
+            WalletChange::TransactionRemoved { height, txid } => Self {
+                tx_id: Some(txid.to_string()),
+                ..event(WalletEventType::WalletTransactionRemoved, height)
+            },
+        }
+    }
+}
+
 impl GetBalanceResponse {
     fn from_balances(available: &Balance, locked: &Balance) -> Self {
         let total = available.clone() + locked.clone();
@@ -1222,6 +1304,107 @@ mod tests {
             self.0.lock().unwrap().push(txid);
             Ok(txid)
         }
+    }
+
+    /// The events of the wallet: a stream that is opened before the wallet gets the state when
+    /// the wallet is opened. A block with a payment gives the new tip, the transaction and the
+    /// balance. A payment of the wallet gives its transaction and the balance. A stream that is
+    /// opened later starts with the state.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wallet_events_report_tip_transactions_and_balance() {
+        use bdk_wallet::bitcoin::BlockHash;
+        use bdk_wallet::bitcoin::hashes::Hash as _;
+        use bdk_wallet::chain::{BlockId, ConfirmationBlockTime};
+        use bdk_wallet::test_utils::{ReceiveTo, insert_checkpoint, receive_output_to_address};
+
+        let (_dir, service) = service();
+        let service = service.with_broadcaster(Arc::new(RecordingBroadcaster::default()) as _);
+        let mut events = service.wallet_events();
+        let mut next = || {
+            let event = futures_util::FutureExt::now_or_never(events.next());
+            event.flatten()
+        };
+        assert_eq!(next(), None, "no wallet is open");
+
+        service.open_or_create_wallet(PASSWORD).await.unwrap();
+        let empty = Balance::default();
+        let state = WalletChange::State {
+            height: 0,
+            available: empty.clone(),
+            locked: empty.clone(),
+        };
+        assert_eq!(next(), Some(state));
+
+        let block = BlockId {
+            height: 1,
+            hash: BlockHash::from_byte_array([1; 32]),
+        };
+        let funding = {
+            let mut guard = service.wallet.lock().await;
+            let wallet = guard.as_mut().unwrap();
+            let address = wallet.get_new_address().unwrap().address;
+            insert_checkpoint(wallet, block);
+            let anchor = ConfirmationBlockTime {
+                block_id: block,
+                confirmation_time: 1,
+            };
+            let amount = Amount::from_sat(100_000);
+            receive_output_to_address(wallet, address, amount, ReceiveTo::Block(anchor)).txid
+        };
+        assert!(service.sync_once(&NoopChainDataSource).await.unwrap());
+        let funded = Balance {
+            confirmed: Amount::from_sat(100_000),
+            ..Balance::default()
+        };
+        assert_eq!(next(), Some(WalletChange::Tip { height: 1 }));
+        assert_eq!(
+            next(),
+            Some(WalletChange::Transaction {
+                height: 1,
+                txid: funding,
+                block_height: Some(1),
+            })
+        );
+        assert_eq!(
+            next(),
+            Some(WalletChange::Balance {
+                height: 1,
+                available: funded.clone(),
+                locked: empty.clone(),
+            })
+        );
+        // A sync that changes nothing gives no event.
+        assert!(service.sync_once(&NoopChainDataSource).await.unwrap());
+        assert_eq!(next(), None);
+
+        let address = REGTEST_ADDRESS.parse().unwrap();
+        let payment = service
+            .send_to_address(PASSWORD, address, Amount::from_sat(10_000), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            next(),
+            Some(WalletChange::Transaction {
+                height: 1,
+                txid: payment,
+                block_height: None,
+            })
+        );
+        let Some(WalletChange::Balance { available, .. }) = next() else {
+            panic!("the payment changes the balance")
+        };
+        assert!(available.trusted_pending > Amount::ZERO);
+        assert!(available.total() < Amount::from_sat(90_000));
+        assert_eq!(next(), None);
+
+        // A stream that is opened now starts with the state.
+        let mut later = service.wallet_events();
+        let first = futures_util::FutureExt::now_or_never(later.next()).flatten();
+        assert!(
+            matches!(&first, Some(WalletChange::State { height: 1, available: now, .. })
+                if *now == available),
+            "{first:?}"
+        );
     }
 
     /// N5, M4, M8: a transaction of the wallet that an earlier run of the program stored and
