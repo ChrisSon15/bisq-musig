@@ -20,8 +20,9 @@ use crate::pb::musigrpc::{
 /// Serializers that stand in for a secret's value.
 ///
 /// `handle_request` logs every request (and response) as JSON, so any field carrying a password,
-/// passphrase or seed phrase is wired up to one of these in `build.rs`. The field still shows up
-/// in the log — so it's obvious whether the client sent one — but never its content.
+/// passphrase, seed phrase or private key share is wired up to one of these in `build.rs`. The
+/// field still shows up in the log — so it's obvious whether the client sent one — but never
+/// its content.
 pub(crate) mod redact {
     use serde::Serializer;
 
@@ -33,6 +34,63 @@ pub(crate) mod redact {
 
     pub fn string_vec<S: Serializer>(value: &[String], serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_seq(value.iter().map(|_| PLACEHOLDER))
+    }
+
+    /// For an optional secret: the log shows whether the field is set.
+    #[expect(
+        clippy::ref_option,
+        reason = "the signature that `serialize_with` requires"
+    )]
+    pub fn opt_bytes<S: Serializer>(
+        value: &Option<Vec<u8>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(_) => serializer.serialize_str(PLACEHOLDER),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bdk_wallet::serde_json;
+
+    use crate::pb::musigrpc::{CloseTradeRequest, CloseTradeResponse, SwapTxSignatureResponse};
+
+    /// K5 (F7): the form in which requests and responses are written to the log contains no
+    /// private key share, and still shows whether one is set.
+    #[test]
+    fn k5_logged_messages_contain_no_private_key_share() {
+        let share = vec![0xAB; 32];
+        let logged = [
+            serde_json::to_string(&CloseTradeRequest {
+                my_output_peers_prv_key_share: Some(share.clone()),
+                ..CloseTradeRequest::default()
+            }),
+            serde_json::to_string(&SwapTxSignatureResponse {
+                peer_output_prv_key_share: Some(share.clone()),
+            }),
+            serde_json::to_string(&CloseTradeResponse {
+                peer_output_prv_key_share: Some(share),
+                ..CloseTradeResponse::default()
+            }),
+        ];
+        for message in logged {
+            let message = message.expect("serializable");
+            // The share in the forms that the log has used: base64 and hex.
+            assert!(!message.contains("q6ur"), "{message}");
+            assert!(!message.to_lowercase().contains("abab"), "{message}");
+            assert!(
+                message.contains("PrvKeyShare\":\"<redacted>\""),
+                "{message}"
+            );
+        }
+        let unset = serde_json::to_string(&CloseTradeRequest::default()).expect("serializable");
+        assert!(
+            unset.contains("\"myOutputPeersPrvKeyShare\":null"),
+            "{unset}"
+        );
     }
 }
 

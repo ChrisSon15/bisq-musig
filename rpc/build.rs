@@ -33,8 +33,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .serde_serialized_type("SwapTxSignatureRequest", &[
             base64("swapTxInputPeersPartialSignature")
         ])
+        // A private key share is a secret: with it and his own share, its receiver can spend
+        // the payout. Its value is not written to the log.
         .serde_serialized_type("CloseTradeRequest", &[
-            opt_base64("myOutputPeersPrvKeyShare"), opt_hex("swapTx")
+            redacted_opt_bytes("myOutputPeersPrvKeyShare"), opt_hex("swapTx")
         ])
         .serde_serialized_type("CustomCloseTradeRequest", &[
             base64("peersCustomPayoutPsbt")
@@ -50,10 +52,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             hex("tx")
         ])
         .serde_serialized_type("SwapTxSignatureResponse", &[
-            opt_base64("peerOutputPrvKeyShare")
+            redacted_opt_bytes("peerOutputPrvKeyShare")
         ])
         .serde_serialized_type("CloseTradeResponse", &[
-            opt_base64("peerOutputPrvKeyShare"), opt_hex("swapTx"), opt_hex("penaltyTx")
+            redacted_opt_bytes("peerOutputPrvKeyShare"), opt_hex("swapTx"), opt_hex("penaltyTx")
         ])
         .serde_serialized_type("CustomPayoutPsbt", &[
             base64("psbt")
@@ -162,6 +164,13 @@ const fn redacted_string(field: &str) -> CustomField<'_> {
     (
         field,
         Cow::Borrowed("#[serde(serialize_with = \"crate::pb::convert::redact::string\")]"),
+    )
+}
+
+const fn redacted_opt_bytes(field: &str) -> CustomField<'_> {
+    (
+        field,
+        Cow::Borrowed("#[serde(serialize_with = \"crate::pb::convert::redact::opt_bytes\")]"),
     )
 }
 
