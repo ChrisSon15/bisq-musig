@@ -320,6 +320,46 @@ fn c1_c4_forced_close_and_key_share_from_the_spend() {
     }
 }
 
+/// D23: with a forced close margin in the configuration, the seller's engine closes by force
+/// when that number of blocks remains, which is earlier than at the release safety margin. The
+/// rule for the release does not change.
+#[test]
+fn d23_forced_close_margin_of_the_configuration() {
+    let (mut buyer, mut seller) = trade(BUYER_SELLER_ROLES[0]);
+    let forced_close_margin = 12;
+    seller.model.received.config = Some(
+        config()
+            .with_forced_close_margin(forced_close_margin)
+            .expect("valid"),
+    );
+    observe_both(&mut buyer, &mut seller, &facts(3, &[]));
+    start_payment_and_release(&mut buyer, &mut seller);
+
+    // 13 blocks remain: nothing happens.
+    observe(&mut seller, &facts(WARNING_LOCK_TIME - 13, &[]));
+    assert_eq!(seller.model.state(), TradeState::SellerReadyToRelease);
+    assert_eq!(kinds(&seller), vec![]);
+    // 12 blocks remain: the forced close margin.
+    observe(&mut seller, &facts(WARNING_LOCK_TIME - 12, &[]));
+    assert_eq!(seller.model.state(), closed(ClosureType::Forced));
+    assert_eq!(kinds(&seller), vec![TxKind::Swap]);
+
+    // A release is still possible while more blocks than the release safety margin remain. The
+    // engine then closes by force at its next look at the chain.
+    let (mut buyer, mut seller) = trade(BUYER_SELLER_ROLES[0]);
+    seller.model.received.config = Some(
+        config()
+            .with_forced_close_margin(forced_close_margin)
+            .expect("valid"),
+    );
+    let late = facts(WARNING_LOCK_TIME - RELEASE_SAFETY_MARGIN - 1, &[]);
+    observe_both(&mut buyer, &mut seller, &late);
+    start_payment_and_release(&mut buyer, &mut seller);
+    assert_eq!(seller.model.state(), TradeState::SellerReadyToRelease);
+    observe(&mut seller, &late);
+    assert_eq!(seller.model.state(), closed(ClosureType::Forced));
+}
+
 /// C1 on request: the seller can ask for the forced close at any time after the release.
 #[test]
 fn c1_forced_close_on_request() {

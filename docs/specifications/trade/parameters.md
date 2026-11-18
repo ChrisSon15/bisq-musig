@@ -69,6 +69,7 @@ same meaning.
 | Claim lock time | blocks | Relative lock time of both claim transactions, counted from the confirmation of the warning |
 | Deposit timeout | blocks | Number of blocks without a confirmed deposit after which the trader aborts the deposit ([setup-and-deposit.md](setup-and-deposit.md)) |
 | Release safety margin | blocks | The seller does not release the payout when fewer blocks than this remain before the buyer's warning lock time ends ([closing.md](closing.md)) |
+| Forced close margin | blocks | The seller's engine publishes the swap transaction on its own when this number of blocks, or fewer, remain before the buyer's warning lock time ends, and the buyer has not answered the release ([closing.md](closing.md)) |
 | Engine fee rate | sat per vbyte | Fee rate of the transactions that the engine builds on its own ([fees.md](fees.md)) |
 
 | Value | Environment variable | Option of `musigd` | Default |
@@ -77,6 +78,7 @@ same meaning.
 | Claim lock time | `BISQ_MUSIG_CLAIM_LOCK_TIME` | `--claim-lock-time` | 720 |
 | Deposit timeout | `BISQ_MUSIG_DEPOSIT_TIMEOUT` | `--deposit-timeout` | 144 |
 | Release safety margin | `BISQ_MUSIG_RELEASE_SAFETY_MARGIN` | `--release-safety-margin` | 6 |
+| Forced close margin | `BISQ_MUSIG_FORCED_CLOSE_MARGIN` | `--forced-close-margin` | The release safety margin |
 
 An option has priority over the environment variable. The engine fee rate has no configuration
 yet ([fees.md](fees.md)). The default values are open point O7 in [README.md](README.md).
@@ -109,6 +111,11 @@ Lock times:
   Otherwise no time would be left in which the seller may release.
 - The claim lock time is larger than the redirect lock time. Otherwise the peer could not publish
   a redirect transaction before the claim becomes valid.
+- The forced close margin is not smaller than the release safety margin. Otherwise the swap
+  transaction would not have the time to confirm that the release safety margin reserves for it.
+- The forced close margin is smaller than the warning lock time minus `MIN_CONFIRMATIONS`.
+  Otherwise every release would be followed by the swap transaction at once, and no cooperative
+  close would be possible.
 
 Amounts (all conditions use the prepared fee rate and the weights of
 [transactions.md](transactions.md)):

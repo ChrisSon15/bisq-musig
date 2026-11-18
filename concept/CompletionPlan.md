@@ -12,7 +12,7 @@ section 8 under WP1 and WP2. The file and line references of
 the plan point to the code after WP1. The other text of the plan still describes the state of
 revision 3; sections 2 and 4.3 and the findings name what WP1 changed.
 
-The decisions D17 to D22 and the tests G13 to G15 were added on 2026-11-18.
+The decisions D17 to D23 and the tests G13 to G15 were added on 2026-11-18.
 
 The specification of WP0 was written on 2026-11-18 to `docs/specifications/trade/`. Its README
 lists the open points that wait for a confirmation by the project owner. On the same day O2 was
@@ -301,6 +301,7 @@ The decisions D1 to D16 were taken by the project owner on 2026-11-17, D17 and D
 | D20 | Which peers does the engine connect to? | 2026-11-18: only the peers that are configured for `musigd`. Reason given: the software operates only on regtest at present. | `ChainClient` restricts the library to the peers of `--wallet-peer`. The library would otherwise look for peers through DNS seeds when the configured peers fail. Without a reachable configured peer the engine waits, reports the condition and refuses the requests that need the chain. The decision must be looked at again before the software is used on another network than regtest. Tests J5, J10. |
 | D21 | What does the service answer to a request that needs the chain while no peer is reachable, or while no peer serves compact block filters? | 2026-11-18: `SubscribeTxConfirmationStatus` is accepted, and its events arrive when a peer is reachable again. `PublishDepositTx` stays refused. | A request that only observes changes no trade, and a refusal informed only a caller who subscribed during the problem, while it could make a caller that does not repeat the request lose its events for good. A request that must send a transaction is refused with `UNAVAILABLE` before the trade is changed. Consequence: an accepted subscription does not tell the caller that the chain is not observed. The event stream of a trade must report a problem with the peers and its end (WP4). Test J10. |
 | D22 | Which state changes of a trade follow from the chain, and do they go back after a reorganisation? | 2026-11-18: accepted as specified in `docs/specifications/trade/trade-states.md`. | The engine keeps the state that requests caused (`state`) and derives the reported state from it and from the confirmed transactions at every look at the chain (`observed_state`). A derived state goes back when a reorganisation removes its transaction, and it can follow a state that the table of state changes does not connect with it, for example the warning state of the peer after the trader decided to publish his own warning. Two changes that the chain causes stay: the buyer's close after he read the seller's key share from a spend, and the seller's forced close at the release safety margin. The trade store of WP5 stores the state that requests caused; the derived state follows from the chain after a restart. Tests J1, J3, J4, E6. |
+| D23 | When does the seller's engine publish the swap transaction on its own, when the buyer does not answer the release (D7)? | 2026-11-18: about ten days after the deposit with the default values is the intended time, and the time must be configurable. | New configuration value "forced close margin" of the engine: `BISQ_MUSIG_FORCED_CLOSE_MARGIN` or `--forced-close-margin` of `musigd`. The engine closes by force when the number of blocks before the buyer's warning becomes valid falls to this margin. Without a value it is the release safety margin, as before. Limits: not smaller than the release safety margin, and smaller than the warning lock time minus 3. The rule for the release (F6) does not change. A release inside the forced close margin is followed by the swap transaction at once. Open point O8 of the specification is closed. Tests C4, and the unit tests of the configuration. |
 
 What D8 and answer 7 of section 12 mean together: `musigd` does not run while bisq2 is closed, so
 nothing is watched in that time. For closed trades the drain at `close` is then the only
@@ -628,7 +629,8 @@ Done:
   transaction, custom payout. All closure types can be reached, also after two competing
   warnings. The derived state goes back after a reorganisation (J1, J3, J4).
 - Forced close: the seller's engine publishes the swap transaction on request, and on its own at
-  the release safety margin. The buyer's engine reads the key share from any key path spend of
+  the forced close margin of the configuration (D23), which is the release safety margin unless
+  it is set. The buyer's engine reads the key share from any key path spend of
   the seller's payout and imports the payout.
 - Protection after close (D8): a closed trade is watched until it is final, and a warning of the
   peer is answered with the penalty.

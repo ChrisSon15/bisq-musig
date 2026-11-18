@@ -82,17 +82,28 @@ struct Cli {
         default_value_t = EngineConfig::DEFAULT_RELEASE_SAFETY_MARGIN
     )]
     release_safety_margin: u16,
+
+    /// The seller's engine publishes the swap transaction on its own when this number of blocks,
+    /// or fewer, remain before the buyer's warning transaction becomes valid, and the buyer has
+    /// not answered the release. Without a value it is the release safety margin. It cannot be
+    /// smaller than the release safety margin.
+    #[arg(long, env = "BISQ_MUSIG_FORCED_CLOSE_MARGIN")]
+    forced_close_margin: Option<u16>,
 }
 
 impl Cli {
     /// The configuration of the trade engine, from the options and the environment variables.
     fn engine_config(&self) -> Result<EngineConfig, EngineConfigError> {
-        EngineConfig::new(
+        let config = EngineConfig::new(
             self.warning_lock_time,
             self.claim_lock_time,
             self.deposit_timeout,
             self.release_safety_margin,
-        )
+        )?;
+        match self.forced_close_margin {
+            Some(margin) => config.with_forced_close_margin(margin),
+            None => Ok(config),
+        }
     }
 }
 
@@ -195,6 +206,7 @@ mod tests {
             "--claim-lock-time=10",
             "--deposit-timeout=12",
             "--release-safety-margin=2",
+            "--forced-close-margin=5",
         ])
         .expect("valid command line");
         let config = cli.engine_config().expect("valid configuration");
@@ -202,6 +214,27 @@ mod tests {
         assert_eq!(config.claim_lock_time(), LockTime::from_height(10));
         assert_eq!(config.deposit_timeout(), 12);
         assert_eq!(config.release_safety_margin(), 2);
+        assert_eq!(config.forced_close_margin(), 5);
+
+        // Without the option the forced close margin is the release safety margin.
+        let cli = Cli::try_parse_from(["musigd", "--release-safety-margin=9"])
+            .expect("valid command line");
+        let config = cli.engine_config().expect("valid configuration");
+        assert_eq!(config.forced_close_margin(), 9);
+
+        let cli = Cli::try_parse_from([
+            "musigd",
+            "--release-safety-margin=9",
+            "--forced-close-margin=8",
+        ])
+        .expect("valid command line");
+        let error = cli
+            .engine_config()
+            .expect_err("smaller than the safety margin");
+        assert!(
+            error.0.contains("forced close margin of 8 blocks"),
+            "{error}"
+        );
     }
 
     /// A lock time outside the limits of the specification is no valid configuration.

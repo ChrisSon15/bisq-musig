@@ -1592,9 +1592,9 @@ impl TradeModel {
     }
 
     /// The seller publishes the swap transaction on his own when the number of blocks before
-    /// the buyer's warning transaction becomes valid has fallen to the release safety margin
-    /// (D7). He has released the key of the buyer's payout, so he must have his own payout
-    /// before the buyer can publish the warning.
+    /// the buyer's warning transaction becomes valid has fallen to the forced close margin of
+    /// the configuration (D7, D23). He has released the key of the buyer's payout, so he must
+    /// have his own payout before the buyer can publish the warning.
     fn close_by_force_before_the_warning_is_valid(&mut self, situation: &Situation) {
         if self.am_buyer()
             || self.state != TradeState::SellerReadyToRelease
@@ -1607,7 +1607,7 @@ impl TradeModel {
             .received
             .config
             .unwrap_or_default()
-            .release_safety_margin();
+            .forced_close_margin();
         if self
             .blocks_before_warning_is_valid()
             .is_ok_and(|remaining| remaining <= u32::from(margin))

@@ -28,6 +28,7 @@ the environment when it starts (an option of the same meaning has priority):
 | `BISQ_MUSIG_CLAIM_LOCK_TIME`       | `--claim-lock-time`       | 720     | Lock time of the claim transactions, after the confirmation of the warning     |
 | `BISQ_MUSIG_DEPOSIT_TIMEOUT`       | `--deposit-timeout`       | 144     | Blocks without a confirmed deposit after which a trader aborts the deposit     |
 | `BISQ_MUSIG_RELEASE_SAFETY_MARGIN` | `--release-safety-margin` | 6       | The seller does not release when fewer blocks remain before the buyer's warning |
+| `BISQ_MUSIG_FORCED_CLOSE_MARGIN`   | `--forced-close-margin`   | the release safety margin | The seller's engine publishes the swap transaction on its own when this number of blocks, or fewer, remain before the buyer's warning |
 
 Both traders must use the same two lock times. With different values the setup of a trade ends before the deposit is
 signed. The warning lock time must be larger than 3 plus the release safety margin, and the claim lock time larger

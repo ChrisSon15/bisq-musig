@@ -73,8 +73,17 @@ Rules:
 
 - The caller can ask for step 1 at any time in state `SellerReadyToRelease`.
 - The engine performs step 1 on its own when the remaining number of blocks before the buyer's
-  warning transaction becomes valid falls to the release safety margin. This rule is open point
-  O8 in [README.md](README.md).
+  warning transaction becomes valid falls to the forced close margin. The forced close margin is
+  a configuration value of the engine ([parameters.md](parameters.md)). Without a configured
+  value it is the release safety margin, so the engine waits as long as it safely can for
+  message G. With the default values this is about ten days after the confirmation of the
+  deposit.
+- A release that happens when no more blocks than the forced close margin remain is followed by
+  step 1 at the engine's next look at the chain.
+
+The project owner confirmed the time of this step on 2026-11-18 and asked for the configuration
+value (D23 in `concept/CompletionPlan.md`).
+
 - The buyer does not know the swap transaction. His engine therefore examines every confirmed
   transaction that spends the seller's payout with the key path, not a transaction with a known
   ID.

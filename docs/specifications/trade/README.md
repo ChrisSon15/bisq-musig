@@ -48,7 +48,7 @@ A paragraph that starts with "Rationale" explains a requirement and is not one i
 
 ## Where the decisions are specified
 
-The decisions D1 to D22 of `concept/CompletionPlan.md`, section 7:
+The decisions D1 to D23 of `concept/CompletionPlan.md`, section 7:
 
 | Decision | Specified in |
 |---|---|
@@ -71,6 +71,7 @@ The decisions D1 to D22 of `concept/CompletionPlan.md`, section 7:
 | D20 The engine connects only to the configured peers | [chain-observation.md](chain-observation.md) |
 | D21 During a problem with the peers a request that only observes the chain is accepted; a request that must send is refused | [chain-observation.md](chain-observation.md), [service-interface.md](service-interface.md) |
 | D22 The state that follows from confirmed transactions is derived from the chain | [trade-states.md](trade-states.md), [chain-observation.md](chain-observation.md) |
+| D23 The seller's engine publishes the swap transaction on its own at the forced close margin, a configuration value | [closing.md](closing.md), [parameters.md](parameters.md) |
 
 D1, D15 and D16 are decisions about the code and the documents. They need no rule here.
 
@@ -86,7 +87,6 @@ confirmed. The text of the files contains the rule of the column "Rule in the sp
 | O4 | Peers and the visible IP address (N4) | The peer list is a start option. Hiding the IP address is not specified. | [chain-observation.md](chain-observation.md) |
 | O5 | Wording of the security assumption for the open port (N7) | The computer and all its local users are trusted. | [service-interface.md](service-interface.md) |
 | O7 | Default values of the lock times, the deposit timeout and the release safety margin; limits of the lock times (N9) | Defaults until the decision: warning lock time 1440 blocks, claim lock time 720 blocks, deposit timeout 144 blocks, release safety margin 6 blocks. The limits are: warning lock time larger than 3 plus the release safety margin; claim lock time larger than 1. | [parameters.md](parameters.md) |
-| O8 | When does the seller's engine publish the swap transaction on its own (D7)? | When the number of blocks before the buyer's warning becomes valid falls to the release safety margin. The caller can ask for it earlier. | [closing.md](closing.md) |
 | O9 | Values of the fee schedule: blocks between two steps, size of a step, upper limit | No values are specified. | [fees.md](fees.md) |
 | O10 | Size limits of message fields and lists | No values are specified. | [parameters.md](parameters.md) |
 | O11 | gRPC status codes and error details for the error cases | Five cases are specified. The status codes in the file are the ones that the service uses until the decision. | [service-interface.md](service-interface.md) |
@@ -100,6 +100,7 @@ Points that were open and are decided:
 |---|---|---|---|
 | O2 | Which failed checks terminate a trade (D17)? | 2026-11-18: everything by which the engine detects that the peer tampered with the software or does not run our client terminates the trade, and the reason is logged in detail. Conditions that can have another cause, for example a network problem, can be repeated. | [trade-states.md](trade-states.md) |
 | O6 | Path and tag of the key derivation (N6) | 2026-11-18: accepted as specified. Path `m/86'/coin_type'/0'/2'`, tag `BisqMuSig/key-share`. | [key-derivation.md](key-derivation.md) |
+| O8 | When does the seller's engine publish the swap transaction on its own (D7)? | 2026-11-18: when the number of blocks before the buyer's warning becomes valid falls to the forced close margin (D23). The margin is a configuration value. Its default is the release safety margin, which gives about ten days with the default lock time. The caller can ask for the swap transaction earlier. | [closing.md](closing.md), [parameters.md](parameters.md) |
 | O15 | Does the engine use only the peers that the user configured? The library for compact block filters looks for other peers through DNS seeds when the configured peers fail. | 2026-11-18: yes, configured peers only (D20). The reason given: the software operates only on regtest at present. | [chain-observation.md](chain-observation.md) |
 | O16 | Which state changes follow from the chain, and do they go back after a reorganisation? | 2026-11-18: accepted as specified (D22). The state that follows from confirmed transactions is derived from the chain every time and goes back when the transaction is removed. A derived state can follow a state that the table of state changes does not connect with it. | [trade-states.md](trade-states.md) |
 

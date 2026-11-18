@@ -61,6 +61,7 @@ pub struct EngineConfig {
     claim_lock_time: u16,
     deposit_timeout: u16,
     release_safety_margin: u16,
+    forced_close_margin: u16,
 }
 
 impl EngineConfig {
@@ -109,7 +110,38 @@ impl EngineConfig {
             claim_lock_time,
             deposit_timeout,
             release_safety_margin,
+            forced_close_margin: release_safety_margin,
         })
+    }
+
+    /// Sets the forced close margin: the seller's engine publishes the swap transaction on its
+    /// own when this number of blocks, or fewer, remain before the buyer's warning transaction
+    /// becomes valid. Without this call the margin is the release safety margin.
+    ///
+    /// The margin must not be smaller than the release safety margin, which is the time that
+    /// the swap transaction needs to confirm. It must be smaller than the warning lock time
+    /// minus the confirmations that a deposit needs, because otherwise every release would be
+    /// followed by the swap transaction at once.
+    pub fn with_forced_close_margin(
+        mut self,
+        forced_close_margin: u16,
+    ) -> Result<Self, EngineConfigError> {
+        if forced_close_margin < self.release_safety_margin {
+            return Err(EngineConfigError(format!(
+                "the forced close margin of {forced_close_margin} blocks is smaller than the \
+                 release safety margin of {} blocks",
+                self.release_safety_margin
+            )));
+        }
+        let limit = u32::from(self.warning_lock_time) - u32::from(MIN_CONFIRMATIONS);
+        if u32::from(forced_close_margin) >= limit {
+            return Err(EngineConfigError(format!(
+                "the forced close margin of {forced_close_margin} blocks is not smaller than \
+                 {limit} blocks (warning lock time minus minimum confirmations)"
+            )));
+        }
+        self.forced_close_margin = forced_close_margin;
+        Ok(self)
     }
 
     pub const fn warning_lock_time(&self) -> LockTime {
@@ -137,6 +169,12 @@ impl EngineConfig {
     pub const fn release_safety_margin(&self) -> u16 {
         self.release_safety_margin
     }
+
+    /// The number of blocks before the buyer's warning transaction becomes valid at which the
+    /// seller's engine publishes the swap transaction on its own.
+    pub const fn forced_close_margin(&self) -> u16 {
+        self.forced_close_margin
+    }
 }
 
 impl Default for EngineConfig {
@@ -146,6 +184,7 @@ impl Default for EngineConfig {
             claim_lock_time: Self::DEFAULT_CLAIM_LOCK_TIME,
             deposit_timeout: Self::DEFAULT_DEPOSIT_TIMEOUT,
             release_safety_margin: Self::DEFAULT_RELEASE_SAFETY_MARGIN,
+            forced_close_margin: Self::DEFAULT_RELEASE_SAFETY_MARGIN,
         }
     }
 }
@@ -155,11 +194,12 @@ impl Display for EngineConfig {
         write!(
             f,
             "warning lock time {} blocks, claim lock time {} blocks, deposit timeout {} blocks, \
-             release safety margin {} blocks",
+             release safety margin {} blocks, forced close margin {} blocks",
             self.warning_lock_time,
             self.claim_lock_time,
             self.deposit_timeout,
-            self.release_safety_margin
+            self.release_safety_margin,
+            self.forced_close_margin
         )
     }
 }
@@ -320,6 +360,35 @@ mod tests {
     }
 
     /// A10: amounts that would give a dust output in one of the transactions are rejected.
+    /// O8: the forced close margin is the release safety margin unless it is set. It cannot be
+    /// smaller than that margin, and it must leave room for a release.
+    #[test]
+    fn forced_close_margin_has_limits() {
+        let config = EngineConfig::new(20, 10, 144, 6).expect("valid");
+        assert_eq!(config.forced_close_margin(), 6);
+        assert_eq!(EngineConfig::default().forced_close_margin(), 6);
+
+        let earlier = config.with_forced_close_margin(12).expect("valid");
+        assert_eq!(earlier.forced_close_margin(), 12);
+        assert_eq!(earlier.release_safety_margin(), 6);
+        assert!(
+            earlier
+                .to_string()
+                .contains("forced close margin 12 blocks")
+        );
+        assert!(config.with_forced_close_margin(6).is_ok());
+        assert!(config.with_forced_close_margin(16).is_ok());
+
+        assert_invalid_config(
+            config.with_forced_close_margin(5),
+            "smaller than the release safety margin of 6 blocks",
+        );
+        assert_invalid_config(
+            config.with_forced_close_margin(17),
+            "not smaller than 17 blocks",
+        );
+    }
+
     #[test]
     fn a10_amounts_below_the_minimum_are_rejected() {
         // The swap transaction pays 1110 sat of fee at this fee rate, and its output must not be
