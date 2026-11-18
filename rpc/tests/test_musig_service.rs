@@ -1663,19 +1663,23 @@ async fn c4_seller_gets_no_swap_tx_before_payment_started() {
     }
 }
 
-/// A partial signature that the seller's service rejected does not prevent that the service
-/// accepts the valid signature afterwards.
-///
-/// This expectation is not part of the plan. Today the service keeps the first signature that it
-/// receives, also if it is invalid, and then rejects the valid one.
+/// A request that the service rejected ends the use of the trade (D17): after an invalid partial
+/// signature for the swap transaction, the seller's service refuses the valid one too. Today this
+/// follows from the stored invalid signature, not from the blocked mark of the trade, so the
+/// second error is checked by its code only.
 #[tokio::test]
-#[ignore = "not in the plan: a rejected partial signature is kept and blocks the valid one"]
-async fn rejected_swap_tx_signature_does_not_block_the_valid_one() {
+async fn rejected_swap_tx_signature_blocks_the_trade() {
     for trade_type in TRADE_TYPES {
         let mut trade = Trade::at(trade_type, Stage::BuyerStartedPayment).await;
+        let valid_signature = trade.buyers_swap_tx_signature();
+
         let result = trade.seller.sign_swap_tx(&random_scalar()).await;
         assert_refused(result, Code::Internal, "signature is invalid");
-        trade.seller_receives_payment_start().await;
+        let result = trade.seller.sign_swap_tx(&valid_signature).await;
+        assert_refused(result, Code::Internal, "");
+        let result = trade.seller.release_payout().await;
+        assert_refused(result, Code::Internal, "");
+        assert_eq!(trade.seller.state(), TradeState::Deposit);
     }
 }
 
