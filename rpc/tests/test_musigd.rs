@@ -7,8 +7,9 @@
 //! The lock times of the trades are configuration values of `musigd`. It reads them from the
 //! environment and does not start with values outside the limits.
 //!
-//! The tests need no chain. `musigd` creates its Bitcoin Core RPC client at start-up but connects
-//! only for a broadcast, and without `--wallet-peer` the wallet does not sync.
+//! The first tests need no chain: without `--wallet-peer` the wallet does not sync. The tests of
+//! whole trades run two `musigd` processes against a regtest node, which they reach only through
+//! its peer-to-peer port.
 
 use std::io::Read as _;
 use std::net::TcpListener;
@@ -25,10 +26,11 @@ use rpc::pb::bmp_wallet::{
 };
 use rpc::pb::musigrpc::musig_client::MusigClient;
 use rpc::pb::musigrpc::{
-    CloseTradeRequest, DepositPsbt, DepositTxSignatureRequest, NonceSharesMessage,
+    CloseTradeRequest, ClosureKind, DepositPsbt, DepositTxSignatureRequest, NonceSharesMessage,
     NonceSharesRequest, PartialSignaturesMessage, PartialSignaturesRequest, PubKeySharesRequest,
     PubKeySharesResponse, PublishDepositTxRequest, ReceiverAddressAndAmount, Role,
-    SubscribeTxConfirmationStatusRequest, SwapTxSignatureRequest, TxConfirmationStatus,
+    SubscribeTradeEventsRequest, SubscribeTxConfirmationStatusRequest, SwapTxSignatureRequest,
+    TradeEvent, TradeEventType, TradeStateKind, TradeTxKind, TxConfirmationStatus,
 };
 use testenv::TestEnv;
 use tonic::transport::Channel;
@@ -579,5 +581,135 @@ async fn j11_trade_of_two_daemons_without_bitcoin_core_rpc() -> anyhow::Result<(
         drained,
         "the drain transaction {drain_tx_id} of {payout} sat confirms"
     );
+    Ok(())
+}
+
+/// Mines blocks, one every two seconds at most, until the stream delivers an event for which
+/// `expected` holds.
+async fn mine_until_event(
+    env: &mut TestEnv,
+    events: &mut Streaming<TradeEvent>,
+    what: &str,
+    expected: impl Fn(&TradeEvent) -> bool,
+) -> anyhow::Result<TradeEvent> {
+    for _ in 0..40 {
+        env.mine_block()?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.next()).await {
+            let event = event?;
+            if expected(&event) {
+                return Ok(event);
+            }
+        }
+    }
+    anyhow::bail!("no event: {what}")
+}
+
+/// C1, C2, C4 (D7) through the real daemon: the seller releases, and the buyer does not answer.
+/// The seller's `musigd` publishes the swap transaction on its own before the buyer's warning
+/// transaction becomes valid. The buyer's `musigd` reads the seller's key share from the
+/// confirmed transaction, closes the trade and imports the payout. No request asks for any of
+/// this, and both wallets show the result.
+#[tokio::test(flavor = "multi_thread")]
+async fn c4_forced_close_of_two_daemons() -> anyhow::Result<()> {
+    let mut env = TestEnv::new()?;
+    env.mine_blocks(101)?;
+    let (mut buyer, mut seller) = funded_daemons(&mut env).await?;
+    let trade_id = "trade-1".to_owned();
+    let sellers_deposit_psbt = set_up_trade(&mut buyer, &mut seller, &env, &trade_id).await?;
+    let mut deposit_events = buyer
+        .musig
+        .publish_deposit_tx(PublishDepositTxRequest {
+            trade_id: trade_id.clone(),
+            peers_deposit_psbt: Some(sellers_deposit_psbt),
+        })
+        .await?
+        .into_inner();
+    // Blocks are mined until the stream of the deposit ends, at 3 confirmations.
+    let mut confirmed = false;
+    for _ in 0..30 {
+        env.mine_block()?;
+        match tokio::time::timeout(Duration::from_secs(2), deposit_events.next()).await {
+            Ok(None) => {
+                confirmed = true;
+                break;
+            }
+            Ok(Some(event)) => drop(event?),
+            Err(_) => {}
+        }
+    }
+    assert!(confirmed, "the deposit transaction has 3 confirmations");
+
+    let subscribe = SubscribeTradeEventsRequest {
+        trade_id: trade_id.clone(),
+    };
+    let mut buyers_events = buyer
+        .musig
+        .subscribe_trade_events(subscribe.clone())
+        .await?
+        .into_inner();
+    let mut sellers_events = seller
+        .musig
+        .subscribe_trade_events(subscribe)
+        .await?
+        .into_inner();
+
+    // Messages E and F. The buyer never sends message G.
+    let message_e = buyer
+        .musig
+        .get_partial_signatures(PartialSignaturesRequest {
+            trade_id: trade_id.clone(),
+            buyer_ready_to_release: true,
+            ..PartialSignaturesRequest::default()
+        })
+        .await?
+        .into_inner();
+    let swap_request = |signature: Vec<u8>, seller_ready_to_release| SwapTxSignatureRequest {
+        trade_id: trade_id.clone(),
+        swap_tx_input_peers_partial_signature: signature,
+        seller_ready_to_release,
+    };
+    let buyers_swap_signature = message_e
+        .swap_tx_input_partial_signature
+        .expect("message E contains the signature");
+    seller
+        .musig
+        .sign_swap_tx(swap_request(buyers_swap_signature, false))
+        .await?;
+    seller
+        .musig
+        .sign_swap_tx(swap_request(Vec::new(), true))
+        .await?;
+
+    // The warning lock time is 20 blocks and the release safety margin 6 blocks. At 14
+    // confirmations of the deposit the seller's daemon sends the swap transaction.
+    let sent = mine_until_event(&mut env, &mut sellers_events, "swap sent", |event| {
+        event.r#type() == TradeEventType::TxSent
+    })
+    .await?;
+    assert_eq!(sent.tx_kind(), TradeTxKind::SwapTx);
+    assert_eq!(sent.state(), TradeStateKind::TradeClosed);
+    assert_eq!(sent.closure_type(), ClosureKind::Forced);
+
+    // The swap transaction is confirmed: the buyer's daemon closes the buyer's trade.
+    let closed = mine_until_event(&mut env, &mut buyers_events, "buyer closed", |event| {
+        event.r#type() == TradeEventType::State && event.state() == TradeStateKind::TradeClosed
+    })
+    .await?;
+    assert_eq!(closed.closure_type(), ClosureKind::Forced);
+
+    // The buyer's wallet holds the payout of the trade, and the seller's wallet received his
+    // deposit through the swap transaction.
+    let fee_limit = 10_000;
+    buyer
+        .wait_for_balance("buyer's payout", |balance| {
+            (FUNDING + TRADE_AMOUNT - fee_limit..=FUNDING + TRADE_AMOUNT).contains(&balance)
+        })
+        .await;
+    seller
+        .wait_for_balance("seller's deposit", |balance| {
+            (FUNDING - TRADE_AMOUNT - fee_limit..=FUNDING - TRADE_AMOUNT).contains(&balance)
+        })
+        .await;
     Ok(())
 }
