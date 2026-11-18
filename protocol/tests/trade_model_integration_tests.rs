@@ -1,9 +1,10 @@
 //! Tests of the trade engine with real wallets and a regtest chain.
 //!
 //! Two trade models, one per trader, exchange their data directly. Each trader has a funded
-//! wallet, which syncs over compact block filters with the node of the test as its peer. The
-//! engine itself has no chain access, so the tests send its transactions to the node through
-//! the RPC interface and mine the blocks.
+//! wallet and an own long-running compact block filter client, with the node of the test as its
+//! peer. The wallet syncs through this client, and the client watches the outputs of the trade,
+//! as the trade service does. The engine itself has no chain access, so the tests send its
+//! transactions to the node through the RPC interface and mine the blocks.
 //!
 //! The tests are the scenarios of the former tests of `BMPProtocol`. The test IDs in the comments
 //! refer to section 9.4 of `concept/CompletionPlan.md`.
@@ -80,23 +81,29 @@ impl Chain {
         }
     }
 
-    /// Runs the chain sync of a wallet, when the client has evaluated all blocks of the node. A
-    /// client that runs learns of a new block a moment after the node has mined it.
-    fn sync(&self, env: &TestEnv, wallet: &mut BMPWallet) {
+    /// Waits until the client has evaluated all blocks of the node. A client that runs learns of
+    /// a new block a moment after the node has mined it.
+    fn wait_for_tip(&self, env: &TestEnv) {
         let height = u32::try_from(env.block_count().expect("block count")).expect("small height");
         self.runtime
             .block_on(async {
-                if self.client.is_started() {
-                    tokio::time::timeout(
-                        Duration::from_secs(60),
-                        self.client.wait_until_synced_to(height),
-                    )
-                    .await
-                    .expect("the client reaches the chain tip in time")
-                    .expect("the client runs");
-                }
-                wallet.sync_all(&self.client).await
+                tokio::time::timeout(
+                    Duration::from_secs(60),
+                    self.client.wait_until_synced_to(height),
+                )
+                .await
             })
+            .expect("the client reaches the chain tip in time")
+            .expect("the client runs");
+    }
+
+    /// Runs the chain sync of a wallet, when the client has evaluated all blocks of the node.
+    fn sync(&self, env: &TestEnv, wallet: &mut BMPWallet) {
+        if self.client.is_started() {
+            self.wait_for_tip(env);
+        }
+        self.runtime
+            .block_on(wallet.sync_all(&self.client))
             .expect("the wallet syncs");
     }
 }
@@ -111,31 +118,32 @@ fn send_to_node(env: &TestEnv, tx: &Transaction) -> Result<Txid, String> {
 }
 
 /// Returns a wallet with one confirmed coin of the amount `funding`, and its directory.
-fn funded_wallet(env: &mut TestEnv, funding: Amount) -> (BMPWallet, PathBuf) {
+fn funded_wallet(env: &mut TestEnv, chain: &Chain, funding: Amount) -> (BMPWallet, PathBuf) {
     let path = env.new_temp_path().to_path_buf();
     let mut wallet =
         BMPWallet::new(path.as_path().into(), &test_password(), Network::Regtest).unwrap();
 
-    fund(env, &mut wallet, funding);
+    fund(env, chain, &mut wallet, funding);
     (wallet, path)
 }
 
 /// Sends a coin of the amount `funding` to the wallet, confirms it and syncs the wallet.
-fn fund(env: &mut TestEnv, wallet: &mut BMPWallet, funding: Amount) {
+fn fund(env: &mut TestEnv, chain: &Chain, wallet: &mut BMPWallet, funding: Amount) {
     let address = wallet.get_new_address().unwrap();
     let txid = env.fund_address(&address.address, funding).unwrap();
     env.mine_block().unwrap();
-    Chain::new(env).sync(env, wallet);
+    chain.sync(env, wallet);
     assert!(
         wallet.list_transactions().iter().any(|tx| tx.tx_id == txid),
         "the wallet found the funding transaction"
     );
 }
 
-/// One trader: his trade model and his wallet.
+/// One trader: his trade model, his wallet and his access to the chain.
 struct Trader {
     model: TradeModel,
     wallet: BMPWallet,
+    chain: Chain,
     /// The directory of the wallet database, to load the wallet again.
     wallet_path: PathBuf,
 }
@@ -146,13 +154,24 @@ impl Trader {
     }
 
     fn with_funding(env: &mut TestEnv, role: Role, funding: Amount) -> Self {
-        let (mut wallet, wallet_path) = funded_wallet(env, funding);
+        let chain = Chain::new(env);
+        let (mut wallet, wallet_path) = funded_wallet(env, &chain, funding);
         let model = TradeModel::new("trade-1".to_owned(), role, &mut wallet)
             .expect("the trade can be created");
         Self {
             model,
             wallet,
+            chain,
             wallet_path,
+        }
+    }
+
+    /// Watches the outputs of the trade with the client of the trader, as the trade service does
+    /// when the trader has signed the deposit transaction.
+    fn watch_trade(&self) {
+        let outputs = self.model.outputs_to_watch().expect("deposit is signed");
+        for (outpoint, script) in outputs {
+            self.chain.client.watch_output(outpoint, script);
         }
     }
 
@@ -267,7 +286,6 @@ impl Trader {
 /// A trade of two traders with a confirmed deposit transaction.
 struct Trade {
     env: TestEnv,
-    chain: Chain,
     buyer: Trader,
     seller: Trader,
     buyer_payout: OutPoint,
@@ -283,7 +301,6 @@ impl Trade {
         let mut env = TestEnv::new()?;
         let mut buyer = Trader::new(&mut env, Role::BuyerAsTaker);
         let mut seller = Trader::new(&mut env, Role::SellerAsMaker);
-        let chain = Chain::new(&env);
 
         seller.receive_key_shares(&buyer);
         buyer.receive_key_shares(&seller);
@@ -314,6 +331,9 @@ impl Trade {
         buyer.receive_partial_signatures(sellers_partial_signatures);
         assert_eq!(buyer.model.state(), TradeState::Deposit);
         assert_eq!(seller.model.state(), TradeState::Deposit);
+        // From now on the peer can publish the deposit transaction.
+        buyer.watch_trade();
+        seller.watch_trade();
 
         // The taker holds all signatures and publishes the deposit transaction.
         let sellers_deposit_psbt = seller.model.deposit_psbt()?.clone();
@@ -334,7 +354,6 @@ impl Trade {
             buyer_payout: payout(TRADE_AMOUNT + BUYERS_SECURITY_DEPOSIT),
             seller_payout: payout(SELLERS_SECURITY_DEPOSIT),
             env,
-            chain,
             buyer,
             seller,
             redirection_receiver,
@@ -346,8 +365,8 @@ impl Trade {
 
     /// Runs the chain sync of both wallets.
     fn sync_wallets(&mut self) {
-        self.chain.sync(&self.env, &mut self.buyer.wallet);
-        self.chain.sync(&self.env, &mut self.seller.wallet);
+        self.buyer.chain.sync(&self.env, &mut self.buyer.wallet);
+        self.seller.chain.sync(&self.env, &mut self.seller.wallet);
     }
 
     /// The number of confirmations of an unspent output, or `None` if the output does not exist
@@ -622,8 +641,9 @@ fn a6_too_few_funds() -> anyhow::Result<()> {
 fn a8_i3_reserved_coins_are_used_once() -> anyhow::Result<()> {
     let mut env = TestEnv::new()?;
     let peer = Trader::new(&mut env, Role::SellerAsMaker);
-    let (mut wallet, _path) = funded_wallet(&mut env, FUNDING);
-    fund(&mut env, &mut wallet, FUNDING);
+    let chain = Chain::new(&env);
+    let (mut wallet, _path) = funded_wallet(&mut env, &chain, FUNDING);
+    fund(&mut env, &chain, &mut wallet, FUNDING);
 
     let start_trade = |wallet: &mut BMPWallet, trade_id: &str| {
         let mut model = TradeModel::new(trade_id.to_owned(), Role::BuyerAsTaker, wallet)?;
@@ -667,11 +687,11 @@ fn assert_payout_is_kept_and_spent_first(
     payout: OutPoint,
     amount: Amount,
     env: &mut TestEnv,
-    chain: &Chain,
 ) -> anyhow::Result<()> {
     let Trader {
         wallet,
         wallet_path,
+        chain,
         ..
     } = trader;
     let balance = wallet.balance();
@@ -742,20 +762,127 @@ fn b1_b2_cooperative_close_and_payout_in_the_wallet() -> anyhow::Result<()> {
     let Trade {
         buyer,
         seller,
-        chain,
         mut env,
         buyer_payout,
         seller_payout,
         ..
     } = trade;
-    assert_payout_is_kept_and_spent_first(buyer, buyer_payout, buyers_payout, &mut env, &chain)?;
+    assert_payout_is_kept_and_spent_first(buyer, buyer_payout, buyers_payout, &mut env)?;
     assert_payout_is_kept_and_spent_first(
         seller,
         seller_payout,
         SELLERS_SECURITY_DEPOSIT,
         &mut env,
-        &chain,
     )?;
+    Ok(())
+}
+
+/// The completion criterion of WP3 for the outputs of a trade: the client of each trader reports
+/// the confirmations of the deposit transaction, the spend of the payouts by a warning
+/// transaction, a reorganisation that moves the warning transaction to another block, and the
+/// spend of the escrow output by the redirect transaction. A client that starts later, as after
+/// a restart of the program, finds all of that in the blocks that were mined before.
+#[test]
+fn chain_clients_report_confirmations_spends_and_a_reorganisation_of_a_trade() -> anyhow::Result<()>
+{
+    let mut trade = Trade::with_confirmed_deposit()?;
+    let deposit_txid = trade.buyer_payout.txid;
+    let deposit_height = u32::try_from(trade.env.block_count()?)?;
+    let both = |trade: &Trade, check: &dyn Fn(&ChainClient)| {
+        for trader in [&trade.buyer, &trade.seller] {
+            trader.chain.wait_for_tip(&trade.env);
+            check(&trader.chain.client);
+        }
+    };
+    both(&trade, &|client| {
+        assert_eq!(client.confirmations(&deposit_txid), 1);
+        assert_eq!(
+            client.transaction(&deposit_txid).map(|found| found.height),
+            Some(deposit_height)
+        );
+        assert!(client.spending_tx(&trade.buyer_payout).is_none());
+    });
+    trade.env.mine_blocks(2)?;
+    both(&trade, &|client| {
+        assert_eq!(client.confirmations(&deposit_txid), 3);
+    });
+
+    // The seller's warning transaction spends both payouts.
+    trade.mine_until_warning_is_valid()?;
+    let warning_tx = trade.seller.model.my_signed_warning_tx()?.clone();
+    let warning_txid = warning_tx.compute_txid();
+    let escrow = Trade::escrow(&warning_tx);
+    let warning_block = trade.broadcast_and_confirm(&warning_tx)?;
+    both(&trade, &|client| {
+        for payout in [trade.buyer_payout, trade.seller_payout] {
+            let spend = client.spending_tx(&payout).expect("the spend is found");
+            assert_eq!(spend.tx.compute_txid(), warning_txid);
+            assert_eq!(spend.block_hash, warning_block);
+        }
+        assert_eq!(client.confirmations(&warning_txid), 1);
+        assert!(client.spending_tx(&escrow).is_none());
+    });
+
+    // The block of the warning transaction is replaced. The node confirms the transaction again
+    // in a new block, and the clients report it there.
+    let new_blocks = trade.env.reorganize(1, 2)?;
+    both(&trade, &|client| {
+        let spend = client
+            .spending_tx(&trade.buyer_payout)
+            .expect("the spend is found again");
+        assert_eq!(spend.tx.compute_txid(), warning_txid);
+        assert_ne!(spend.block_hash, warning_block);
+        assert!(new_blocks.contains(&spend.block_hash));
+        assert_eq!(
+            client.confirmations(&deposit_txid),
+            // One block with the warning transaction, replaced by two blocks.
+            u32::from(WARNING_LOCK_TIME) + 2
+        );
+    });
+
+    // The buyer's redirect transaction spends the escrow output of the seller's warning.
+    let redirect_tx = trade.buyer.model.my_signed_redirect_tx()?.clone();
+    trade.broadcast_and_confirm(&redirect_tx)?;
+    both(&trade, &|client| {
+        let spend = client.spending_tx(&escrow).expect("the spend is found");
+        assert_eq!(spend.tx.compute_txid(), redirect_tx.compute_txid());
+    });
+
+    // A client that starts now watches the outputs of the trade from the block before the
+    // deposit, and finds everything in the blocks that were mined while it did not run.
+    let late = Chain::new(&trade.env);
+    let (outpoints, scripts): (Vec<_>, Vec<_>) =
+        trade.seller.model.outputs_to_watch()?.into_iter().unzip();
+    {
+        let _runtime = late.runtime.enter();
+        late.client.start(None);
+    }
+    late.wait_for_tip(&trade.env);
+    assert!(late.client.transaction(&deposit_txid).is_none());
+    assert!(
+        late.client
+            .watch_from(scripts, outpoints, deposit_height - 1)
+    );
+    let view = late.runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(60), late.client.synced_view()).await
+    })??;
+    assert_eq!(
+        view.txs
+            .iter()
+            .map(|found| found.tx.compute_txid())
+            .collect::<Vec<_>>(),
+        vec![deposit_txid, warning_txid, redirect_tx.compute_txid()]
+    );
+    assert_eq!(
+        late.client
+            .spending_tx(&escrow)
+            .map(|spend| spend.tx.compute_txid()),
+        Some(redirect_tx.compute_txid())
+    );
+    assert_eq!(
+        late.client.confirmations(&deposit_txid),
+        trade.buyer.chain.client.confirmations(&deposit_txid)
+    );
     Ok(())
 }
 
