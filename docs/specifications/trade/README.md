@@ -93,6 +93,9 @@ confirmed. The text of the files contains the rule of the column "Rule in the sp
 | O12 | Sanity limits of the engine for the deposit fee rate and the prepared fee rate | Not specified. | [fees.md](fees.md) |
 | O13 | Which request carries the trade parameters (amounts, fee rates, trade fee receiver)? The first version of this specification named the request that creates the trade (step 1). | Step 2 (`GetNonceShares`), as in the existing messages. No message changes. Nothing in step 1 depends on the parameters. | [parameters.md](parameters.md), [setup-and-deposit.md](setup-and-deposit.md) |
 | O14 | Two unmodified clients with different lock times in their configuration (D19): the partial signatures do not fit, and the engine cannot tell this from a modified client. | The setup is terminated (D17). Nothing is signed, so no funds are at risk. The reason names the trader's own lock times. | [parameters.md](parameters.md), [trade-states.md](trade-states.md) |
+| O18 | Which deadlines and which actions of the user do the events of a trade report, and in which form? The plan names "deadlines as block heights" and "required user actions" without a list. | Five deadlines and three actions, each defined by a rule of the engine. Every event carries the current deadlines, actions and the reason of a termination. The form is not agreed with bisq2. | [service-interface.md](service-interface.md) |
+| O19 | Details of the deposit abort (D13): (a) the engine aborts on its own only in the state `Deposit`, and in a later state it sends the deposit again; (b) the deposit timeout is counted again after a reorganisation removed the deposit; (c) the abort pays more than the fee of the whole deposit transaction, so that it replaces the deposit in a node; (d) the abort pays to the trader's payout address; (e) the abort is not stored. | As listed in the question. | [setup-and-deposit.md](setup-and-deposit.md), [transactions.md](transactions.md) |
+| O20 | Which stored transactions are sent again after a start (N5)? The plan names the drain transaction. | Every unconfirmed transaction that spends coins of the wallet: the drain, wallet payments and recorded transactions of trades. They are sent after the first sync of a run and after every new block, until they are confirmed or can no longer confirm. | [post-trade-protection.md](post-trade-protection.md), [../wallet/coin-reservation.md](../wallet/coin-reservation.md) |
 | O17 | A record of the trade store cannot be loaded. The engine then serves no trade ([persistence-and-recovery.md](persistence-and-recovery.md)). How does the user leave this condition? | Not specified. No request removes or repairs a record. Until the decision the user needs a copy of the wallet database from before the damage. | [persistence-and-recovery.md](persistence-and-recovery.md) |
 
 Points that were open and are decided:
@@ -111,5 +114,5 @@ Points that were open and are decided:
   changes that follow from the chain are not in this table: the engine derives them from the
   confirmed transactions (`TradeModel::observe_chain`), as `trade-states.md` describes. This
   covers the change from `SellerReadyToRelease` to `BuyersWarning` for the seller.
-- The terminated mark is a field of the trade, with the reason. It is not stored on disk yet,
-  like the rest of the trade.
+- The terminated mark is a field of the trade, with the reason. It is stored with the trade
+  ([persistence-and-recovery.md](persistence-and-recovery.md)).

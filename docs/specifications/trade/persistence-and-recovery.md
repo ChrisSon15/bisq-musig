@@ -25,7 +25,9 @@ Stored for each trade:
 - the peer's secret key share, once received, and with it the penalty transaction;
 - the custom payout PSBTs of the trader and of the peer, and the final custom payout transaction;
 - the trader's reserved coins;
-- the height at which the trader signed the deposit.
+- the height at which the trader signed the deposit;
+- the height from which the deposit timeout is counted, while the deposit is unconfirmed
+  ([setup-and-deposit.md](setup-and-deposit.md)).
 
 The record of a trade is kept after the trade is closed or abandoned. The records are therefore
 also the set of all trade IDs that were ever used.
@@ -38,6 +40,9 @@ must have on the network follows from the stored state of the trade and from the
 ([chain-observation.md](chain-observation.md), "Reactions to chain events"). A decision of the
 trader that makes the engine send a transaction, for example the request to publish the warning
 transaction, is a change of the stored state.
+
+The deposit abort transaction is not stored either. Its inputs, its output and its fee follow
+from the stored data of the trade, so the engine builds the same transaction again.
 
 Stored once for the wallet:
 

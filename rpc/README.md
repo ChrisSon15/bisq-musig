@@ -51,13 +51,19 @@ The service watches every trade on the chain while `musigd` runs, and it sends t
 
 - the deposit transaction after `PublishDepositTx`, the swap transaction after `CloseTrade` without data, the custom
   payout transaction after `CustomCloseTrade`, and the trader's warning transaction after `PublishWarningTx`;
-- without a request: the swap transaction when the buyer did not answer the release in time, the redirect or the
-  penalty transaction when the warning transaction of the peer is confirmed, and the claim transaction when the claim
-  lock time of the trader's own warning has passed.
+- without a request: the deposit abort transaction when the deposit transaction was not confirmed within the deposit
+  timeout, the swap transaction when the buyer did not answer the release in time, the redirect or the penalty
+  transaction when the warning transaction of the peer is confirmed, and the claim transaction when the claim lock time
+  of the trader's own warning has passed.
 
 A transaction is sent again after every new block until it is confirmed. `SubscribeTradeEvents` returns the events of
-one trade: its state, every transaction that was sent, a loss, and a problem with the peers. The requests that hand
-out a signature or a key share are refused until the deposit transaction has 3 confirmations.
+one trade: its state, every transaction that was sent, the confirmations of its transactions, a loss, and a problem
+with the peers. Every event also names the deadlines of the trade as block heights, the actions that the user must
+take, and the reason if the trade was terminated. The requests that hand out a signature or a key share are refused
+until the deposit transaction has 3 confirmations.
+
+The wallet service sends the unconfirmed transactions that spend coins of the wallet again, after the first sync of a
+run and after every new block. This includes a drain transaction of `Close` that no peer took before `musigd` ended.
 
 Every trade is stored in the database of the wallet, before a response or a transaction of the trade leaves `musigd`.
 When the wallet is opened after a start of `musigd`, the trades are loaded: a trade whose deposit transaction was not

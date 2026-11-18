@@ -10,7 +10,7 @@ unconfirmed transaction is raised.
 | Deposit fee rate | Trade parameter | Deposit transaction |
 | Prepared fee rate | Trade parameter | Swap, warning and redirect transactions; penalty transaction unless another rate is set at close |
 | Custom payout fee rate | Request of the caller, the same for both traders | Custom payout transaction |
-| Engine fee rate | The engine | Claim, deposit abort, drain, and every transaction that raises the fee of another one |
+| Engine fee rate | The engine | Claim, deposit abort, drain, and every transaction that raises the fee of another one. The deposit abort pays more if the fee of the deposit transaction requires it ([transactions.md](transactions.md)). |
 
 The engine applies sanity limits to the deposit fee rate and the prepared fee rate that the caller
 passes. The limits are open point O12 in [README.md](README.md).

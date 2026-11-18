@@ -20,7 +20,8 @@ decided (see D17), O6 was accepted (see N6), and O1 was postponed (section 12, r
 
 The identifiers of revision 1 are unchanged: findings F1 to F26, decisions D1 to D16, work packages
 WP0 to WP8, test groups A to L. Revision 2 added findings F27 and F28, the points N1 to N9
-(section 7.2) and test group M.
+(section 7.2) and test group M. The findings F29 to F31 were found and fixed during WP4, on
+2026-11-18.
 
 ## 1. Purpose and method
 
@@ -243,6 +244,7 @@ with a running test.
 | F9 | The engine does not check chain conditions before it releases secrets. | `start_payment`, `receive_swap_tx_signature`, `release_payout` in `protocol/src/trade_model.rs:709-777` | Rust trusts Java that the deposit is confirmed. The component that holds the secrets should enforce this rule. Confirmed. D6 defines the rule: 3 confirmations. |
 | F10 | The claim script leaf of the warning escrow is never used or tested on chain. | `protocol/src/script_paths.rs:18`, `protocol/src/trade_model.rs:1285` | With D3 this leaf becomes the only claim path, so it must be implemented and tested on chain (WP4, tests E3, E4, E11). Confirmed. |
 | F11 | Mock wallets are part of the production build. | Was `protocol/src/lib.rs:1` (`pub mod mocks`). Fixed in WP1: the module is behind the feature `test-utils`, and `musigd` uses the wallet of the wallet service. | Fixed keys and signatures are reachable from production code. Confirmed. |
+| F30 | The custom payout PSBT of the peer is merged into the trader's PSBT without a check. | `finalize_custom_payout` called `combine_psbts` and let the wallet finish the inputs. A PSBT can carry a finished witness, which the combination takes over. | A peer can make the trader's engine close the trade as `Custom` with a transaction that no node accepts. In this state the trader cannot publish his warning transaction, and the peer keeps all his own ways. Reproduced on regtest with real wallets. Fixed in WP4: only verified signatures of the peer are taken from his PSBT. |
 
 ### 6.2 Wallet and chain
 
@@ -261,6 +263,8 @@ with a running test.
 | F22 | `CBFScanner::from_hostnames` panics on malformed input. | `chain/src/lib.rs:113`, `:116` | Start-up crash on a configuration error. Upstream issue #193. Confirmed. |
 | F27 | `musigd` broadcasts wallet transactions through Bitcoin Core RPC. | `BitcoinCoreChainApi` in `rpc/src/bmp_wallet_service.rs:512-526`, used in `rpc/src/bin/musigd.rs:86` | D2 forbids this path. Broadcast must move to the peer-to-peer network (`submit_package` of the `bip157` client). After that and D16, `musigd` needs no Bitcoin Core RPC options. Confirmed. |
 | F28 | Every wallet sync builds a new CBF client and stops it after the first update. | `sync_cbf` in `chain/src/lib.rs:160-184` | Nothing observes the chain between two syncs, and each sync opens new peer connections. The engine needs one long-running client that the wallet sync shares. Confirmed. |
+| F29 | A deposit that spends a coin of an imported key cannot be signed. | The signer of an imported key in `BMPWallet::sign` needs the fields `tap_internal_key` and `tap_merkle_root` of the PSBT input. `Redact` in `protocol/src/psbt.rs` removes them from the half deposit. | Imported coins are spent first (D8), so every trade that a trader starts while he holds an unspent payout of an earlier trade fails at `SignDepositTx`. Reproduced with a test. Fixed in WP4: the wallet sets the fields from the imported key. |
+| F31 | The wallet of the trader who published the deposit keeps a deposit that can never confirm. | `receive_deposit_psbt` records the deposit in the wallet. The transaction that makes the deposit impossible can spend a coin of the peer, which the wallet does not watch. | After `DepositAborted` the trader's coins stay marked as spent, and the change of the deposit counts as incoming. Reproduced on regtest. Fixed in WP4: `ProtocolWalletApi::forget_transaction`. |
 
 ### 6.3 Tests and CI
 
@@ -411,7 +415,7 @@ Status on 2026-11-18: done, with these differences to the list above.
   values now, but nothing enforces them before the engine sees the chain (WP3, WP4).
 - The signatures of the peer in a custom payout PSBT are not verified yet. A PSBT without valid
   signatures is refused, not treated as proof of a modified client (TODO in
-  `finalize_custom_payout`).
+  `finalize_custom_payout`). Done in WP4 (finding F30).
 - `TradeProtocolClient.java` was changed to talk to two daemons. It was compiled, not run.
 
 ### WP2 Wallet integration for trades (estimate: 3 to 4 weeks; issues #59, #185, #186, #187, #202, #229, #230, #232)
@@ -455,7 +459,9 @@ Not done:
   functions are the reactions of WP4, and sending a parent with its child needs the package
   submission of WP3. Tests C5, E9, E10, E15, F5.
 - Sending the stored drain transaction again at the next start, and replacing it (N5, test M4,
-  M8). This needs the rebroadcast of pull request #235 and WP3.
+  M8). This needs the rebroadcast of pull request #235 and WP3. The sending again was done in
+  WP4, by the wallet service on its own and without pull request #235. The replacement is open
+  (WP6).
 - Coins that stay reserved when `musigd` stops during a setup (test H1 after a restart, H8).
   This needs the trade store of WP5; the project owner accepted to wait for it (point W2 of the
   wallet specification). Until then the request `ReleaseUtxo` of `wallet.Wallet` releases such a
@@ -563,7 +569,7 @@ Not done:
   it sends it (lock time, inputs). The swap transaction and the custom payout transaction are
   not sent. All of this belongs to the reactions of WP4.
 - A wallet payment or a drain transaction whose sending fails stays recorded in the wallet and is
-  not sent again (N5).
+  not sent again (N5). Done in WP4.
 - A reorganisation of more than 10 blocks while the client is not connected: the new connection
   starts at a block that is no longer part of the chain, and the client does not recover.
 - A new wallet follows the chain from its first block, as before. A start block for a new
@@ -608,12 +614,12 @@ Not done:
 Done when: every outcome of section 4.2 can be reached through the engine on regtest, for both
 roles, and the claim confirms through the script path.
 
-Status on 2026-11-18 (branch `wp4-trade-flows`): the condition holds for six of the seven
-outcomes of section 4.2, and the claim confirms through the script path
-(`protocol/tests/trade_model_integration_tests.rs`, tests `outcome_*`, and
-`b1_b2_cooperative_close_and_payout_in_the_wallet`). For the setup abort, the abort by the caller
-and the end by a conflicting spend of a deposit input work. The deposit abort transaction after
-the timeout does not exist.
+Status on 2026-11-18 (branches `wp4-trade-flows` and `wp4-finish`; the second one is on top of
+`wp5-persistence`): the condition holds. Every outcome of section 4.2 is reached through the
+engines on regtest (`protocol/tests/trade_model_integration_tests.rs`, tests `outcome_*`, and
+`b1_b2_cooperative_close_and_payout_in_the_wallet`), and the claim confirms through the script
+path. The setup abort is reached in all its forms: the abort by the caller, the deposit abort
+transaction after the timeout, and the end by a conflicting spend of a deposit input.
 
 Done:
 
@@ -624,49 +630,72 @@ Done:
   no signature for a custom payout before the deposit has 3 confirmations. Release safety margin
   (F6).
 - The engine derives the state of a trade from the confirmed transactions and names the
-  transactions that the trader should have on the network (D7): deposit, warning after
-  `PublishWarningTx`, redirect or penalty against a confirmed warning of the peer, claim, swap
-  transaction, custom payout. All closure types can be reached, also after two competing
+  transactions that the trader should have on the network (D7): deposit, deposit abort, warning
+  after `PublishWarningTx`, redirect or penalty against a confirmed warning of the peer, claim,
+  swap transaction, custom payout. All closure types can be reached, also after two competing
   warnings. The derived state goes back after a reorganisation (J1, J3, J4).
+- Deposit abort (D13, A3, A5): when the deposit timeout has passed in the state `Deposit`, the
+  engine builds the abort from the trader's half of the deposit, records it in the wallet and
+  names it in place of the deposit. The abort pays more than the whole deposit transaction, so
+  it replaces the deposit in a node that holds it. The timeout is counted again after a
+  reorganisation removed the deposit. In a later state the engine does not abort and sends the
+  deposit again. The abort is not stored and is built again after a restart. The details are
+  open point O19 of the specification.
 - Forced close: the seller's engine publishes the swap transaction on request, and on its own at
   the forced close margin of the configuration (D23), which is the release safety margin unless
   it is set. The buyer's engine reads the key share from any key path spend of
   the seller's payout and imports the payout.
+- Custom payout: the engine takes only verified signatures of the peer from his PSBT, and
+  verifies the finished transaction before it closes the trade (F30). An invalid signature
+  terminates the trade; a PSBT without a signature is refused and can be sent again. A repeated
+  finalisation returns the same transaction (D4).
 - Protection after close (D8): a closed trade is watched until it is final, and a warning of the
   peer is answered with the penalty.
 - A confirmed spend of a deposit input that is not the deposit closes the trade as
-  `DepositAborted` and releases the reserved coins (A13, J2).
+  `DepositAborted` and releases the reserved coins (A13, J2). The wallet forgets a recorded
+  deposit that can never confirm (F31).
+- A deposit that spends the payout of an earlier trade can be signed (F29).
 - Trade service: one task watches all trades and sends their transactions, once per block and
-  again after a failure. New requests `PublishWarningTx` and `SubscribeTradeEvents`. The event
-  stream reports the state, sent transactions, losses, unexpected events on the chain and a
-  problem with the peers (D21).
+  again after a failure. It sends nothing for a trade while the facts of the chain are unknown.
+  New requests `PublishWarningTx` and `SubscribeTradeEvents`.
+- Event stream: state, sent transactions, confirmations of the transactions of a trade (up to 3,
+  and 0 after a reorganisation), losses, unexpected events on the chain, a problem with the
+  peers (D21), and in every event the deadlines as block heights, the actions that the user must
+  take and the reason of a termination. The set of deadlines and actions is open point O18 of
+  the specification.
+- The wallet service sends the unconfirmed transactions that spend coins of the wallet again,
+  after the first sync of a run and after every new block (N5, M4, M8). This covers the drain
+  transaction of the last close. Open point O20 of the specification.
 - The chain client loads blocks with their witness data.
-- Tests: A1, A13, A14, C1, C2, C4, D1, D5, E1 to E6, E11, E14, F1, F3, J1 to J4, M1, M2 at the
-  level of the engine; six outcomes on regtest through the engines alone; four service tests; a
-  forced close between two `musigd` processes.
+- Tests: A1, A3, A5, A13, A14, C1, C2, C4, D1, D3, D4, D5, E1 to E6, E11, E14, F1, F3, G13 for
+  the custom payout, J1 to J4, M1, M2 at the level of the engine; seven outcomes on regtest
+  through the engines alone, with two forms of the deposit abort; a regtest test of a forged
+  witness in the custom payout PSBT of the peer; service tests, among them the abort after an
+  unconfirmed deposit (J9, A3) and the contents of the events; a forced close between two
+  `musigd` processes.
 
 Not done:
 
-- The deposit abort transaction (D13, test A3). After the deposit timeout the deposit is no
-  longer sent, and the coins stay reserved until a conflicting spend confirms or the user
-  releases them by hand. Needed: a wallet function that spends the reserved coins, also when the
-  wallet has recorded the unpublished deposit as their spend, with a fee that replaces the
-  deposit in the mempool of a node.
 - Fee increases of sent transactions (F20; tests C5, E9, E10, E15, F5): no child transaction for
   an anchor output, no replacement. A reaction that does not confirm at its fee rate stays
-  unconfirmed.
-- The signatures of the peer in a custom payout PSBT are still not verified.
-- The event stream does not report the terminated mark, confirmations of the transactions of a
-  trade, deadlines as block heights or actions that the user must take.
+  unconfirmed. This holds for the deposit abort and the drain transaction as well: they are sent
+  again, and their fee is not raised. This is the content of WP6.
 - The swap, custom payout, claim and penalty transactions are not recorded in the wallet when
-  they are sent. The wallet shows their outputs after they are confirmed.
-- A stored drain transaction is not sent again at the next start (N5). The engine keeps no
-  stored state "sent" for the transactions of a trade; since WP5 this is the specified behaviour,
-  because the engine derives what it must send from the stored state and from the chain.
+  they are sent. The wallet shows their outputs after they are confirmed. Reason: each of them
+  competes with a transaction of the peer for an output that the wallet does not watch. A
+  recorded transaction that loses would stay in the wallet as incoming for ever. The operation
+  to forget a transaction exists now (F31); the rule when the engine uses it for these
+  transactions does not.
+- A trader's own deposit abort that is unconfirmed when a transaction of the peer ends the
+  deposit is no longer named by the engine. It stays a valid transaction of the wallet, and the
+  wallet service sends it again until it is confirmed.
+- No test stops a real `musigd` process between the close of the wallet and the sending of the
+  drain transaction (M8). The sending again is tested in the wallet service with a wallet that
+  holds an unconfirmed transaction from an earlier run.
 - Validation of the caller's data (D5, D9, D14) was done in WP1 as far as it exists; no limit for
   the number of redirection receivers exists (open point O10).
-- bisq2 does not call the new requests yet (WP7). The Java sources of this repository were
-  compiled, not run.
+- bisq2 does not call the new requests and does not read the new fields of the events yet
+  (WP7). The Java sources of this repository were compiled, not run.
 
 ### WP5 Persistence and recovery (estimate: 3 to 4 weeks)
 
@@ -734,7 +763,7 @@ Not done:
   documentation of backup and restore: postponed by the project owner.
 - No way exists to leave the condition "a record cannot be loaded" except a copy of the wallet
   database from before the damage (open point O17 of the specification).
-- A stored drain transaction is not sent again at the next start (N5).
+- A stored drain transaction is not sent again at the next start (N5). Done in WP4.
 - Secrets in memory are not zeroised.
 - H3 and H4 are tested by restarting the service between requests and by a wallet that cannot
   store. No test stops the process inside a request.

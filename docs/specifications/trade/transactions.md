@@ -191,8 +191,22 @@ If `F` is odd, the buyer pays 1 satoshi more than the seller.
 ## Deposit abort transaction
 
 A trader who signed the deposit and does not see it confirmed within the deposit timeout spends
-his own deposit inputs to his own wallet, with a higher fee than his part of the deposit fee. The
-deposit transaction can then no longer confirm.
+his own deposit inputs to his own wallet. When this transaction is confirmed, the deposit
+transaction can no longer confirm.
+
+- Inputs: all coins that the trader put into the deposit transaction, with the sequence number
+  `0xFFFFFFFD`.
+- Output: one output to the trader's payout address. No other transaction of the trade can pay to
+  this address once the deposit is aborted, so the address is used once.
+- Fee: at least the engine fee rate for its own weight ([fees.md](fees.md)), and more than the
+  fee of the whole deposit transaction, by 1 sat per vbyte of its own weight.
+
+Rationale for the fee: a node can hold the deposit transaction as unconfirmed, and the trader
+cannot see that. The abort must then replace the deposit in this node. A node accepts a
+replacement only if it pays more than the transaction that it replaces, by the incremental relay
+fee for its own weight, and at a higher fee rate. The abort is smaller than the deposit, so the
+higher fee gives the higher fee rate. A fee above the trader's own part of the deposit fee would
+not be enough.
 
 ## Drain transaction
 

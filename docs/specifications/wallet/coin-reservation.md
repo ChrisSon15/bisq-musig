@@ -63,5 +63,34 @@ Rationale: the wallet sees the chain through compact block filters, which report
 transactions only. Without the record the wallet would believe that the coins of the deposit are
 unspent until a block confirms the deposit. This was finding F14.
 
-A transaction that is recorded but never reaches the network leaves its coins marked as spent.
-This is the safe direction: the coins can be recovered, and they cannot be spent twice.
+A transaction that is recorded and not confirmed leaves its coins marked as spent. This is the
+safe direction: the coins cannot be spent twice. Two rules keep such a record from staying for
+ever.
+
+### Sending recorded transactions again
+
+The owner of the wallet sends every unconfirmed transaction that spends coins of the wallet to
+the network again: after the first sync of a run of the program, and after every new block.
+
+- The wallet names these transactions: payments, drain transactions and recorded transactions of
+  trades.
+- A transaction leaves the list when it is confirmed, when the wallet sees a confirmed transaction
+  that spends one of the same coins, or when it is forgotten.
+
+Rationale: a broadcast over the peer-to-peer network has no result. The program can end before a
+peer took the transaction, as after the drain at the close of the wallet, and a node can drop a
+transaction.
+
+### Forgetting a recorded transaction
+
+The wallet offers an operation that removes a recorded unconfirmed transaction. The coins that it
+spends count as unspent again, and its outputs no longer count as incoming. A transaction that is
+unknown or confirmed is left as it is.
+
+The engine uses the operation for the deposit transaction when the deposit can never confirm
+([../trade/setup-and-deposit.md](../trade/setup-and-deposit.md)).
+
+Rationale: the wallet notices on its own when another confirmed transaction spends one of its
+coins. It cannot notice a transaction that spends a coin of somebody else. The transaction that
+makes a deposit impossible can spend an input of the peer. Without this operation the wallet of
+the trader who published the deposit would count his coins as spent for ever.

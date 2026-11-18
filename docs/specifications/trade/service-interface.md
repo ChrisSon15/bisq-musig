@@ -75,10 +75,37 @@ of the chain as the engine sees it.
 | Transaction sent | The engine sent a transaction of the trade to the network: its kind and its ID. This does not mean that a node accepted it. |
 | Loss | The peer took funds of the trader with a claim or a penalty transaction. |
 | Unexpected | Something happened on the chain that the engine does not expect. No state changed. |
+| Transaction confirmed | The number of confirmations of a transaction of the trade changed: its kind, its ID and the number. It is reported from the first confirmation until the transaction counts as confirmed (3 confirmations), and with the number 0 when a reorganisation removed the transaction. Blocks that arrive together can give one event. |
+| Status | A deadline, a required action, the terminated mark or the final mark changed, and the state did not. |
 | Problem with the peers, and its end | While the problem lasts, the chain is not observed and nothing can be sent ([chain-observation.md](chain-observation.md)). |
 
-The events must also report the terminated mark, the confirmation of a transaction of the trade,
-deadlines as block heights and actions that the user must take.
+Every event also contains, as they are after the event:
+
+- the reason of the termination, if the trade is terminated ([trade-states.md](trade-states.md));
+- the deadlines that are in force;
+- the actions that the user must take.
+
+A deadline is a block height: the height of the last block of the chain at which a rule of the
+engine changes. It follows from the same data as the rule itself.
+
+| Deadline | Reported while | Meaning of the height |
+|---|---|---|
+| Deposit timeout | The deposit is unconfirmed, state `Deposit` | The engine sends the deposit abort transaction |
+| Warning lock time | The deposit is confirmed and both payouts are unspent, also after a cooperative close | From this height on a warning transaction is valid: the request to publish the warning is accepted, and a warning of either trader can be in the next block |
+| Last release | Seller, state `Deposit` or `BuyerReadyToRelease`, deposit confirmed | The last height at which the seller's release is accepted ([closing.md](closing.md), release safety margin) |
+| Forced close | Seller, state `SellerReadyToRelease` | The seller's engine publishes the swap transaction on its own ([closing.md](closing.md)) |
+| Claim lock time | A warning transaction is confirmed and its escrow is unspent | From this height on the claim of the trader who published the warning is valid, and his engine sends it. The redirect or the penalty of the other trader must be confirmed at this height at the latest. |
+
+An action is something that the engine cannot do on its own:
+
+| Action | Reported while | What the user must do |
+|---|---|---|
+| Publish the warning | The trade is terminated, the deposit is confirmed, both payouts are unspent, and the state allows the warning | No step with the peer is possible any more. The trader must publish his warning transaction when the warning lock time has passed, unless the peer publishes his own first. |
+| Start the dispute | The trade is not terminated, the state is `Deposit` or `BuyerReadyToRelease`, and the last release has passed | The trade cannot end with a release any more. The traders must agree on a custom payout, or a trader must publish his warning transaction when the warning lock time has passed. |
+| Spend or drain the payout | The trade is closed cooperatively and both payouts are unspent | The peer can still publish his warning, and the engine answers only while the program runs. The user must spend his payout, or end the program in the regular way ([post-trade-protection.md](post-trade-protection.md)). |
+
+The set of deadlines and actions, and the form of the events, are not agreed with bisq2. This is
+open point O18 in [README.md](README.md).
 
 Changes of existing messages that this specification requires:
 

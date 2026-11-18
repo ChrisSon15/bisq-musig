@@ -158,8 +158,21 @@ Rules:
 - A PSBT of the peer for another transaction, with other outputs or other amounts, is refused. It
   does not terminate the trade, because the two callers can have used different amounts or fee
   rates. The trader can still finalise with a PSBT of the peer for the same transaction.
-- The engine checks the peer's signatures in the PSBT. A PSBT of the peer for the same
-  transaction with an invalid signature terminates the trade.
+- The engine takes from the PSBT of the peer only the peer's signature for each of the two
+  inputs, and only after it has verified the signature. It uses nothing else of this PSBT. A
+  signature is found among the signatures for the script path, or in the witness of an input
+  that the peer has finished, so the PSBT of a peer who has completed step 2 already is accepted.
+- A PSBT of the peer for the same transaction with an invalid signature terminates the trade. A
+  signature that covers only a part of the transaction counts as invalid.
+- A PSBT of the peer for the same transaction without a signature of the peer is refused. The
+  trade continues, and the request can be repeated with the signed PSBT.
+- The engine verifies the complete transaction, with both signatures of both inputs, before it
+  closes the trade.
+
+Rationale: a PSBT can carry a finished witness for an input. If the two PSBTs were combined, such
+a witness of the peer would become part of the trader's transaction without a check. The trader's
+engine would then close the trade with a transaction that no node accepts, and a closed trade
+cannot use the dispute path.
 - Step 2 can be repeated. It returns the same transaction and sends it again.
 - A successful step 2 means that the transaction is complete and was sent. It does not mean that
   it is confirmed. The trade is final when the transaction has `MIN_CONFIRMATIONS` confirmations.

@@ -145,19 +145,34 @@ Before the trader signed the deposit (`Init`):
 
 After the trader signed the deposit (`Deposit`), and the deposit is not confirmed:
 
-- The engine counts the blocks since it signed. When the deposit timeout has passed without a
-  confirmation of the deposit, the engine publishes the deposit abort transaction
-  ([transactions.md](transactions.md)).
+- The engine counts the blocks since it first saw the chain without the deposit: after it signed,
+  or after a reorganisation removed the deposit. The height at which the counting started is
+  stored, so the counting continues after a restart. It ends when the deposit is confirmed.
+- When the deposit timeout has passed without a confirmation of the deposit, the engine builds
+  the deposit abort transaction ([transactions.md](transactions.md)), records it in the wallet
+  and publishes it. From then on the engine sends the abort and no longer the deposit.
+- The engine aborts on its own only in the state `Deposit`. In a later state the deposit was
+  confirmed before, and the buyer can have started the payment. If a reorganisation removes the
+  deposit then, the trader who holds it sends it again, without a time limit
+  ([chain-observation.md](chain-observation.md)).
 - The engine cannot see unconfirmed transactions. It therefore watches for the confirmation of
   either transaction and follows the one that confirms:
   - the abort confirms: the trade is closed as `DepositAborted`, the coins are free again;
-  - the deposit confirms: the trade continues in `Deposit`.
-- While neither is confirmed, the engine sends the abort transaction again and can raise its fee
-  ([fees.md](fees.md)).
+  - the deposit confirms: the trade continues in `Deposit`, and the abort is dropped.
+- While neither is confirmed, the engine sends the abort transaction again after every block.
+  Raising its fee is defined in [fees.md](fees.md).
+- The abort transaction is not stored. It follows from the stored data of the trade, so the
+  engine builds the same transaction again after a restart.
 
 - Any other confirmed transaction that spends an input of the deposit transaction, of either
   trader, has the same effect as the abort: the deposit can never confirm, the trade is closed as
   `DepositAborted`, and the coins of the trader are free again.
+- When the trade is closed as `DepositAborted`, the engine tells the wallet to forget the deposit
+  transaction, if the wallet has recorded it
+  ([../wallet/coin-reservation.md](../wallet/coin-reservation.md)).
 
 Rationale: without the abort, a peer who never publishes the deposit would keep the trader's coins
 reserved for ever, and could publish the deposit at any later time.
+
+The details of the abort in this section and in [transactions.md](transactions.md) are open point
+O19 in [README.md](README.md).

@@ -136,7 +136,8 @@ watched outputs again for the new blocks.
 | Event removed by the reorganisation | Reaction |
 |---|---|
 | Deposit depth falls below 3, the buyer has not started the payment and no custom payout is signed | The deposit counts as unconfirmed again. Requests that need a confirmed deposit are refused until the depth is 3 again. |
-| The deposit is removed and the deposit timeout passes | Deposit abort ([setup-and-deposit.md](setup-and-deposit.md)) |
+| The deposit is removed in the state `Deposit` | The deposit timeout is counted again from the removal. When it passes: deposit abort ([setup-and-deposit.md](setup-and-deposit.md)) |
+| The deposit is removed in a later state | The trader who holds the deposit transaction sends it again, without a time limit. The engine does not abort on its own. |
 | The deposit is removed and a transaction that spends one of its inputs confirms | The trade is closed as `DepositAborted`. The trader's coins are free again. |
 | A confirmed warning transaction | The counting of the redirect and claim lock times starts again when the warning confirms again. No redirect or claim is sent before. |
 | A confirmed transaction that the engine sent | The engine sends it again. |

@@ -44,13 +44,22 @@ in that time. A payout that is moved to the seed wallet cannot be taken by a war
 - Imported coins that are reserved for an open trade are not drained. The open trade continues at
   the next start.
 
-At the next start the engine checks the stored drain transaction:
+The drain transaction is stored in the wallet as an unconfirmed transaction. The wallet service
+sends every unconfirmed transaction that spends coins of the wallet again: once after the first
+sync of a run of the program, and once after every new block
+([../wallet/coin-reservation.md](../wallet/coin-reservation.md)). For the drain transaction this
+means at the next start:
 
-- confirmed: the stored transaction is removed;
-- not confirmed: the engine sends it again, or replaces it with a higher fee. Exactly one drain
-  transaction confirms;
-- one of its inputs was spent by another confirmed transaction: the stored transaction is removed
-  and the engine evaluates that spend as a chain event.
+- confirmed: it is no longer unconfirmed, and nothing is sent;
+- not confirmed: the wallet service sends it again, after the start and after every block.
+  Exactly one drain transaction exists;
+- one of its inputs was spent by another confirmed transaction: the wallet sees this spend,
+  because the input is a coin of the wallet. The drain transaction is no longer valid for the
+  wallet and is not sent. The engine evaluates the spend as a chain event of the trade.
+
+A replacement of the drain transaction with a higher fee is defined in [fees.md](fees.md) and is
+not implemented. That the wallet service sends all unconfirmed transactions of the wallet again,
+and not only the drain transaction, is open point O20 in [README.md](README.md).
 
 ## Limits that the user must know
 

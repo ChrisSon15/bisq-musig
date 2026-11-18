@@ -46,6 +46,18 @@ Consequences that the user must know: a payment after a close links the payout w
 on the chain, and it can be larger than a payment from the seed wallet alone, so its fee is
 higher.
 
+## Signing
+
+The wallet signs a coin of an imported key in every transaction that spends it, from what the
+wallet knows itself: the secret key and the script of the output. It does not need the Taproot
+key data of the coin in the PSBT that it is given.
+
+Rationale: the trade protocol removes this data from the trader's half of the deposit
+transaction before the half goes to the peer, and signs the deposit transaction later. Because
+imported coins are spent first, the deposit of the next trade after a cooperative close spends
+the payout of the earlier trade. A wallet that needed the data in the PSBT could not sign this
+deposit.
+
 ## Drain
 
 The close operation of the wallet service moves all imported coins that are not reserved to one
