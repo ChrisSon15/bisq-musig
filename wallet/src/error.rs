@@ -47,6 +47,8 @@ pub enum WalletErrorKind {
     WalletAlreadyExists,
     #[error("seed-derived descriptors do not match the persisted wallet descriptors")]
     SeedDescriptorMismatch,
+    #[error("UTXO is spent or invalid")]
+    InvalidUTXO,
     ExtractTx(#[from] Box<ExtractTxError>),
     LoadWallet(#[from] bdk_wallet::LoadWithPersistError<rusqlite::Error>),
     CreateWallet(#[from] bdk_wallet::CreateWithPersistError<rusqlite::Error>),
