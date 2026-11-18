@@ -141,7 +141,12 @@ impl Trader {
             trade_fee_receiver: None,
         };
         self.model
-            .receive_key_shares(&mut *self.wallet, &CONFIG, &peer.sent_key_shares(), params)
+            .receive_key_shares(
+                &mut *self.wallet,
+                &CONFIG,
+                Ok(peer.sent_key_shares()),
+                params,
+            )
             .expect("valid key shares and parameters");
     }
 
@@ -170,7 +175,10 @@ impl Trader {
             sellers_claim_tx_input: nonces.sellers_claim_tx_input.clone(),
         };
         self.model
-            .receive_nonce_shares(half_deposit_psbt, addresses, nonces, receivers.to_vec())
+            .receive_nonce_shares(
+                Ok((half_deposit_psbt, addresses, nonces)),
+                receivers.to_vec(),
+            )
             .expect("valid nonce shares");
     }
 
@@ -193,9 +201,12 @@ impl Trader {
         }
     }
 
-    fn receive_partial_signatures(&mut self, peers_partial_signatures: &ExchangedSigs<ByVal>) {
+    fn receive_partial_signatures(
+        &mut self,
+        peers_partial_signatures: ExchangedSigs<'static, ByVal>,
+    ) {
         self.model
-            .receive_partial_signatures(&mut *self.wallet, peers_partial_signatures)
+            .receive_partial_signatures(&mut *self.wallet, Ok(peers_partial_signatures))
             .expect("valid partial signatures");
     }
 }
@@ -246,14 +257,14 @@ impl Trade {
 
         let buyers_partial_signatures = buyer.sent_partial_signatures();
         let sellers_partial_signatures = seller.sent_partial_signatures();
-        seller.receive_partial_signatures(&buyers_partial_signatures);
-        buyer.receive_partial_signatures(&sellers_partial_signatures);
+        seller.receive_partial_signatures(buyers_partial_signatures);
+        buyer.receive_partial_signatures(sellers_partial_signatures);
         assert_eq!(buyer.model.state(), TradeState::Deposit);
         assert_eq!(seller.model.state(), TradeState::Deposit);
 
         // The taker holds all signatures and publishes the deposit transaction.
         let sellers_deposit_psbt = seller.model.deposit_psbt()?.clone();
-        let deposit_tx = buyer.model.receive_deposit_psbt(sellers_deposit_psbt)?;
+        let deposit_tx = buyer.model.receive_deposit_psbt(Ok(sellers_deposit_psbt))?;
         let deposit_txid = chain.transaction_broadcast(&deposit_tx)?;
         env.mine_block()?;
 
@@ -329,11 +340,11 @@ impl Trade {
         let sellers_key_share = *self.seller.model.my_private_key_share_for_peer_output()?;
         self.buyer
             .model
-            .close_with_key_share(sellers_key_share, None)?;
+            .close_with_key_share(Ok(sellers_key_share), None)?;
         let buyers_key_share = *self.buyer.model.my_private_key_share_for_peer_output()?;
         self.seller
             .model
-            .close_with_key_share(buyers_key_share, None)?;
+            .close_with_key_share(Ok(buyers_key_share), None)?;
         let closed = TradeState::TradeClosed(ClosureType::Cooperative);
         assert_eq!(self.buyer.model.state(), closed);
         assert_eq!(self.seller.model.state(), closed);
@@ -352,7 +363,7 @@ impl Trade {
             .expect("message E contains the buyer's partial signature");
         self.seller
             .model
-            .receive_swap_tx_signature(swap_tx_signature)?;
+            .receive_swap_tx_signature(Ok(swap_tx_signature))?;
         Ok(self.seller.model.release_payout()?)
     }
 
@@ -579,11 +590,11 @@ fn d1_custom_payout() -> anyhow::Result<()> {
     let custom_payout_tx = trade
         .seller
         .model
-        .finalize_custom_payout(&mut *trade.seller.wallet, buyers_psbt)?;
+        .finalize_custom_payout(&mut *trade.seller.wallet, Ok(buyers_psbt))?;
     let buyers_custom_payout_tx = trade
         .buyer
         .model
-        .finalize_custom_payout(&mut *trade.buyer.wallet, sellers_psbt)?;
+        .finalize_custom_payout(&mut *trade.buyer.wallet, Ok(sellers_psbt))?;
     assert_eq!(
         custom_payout_tx.compute_txid(),
         buyers_custom_payout_tx.compute_txid()

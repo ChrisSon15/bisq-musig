@@ -2184,6 +2184,39 @@ async fn g13_invalid_peer_data_terminates_the_trade() {
     }
 }
 
+/// G13 and D18: the preconditions of a request are checked before the data of the peer. Data that
+/// cannot be decoded, in a request that is not allowed, does not terminate the trade.
+#[tokio::test]
+async fn g13_invalid_peer_data_in_a_request_that_is_not_allowed() {
+    for trade_type in TRADE_TYPES {
+        let mut trade = Trade::at(trade_type, Stage::SignaturesExchanged).await;
+        let no_psbt = DepositPsbt {
+            deposit_psbt: b"no PSBT".to_vec(),
+        };
+        for party in [&mut trade.buyer, &mut trade.seller] {
+            let result = party.publish_deposit_tx(&no_psbt).await;
+            assert_not_allowed(result, party, TradeState::Init);
+            let result = party.close_trade_with_key_share(&[1, 2, 3]).await;
+            assert_not_allowed(result, party, TradeState::Init);
+            let result = party.custom_close_trade(b"no PSBT").await;
+            assert_not_allowed(result, party, TradeState::Init);
+        }
+        let result = trade.seller.sign_swap_tx(&[1, 2, 3]).await;
+        assert_not_allowed(result, &trade.seller, TradeState::Init);
+        let result = trade.buyer.sign_swap_tx(&[1, 2, 3]).await;
+        assert_refused(
+            result,
+            Code::FailedPrecondition,
+            "only available for seller",
+        );
+        assert!(!trade.buyer.is_terminated());
+
+        // The trade continues: both sides sign the deposit transaction.
+        trade.sign_deposit_tx().await;
+        trade.assert_states(TradeState::Deposit, TradeState::Deposit);
+    }
+}
+
 /// G15: a request that is refused for a reason that an honest peer and a correct network can also
 /// cause does not end the use of the trade. The trade closes normally afterwards (D17).
 #[tokio::test]

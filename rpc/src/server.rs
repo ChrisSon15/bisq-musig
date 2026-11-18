@@ -14,7 +14,8 @@ use musig2::secp::Scalar;
 use protocol::params::{EngineConfig, TradeParams};
 use protocol::storage::ByVal;
 use protocol::trade_model::{
-    ExchangedKeys, ExchangedSigs, ProtocolErrorKind, TradeModel, TradeModelStore,
+    ExchangedKeys, ExchangedSigs, PeerData, ProtocolErrorKind, TradeModel, TradeModelStore,
+    UndecodablePeerData,
 };
 use serde::Serialize;
 use tokio::time::{self, Duration};
@@ -99,8 +100,7 @@ impl MusigImpl {
         })
     }
 
-    /// Looks up the trade of the request and runs `handler` with it. If the handler finds a field
-    /// of the peer that cannot be decoded, the trade is terminated.
+    /// Looks up the trade of the request and runs `handler` with it.
     fn handle_trade_request<Req, Res, F>(
         &self,
         request: Request<Req>,
@@ -119,15 +119,7 @@ impl MusigImpl {
                     Status::not_found(format!("missing trade with id: {}", request.trade_id()))
                 })?;
             let mut trade_model = trade_model.lock().unwrap();
-            handler(request, &mut trade_model).map_err(|error| match error {
-                HandlerError::PeerData(status) => {
-                    HandlerError::Protocol(trade_model.reject_peer_data(&format!(
-                        "a field of a message of the peer cannot be decoded: {}",
-                        status.message()
-                    )))
-                }
-                error => error,
-            })
+            handler(request, &mut trade_model)
         })
     }
 }
@@ -168,20 +160,16 @@ impl musig_server::Musig for MusigImpl {
     ) -> Result<Response<NonceSharesMessage>> {
         self.with_wallet(|wallet| {
             self.handle_trade_request(request, |request, trade_model| {
-                let peers_key_shares = ExchangedKeys {
-                    buyer_payout: request
-                        .buyer_output_peers_pub_key_share
-                        .try_proto_into()
-                        .peer_data()?,
-                    seller_payout: request
-                        .seller_output_peers_pub_key_share
-                        .try_proto_into()
-                        .peer_data()?,
-                    multisig_script: request
-                        .peers_multisig_script_key
-                        .try_proto_into()
-                        .peer_data()?,
-                };
+                let peers_key_shares = (|| {
+                    Ok(ExchangedKeys {
+                        buyer_payout: request.buyer_output_peers_pub_key_share.try_proto_into()?,
+                        seller_payout: request
+                            .seller_output_peers_pub_key_share
+                            .try_proto_into()?,
+                        multisig_script: request.peers_multisig_script_key.try_proto_into()?,
+                    })
+                })()
+                .peer_data();
                 let params = TradeParams {
                     trade_amount: Amount::from_sat(request.trade_amount.check_in_signed_range()?),
                     buyers_security_deposit: Amount::from_sat(
@@ -200,7 +188,7 @@ impl musig_server::Musig for MusigImpl {
                     claim_lock_time: lock_time_in_blocks(request.claim_lock_time)?,
                     trade_fee_receiver: request.trade_fee_receiver.try_proto_into()?,
                 };
-                trade_model.receive_key_shares(wallet, &self.config, &peers_key_shares, params)?;
+                trade_model.receive_key_shares(wallet, &self.config, peers_key_shares, params)?;
 
                 let redirection_amount_msat = trade_model
                     .redirection_amount_msat()?
@@ -236,17 +224,14 @@ impl musig_server::Musig for MusigImpl {
                     .into_iter()
                     .map(TryProtoInto::try_proto_into)
                     .collect::<Result<Vec<_>>>()?;
-                let peers_half_deposit_psbt: Psbt = (&peers_nonce_shares.half_deposit_psbt[..])
-                    .try_proto_into()
-                    .peer_data()?;
-                let (peers_addresses, peers_nonces) =
-                    peers_nonce_shares.try_proto_into().peer_data()?;
-                trade_model.receive_nonce_shares(
-                    peers_half_deposit_psbt,
-                    peers_addresses,
-                    peers_nonces,
-                    redirection_receivers,
-                )?;
+                let peers_message = (|| {
+                    let half_deposit_psbt: Psbt =
+                        (&peers_nonce_shares.half_deposit_psbt[..]).try_proto_into()?;
+                    let (addresses, nonces) = peers_nonce_shares.try_proto_into()?;
+                    Ok((half_deposit_psbt, addresses, nonces))
+                })()
+                .peer_data();
+                trade_model.receive_nonce_shares(peers_message, redirection_receivers)?;
             }
             let my_partial_signatures = trade_model.my_partial_signatures_on_peer_txs()?;
 
@@ -264,9 +249,9 @@ impl musig_server::Musig for MusigImpl {
                 let peers_partial_signatures = request
                     .peers_partial_signatures
                     .ok_or_else(|| Status::not_found("missing request.peers_partial_signatures"))?;
-                let peers_partial_signatures: ExchangedSigs<ByVal> =
-                    peers_partial_signatures.try_proto_into().peer_data()?;
-                trade_model.receive_partial_signatures(wallet, &peers_partial_signatures)?;
+                let peers_partial_signatures: PeerData<ExchangedSigs<ByVal>> =
+                    peers_partial_signatures.try_proto_into().peer_data();
+                trade_model.receive_partial_signatures(wallet, peers_partial_signatures)?;
                 let deposit_psbt = trade_model.deposit_psbt()?;
 
                 Ok(DepositPsbt {
@@ -288,10 +273,8 @@ impl musig_server::Musig for MusigImpl {
             let peers_deposit_psbt = request
                 .peers_deposit_psbt
                 .ok_or_else(|| Status::not_found("missing request.peers_deposit_psbt"))?;
-            let peers_deposit_psbt: Psbt = peers_deposit_psbt
-                .deposit_psbt
-                .try_proto_into()
-                .peer_data()?;
+            let peers_deposit_psbt: PeerData<Psbt> =
+                peers_deposit_psbt.deposit_psbt.try_proto_into().peer_data();
             let deposit_tx = trade_model.receive_deposit_psbt(peers_deposit_psbt)?;
 
             info!("*** BROADCAST DEPOSIT TX ***"); // TODO: Implement broadcast.
@@ -332,15 +315,10 @@ impl musig_server::Musig for MusigImpl {
                     peer_output_prv_key_share: Some(prv_key_share.serialize().into()),
                 })
             } else {
-                // The role is checked before the signature is decoded, so that a call of the buyer
-                // is refused whatever it contains.
-                if trade_model.am_buyer() {
-                    return Err(ProtocolErrorKind::WrongRole("seller").into());
-                }
-                let signature: PartialSignature = request
+                let signature: PeerData<PartialSignature> = request
                     .swap_tx_input_peers_partial_signature
                     .try_proto_into()
-                    .peer_data()?;
+                    .peer_data();
                 trade_model.receive_swap_tx_signature(signature)?;
 
                 Ok(SwapTxSignatureResponse::default())
@@ -361,7 +339,8 @@ impl musig_server::Musig for MusigImpl {
                 .map(FeeRate::from_sat_per_kwu);
             if let Some(peer_prv_key_share) = request.my_output_peers_prv_key_share {
                 // Trader receives the private key share from a cooperative peer, closing our trade.
-                let peer_prv_key_share: Scalar = peer_prv_key_share.try_proto_into().peer_data()?;
+                let peer_prv_key_share: PeerData<Scalar> =
+                    peer_prv_key_share.try_proto_into().peer_data();
                 trade_model.close_with_key_share(peer_prv_key_share, penalty_tx_fee_rate)?;
             } else if let Some(swap_tx) = request.swap_tx {
                 // Buyer supplies a signed swap tx to the Rust server, to close our trade. (Mainly
@@ -429,10 +408,10 @@ impl musig_server::Musig for MusigImpl {
     ) -> Result<Response<CustomCloseTradeResponse>> {
         self.with_wallet(|wallet| {
             self.handle_trade_request(request, |request, trade_model| {
-                let peers_psbt: Psbt = request
+                let peers_psbt: PeerData<Psbt> = request
                     .peers_custom_payout_psbt
                     .try_proto_into()
-                    .peer_data()?;
+                    .peer_data();
                 let custom_payout_tx = trade_model.finalize_custom_payout(wallet, peers_psbt)?;
 
                 info!("*** BROADCAST CUSTOM PAYOUT TX ***"); // TODO: Implement broadcast.
@@ -555,9 +534,6 @@ enum HandlerError {
     /// A status that the handler created itself. It concerns the request of the caller, not the
     /// data of the peer.
     Status(Status),
-    /// A field of a message of the peer cannot be decoded. An unmodified client of the peer never
-    /// sends such a field, so the trade is terminated.
-    PeerData(Status),
     /// An error of the trade engine.
     Protocol(ProtocolErrorKind),
 }
@@ -579,7 +555,6 @@ impl From<HandlerError> for Status {
         // TODO: The status codes are not decided yet (open point O11 of the specification).
         match value {
             HandlerError::Status(status) => status,
-            HandlerError::PeerData(status) => Self::invalid_argument(status.message()),
             HandlerError::Protocol(e) => match e {
                 ProtocolErrorKind::DuplicateTradeId(_) => Self::already_exists(e.to_string()),
                 ProtocolErrorKind::TradeTerminated(_) => Self::aborted(e.to_string()),
@@ -595,14 +570,15 @@ impl From<HandlerError> for Status {
     }
 }
 
-/// Marks the conversion of a field that the peer created.
+/// Marks the conversion of data that the peer created. The engine decides what a failed
+/// conversion means for the trade, after it has checked the preconditions of the request.
 trait PeerField<T> {
-    fn peer_data(self) -> Result<T, HandlerError>;
+    fn peer_data(self) -> PeerData<T>;
 }
 
 impl<T> PeerField<T> for Result<T> {
-    fn peer_data(self) -> Result<T, HandlerError> {
-        self.map_err(HandlerError::PeerData)
+    fn peer_data(self) -> PeerData<T> {
+        self.map_err(|status| UndecodablePeerData(status.message().to_owned()))
     }
 }
 

@@ -118,6 +118,42 @@ struct ReceivedNonceShares {
     redirection_receivers: Vec<Receiver<NetworkUnchecked>>,
 }
 
+impl ReceivedNonceShares {
+    fn new(
+        (half_deposit_psbt, addresses, nonce_shares): PeersNonceSharesMessage,
+        redirection_receivers: Vec<Receiver<NetworkUnchecked>>,
+    ) -> Self {
+        Self {
+            half_deposit_psbt,
+            addresses: [
+                addresses.warning_tx_fee_bump,
+                addresses.redirect_tx_fee_bump,
+                addresses.claim_tx_payout,
+            ],
+            nonce_shares: [
+                nonce_shares.swap_tx_input,
+                nonce_shares.buyers_warning_tx_buyer_input,
+                nonce_shares.buyers_warning_tx_seller_input,
+                nonce_shares.sellers_warning_tx_buyer_input,
+                nonce_shares.sellers_warning_tx_seller_input,
+                nonce_shares.buyers_redirect_tx_input,
+                nonce_shares.sellers_redirect_tx_input,
+                nonce_shares.buyers_claim_tx_input,
+                nonce_shares.sellers_claim_tx_input,
+            ],
+            redirection_receivers,
+        }
+    }
+}
+
+/// The data of the peer in the second message of the setup: its half of the deposit transaction,
+/// its addresses and its nonce shares.
+pub type PeersNonceSharesMessage = (
+    Psbt,
+    ExchangedAddresses<'static, ByVal, NetworkUnchecked>,
+    ExchangedNonces<'static, ByVal>,
+);
+
 #[derive(Clone, Eq, PartialEq)]
 struct ReceivedPartialSignatures {
     warning_tx_buyer: PartialSignature,
@@ -247,6 +283,29 @@ fn peer_misbehaved(reason: impl Into<String>) -> Failure {
     Failure::PeerMisbehaved(reason.into())
 }
 
+/// Data of a message of the peer, as the caller of the engine decoded it. `Err` holds the reason
+/// why a field cannot be decoded.
+///
+/// An operation takes the result of the decoding, not the decoded value, so that the engine keeps
+/// its order of checks (D18): it checks the preconditions of the request first, and only then
+/// handles data that cannot be decoded as a failed check of the peer's data (D17).
+pub type PeerData<T> = Result<T, UndecodablePeerData>;
+
+/// The reason why a field of a message of the peer cannot be decoded. It appears in the log and
+/// in the error for the caller, so it must not contain a secret.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UndecodablePeerData(pub String);
+
+/// Returns the decoded data of the peer. Data that cannot be decoded is a failed check of the
+/// peer's data: an unmodified client never sends it.
+fn decoded<T>(data: PeerData<T>) -> Result<T, Failure> {
+    data.map_err(|UndecodablePeerData(reason)| {
+        peer_misbehaved(format!(
+            "a field of a message of the peer cannot be decoded: {reason}"
+        ))
+    })
+}
+
 /// Marks the checks of data that the peer created. An unmodified client passes them.
 trait PeerDataCheck<T> {
     fn or_peer_misbehaved(self, what: &str) -> Result<T, Failure>;
@@ -357,16 +416,6 @@ impl TradeModel {
         ProtocolErrorKind::TradeTerminated(reason)
     }
 
-    /// Terminates the trade for data of the peer that the caller of the engine found to be
-    /// invalid before it reached the engine, for example a field that cannot be decoded. Returns
-    /// the error for the caller. A trade that is terminated already keeps its first reason.
-    pub fn reject_peer_data(&mut self, reason: &str) -> ProtocolErrorKind {
-        match self.check_not_terminated() {
-            Ok(()) => self.terminate(reason.to_owned()),
-            Err(error) => error,
-        }
-    }
-
     /// Runs one operation on a copy of the trade. The copy replaces the trade only if the
     /// operation succeeds, so a request that is refused leaves no data and no signature. If the
     /// operation finds that the peer misbehaved, the trade is terminated.
@@ -443,13 +492,14 @@ impl TradeModel {
         &mut self,
         wallet: &mut dyn ProtocolWalletApi,
         config: &EngineConfig,
-        peers_key_shares: &ExchangedKeys<ByVal>,
+        peers_key_shares: PeerData<ExchangedKeys<ByVal>>,
         params: TradeParams,
     ) -> Result<()> {
         self.atomically(|trade| {
             if let Some(stored_params) = &trade.received.params {
                 // The request was processed before.
-                if !trade.keys.has_peers_key_shares(peers_key_shares) {
+                let peers_key_shares = decoded(peers_key_shares)?;
+                if !trade.keys.has_peers_key_shares(&peers_key_shares) {
                     return Err(peer_misbehaved(
                         "the key shares of the peer differ from the ones that it sent before",
                     ));
@@ -461,9 +511,10 @@ impl TradeModel {
             }
             trade.require_state(&[TradeState::Init])?;
             params.validate(config, trade.network)?;
-            trade.check_peer_key_shares(peers_key_shares)?;
+            let peers_key_shares = decoded(peers_key_shares)?;
+            trade.check_peer_key_shares(&peers_key_shares)?;
 
-            trade.set_peer_key_shares(peers_key_shares);
+            trade.set_peer_key_shares(&peers_key_shares);
             trade.set_params(&params)?;
             trade.aggregate_key_shares(&params)?;
             trade.init_my_addresses(wallet)?;
@@ -479,34 +530,14 @@ impl TradeModel {
     /// trader's partial signatures exist.
     pub fn receive_nonce_shares(
         &mut self,
-        peers_half_deposit_psbt: Psbt,
-        peers_addresses: ExchangedAddresses<ByVal, NetworkUnchecked>,
-        peers_nonce_shares: ExchangedNonces<ByVal>,
+        peers_message: PeerData<PeersNonceSharesMessage>,
         redirection_receivers: Vec<Receiver<NetworkUnchecked>>,
     ) -> Result<()> {
-        let received = ReceivedNonceShares {
-            half_deposit_psbt: peers_half_deposit_psbt,
-            addresses: [
-                peers_addresses.warning_tx_fee_bump,
-                peers_addresses.redirect_tx_fee_bump,
-                peers_addresses.claim_tx_payout,
-            ],
-            nonce_shares: [
-                peers_nonce_shares.swap_tx_input,
-                peers_nonce_shares.buyers_warning_tx_buyer_input,
-                peers_nonce_shares.buyers_warning_tx_seller_input,
-                peers_nonce_shares.sellers_warning_tx_buyer_input,
-                peers_nonce_shares.sellers_warning_tx_seller_input,
-                peers_nonce_shares.buyers_redirect_tx_input,
-                peers_nonce_shares.sellers_redirect_tx_input,
-                peers_nonce_shares.buyers_claim_tx_input,
-                peers_nonce_shares.sellers_claim_tx_input,
-            ],
-            redirection_receivers,
-        };
         self.atomically(|trade| {
             if let Some(stored) = &trade.received.nonce_shares {
                 // The request was processed before.
+                let received =
+                    ReceivedNonceShares::new(decoded(peers_message)?, redirection_receivers);
                 if stored.half_deposit_psbt != received.half_deposit_psbt
                     || stored.addresses != received.addresses
                     || stored.nonce_shares != received.nonce_shares
@@ -532,10 +563,11 @@ impl TradeModel {
             }
 
             // Data of the caller.
-            trade.set_redirection_receivers(&received.redirection_receivers)?;
+            trade.set_redirection_receivers(&redirection_receivers)?;
             trade.check_redirect_tx_params()?;
 
             // Data of the peer.
+            let received = ReceivedNonceShares::new(decoded(peers_message)?, redirection_receivers);
             let [warning_tx_fee_bump, redirect_tx_fee_bump, claim_tx_payout] =
                 received.addresses.clone();
             let peers_addresses = ExchangedAddresses {
@@ -569,33 +601,13 @@ impl TradeModel {
     pub fn receive_partial_signatures(
         &mut self,
         wallet: &mut dyn ProtocolWalletApi,
-        peers_partial_signatures: &ExchangedSigs<ByVal>,
+        peers_partial_signatures: PeerData<ExchangedSigs<ByVal>>,
     ) -> Result<()> {
         self.atomically(|trade| {
-            let swap_tx_input = if trade.am_buyer() {
-                let missing = "the seller sent no signature hash or no partial signature for the \
-                               swap transaction";
-                Some(
-                    peers_partial_signatures
-                        .swap_tx_input_partial_signature
-                        .zip(peers_partial_signatures.swap_tx_input_sighash)
-                        .ok_or_else(|| peer_misbehaved(missing))?,
-                )
-            } else {
-                // The buyer hands out this signature only when he has started the payment.
-                None
-            };
-            let received = ReceivedPartialSignatures {
-                warning_tx_buyer: peers_partial_signatures
-                    .peers_warning_tx_buyer_input_partial_signature,
-                warning_tx_seller: peers_partial_signatures
-                    .peers_warning_tx_seller_input_partial_signature,
-                redirect_tx: peers_partial_signatures.peers_redirect_tx_input_partial_signature,
-                claim_tx: peers_partial_signatures.peers_claim_tx_input_partial_signature,
-                swap_tx: swap_tx_input,
-            };
             if let Some(stored) = &trade.received.partial_signatures {
                 // The request was processed before.
+                let received =
+                    trade.received_partial_signatures(&decoded(peers_partial_signatures)?)?;
                 if *stored != received {
                     return Err(peer_misbehaved(
                         "the partial signatures of the peer differ from the ones that it sent \
@@ -612,6 +624,8 @@ impl TradeModel {
                 .into());
             }
 
+            let received =
+                trade.received_partial_signatures(&decoded(peers_partial_signatures)?)?;
             if let Some((_, sighash)) = received.swap_tx {
                 trade.sign_swap_tx_input_partial(sighash)?;
             }
@@ -628,14 +642,47 @@ impl TradeModel {
         })
     }
 
+    /// The partial signatures of the peer that the trader needs in his role.
+    fn received_partial_signatures(
+        &self,
+        peers_partial_signatures: &ExchangedSigs<ByVal>,
+    ) -> Result<ReceivedPartialSignatures, Failure> {
+        let swap_tx_input = if self.am_buyer() {
+            let missing = "the seller sent no signature hash or no partial signature for the swap \
+                           transaction";
+            Some(
+                peers_partial_signatures
+                    .swap_tx_input_partial_signature
+                    .zip(peers_partial_signatures.swap_tx_input_sighash)
+                    .ok_or_else(|| peer_misbehaved(missing))?,
+            )
+        } else {
+            // The buyer hands out this signature only when he has started the payment.
+            None
+        };
+        Ok(ReceivedPartialSignatures {
+            warning_tx_buyer: peers_partial_signatures
+                .peers_warning_tx_buyer_input_partial_signature,
+            warning_tx_seller: peers_partial_signatures
+                .peers_warning_tx_seller_input_partial_signature,
+            redirect_tx: peers_partial_signatures.peers_redirect_tx_input_partial_signature,
+            claim_tx: peers_partial_signatures.peers_claim_tx_input_partial_signature,
+            swap_tx: swap_tx_input,
+        })
+    }
+
     /// Takes the deposit PSBT with the signatures of the peer and returns the signed deposit
     /// transaction.
-    pub fn receive_deposit_psbt(&mut self, peers_deposit_psbt: Psbt) -> Result<Transaction> {
+    pub fn receive_deposit_psbt(
+        &mut self,
+        peers_deposit_psbt: PeerData<Psbt>,
+    ) -> Result<Transaction> {
         self.atomically(|trade| {
             // Every state after `Init` means that the trader signed the deposit transaction.
             if trade.state == TradeState::Init {
                 return Err(ProtocolErrorKind::NotAllowedInState(trade.state).into());
             }
+            let peers_deposit_psbt = decoded(peers_deposit_psbt)?;
             let txid = trade.deposit_tx.builder.psbt()?.unsigned_tx.compute_txid();
             let peers_txid = peers_deposit_psbt.unsigned_tx.compute_txid();
             if txid != peers_txid {
@@ -675,11 +722,14 @@ impl TradeModel {
     }
 
     /// The seller takes the buyer's partial signature for the swap transaction.
-    pub fn receive_swap_tx_signature(&mut self, signature: PartialSignature) -> Result<()> {
+    pub fn receive_swap_tx_signature(
+        &mut self,
+        signature: PeerData<PartialSignature>,
+    ) -> Result<()> {
         self.atomically(|trade| {
             trade.require_seller()?;
             if let Some(stored) = trade.received.swap_tx_signature {
-                if stored != signature {
+                if stored != decoded(signature)? {
                     return Err(peer_misbehaved(
                         "the buyer's partial signature for the swap transaction differs from the \
                          one that he sent before",
@@ -688,6 +738,7 @@ impl TradeModel {
                 return Ok(());
             }
             trade.require_state(&[TradeState::Deposit])?;
+            let signature = decoded(signature)?;
             trade.swap_tx.input_sig_ctx.set_peers_partial_sig(signature);
             trade
                 .swap_tx
@@ -728,12 +779,21 @@ impl TradeModel {
     /// Closes the trade with the secret key share that the peer released.
     pub fn close_with_key_share(
         &mut self,
-        peers_key_share: Scalar,
+        peers_key_share: PeerData<Scalar>,
         penalty_tx_fee_rate: Option<FeeRate>,
     ) -> Result<()> {
         self.atomically(|trade| {
+            let closed_before = trade.state == TradeState::TradeClosed(ClosureType::Cooperative);
+            if !closed_before {
+                if trade.am_buyer() {
+                    trade.require_state(&[TradeState::BuyerReadyToRelease])?;
+                } else {
+                    trade.require_state(&[TradeState::SellerReadyToRelease])?;
+                }
+            }
+            let peers_key_share = decoded(peers_key_share)?;
             let peers_pub_key_share = *trade.keys.my_payout_ctx().peers_key_share()?.pub_key();
-            if trade.state == TradeState::TradeClosed(ClosureType::Cooperative) {
+            if closed_before {
                 // The request was processed before.
                 if peers_key_share.base_point_mul() != peers_pub_key_share {
                     return Err(peer_misbehaved(format!(
@@ -742,11 +802,6 @@ impl TradeModel {
                     )));
                 }
                 return Ok(());
-            }
-            if trade.am_buyer() {
-                trade.require_state(&[TradeState::BuyerReadyToRelease])?;
-            } else {
-                trade.require_state(&[TradeState::SellerReadyToRelease])?;
             }
             trade
                 .keys
@@ -842,13 +897,14 @@ impl TradeModel {
     pub fn finalize_custom_payout(
         &mut self,
         wallet: &mut dyn ProtocolWalletApi,
-        peers_custom_payout_psbt: Psbt,
+        peers_custom_payout_psbt: PeerData<Psbt>,
     ) -> Result<Transaction> {
         self.atomically(|trade| {
             trade.require_state(&[
                 TradeState::CustomPayoutSigned,
                 TradeState::TradeClosed(ClosureType::Custom),
             ])?;
+            let peers_custom_payout_psbt = decoded(peers_custom_payout_psbt)?;
             // A PSBT of the peer for another transaction is refused. It does not prove that the
             // peer misbehaved: the two callers can have used different amounts or fee rates.
             let expected = trade
@@ -2036,19 +2092,20 @@ mod tests {
         trader: &mut Trader,
         peers_key_shares: &ExchangedKeys<ByVal>,
     ) -> Result<()> {
+        let peers_key_shares = ExchangedKeys {
+            buyer_payout: peers_key_shares.buyer_payout,
+            seller_payout: peers_key_shares.seller_payout,
+            multisig_script: peers_key_shares.multisig_script,
+        };
         trader.model.receive_key_shares(
             &mut *trader.wallet,
             &EngineConfig::default(),
-            peers_key_shares,
+            Ok(peers_key_shares),
             params(),
         )
     }
 
-    type SentNonceShares = (
-        Psbt,
-        ExchangedAddresses<'static, ByVal, NetworkUnchecked>,
-        ExchangedNonces<'static, ByVal>,
-    );
+    type SentNonceShares = PeersNonceSharesMessage;
 
     fn sent_nonce_shares(trader: &Trader) -> SentNonceShares {
         let model = &trader.model;
@@ -2076,15 +2133,12 @@ mod tests {
 
     fn receive_nonce_shares(
         trader: &mut Trader,
-        (half_deposit_psbt, addresses, nonces): SentNonceShares,
+        peers_message: SentNonceShares,
         redirection_receivers: [(&str, u64); 3],
     ) -> Result<()> {
-        trader.model.receive_nonce_shares(
-            half_deposit_psbt,
-            addresses,
-            nonces,
-            receivers(redirection_receivers),
-        )
+        trader
+            .model
+            .receive_nonce_shares(Ok(peers_message), receivers(redirection_receivers))
     }
 
     fn sent_partial_signatures(trader: &Trader) -> ExchangedSigs<'static, ByVal> {
@@ -2106,13 +2160,22 @@ mod tests {
         }
     }
 
-    fn receive_partial_signatures(
-        trader: &mut Trader,
-        peers_partial_signatures: &ExchangedSigs<ByVal>,
-    ) -> Result<()> {
+    fn receive_partial_signatures(trader: &mut Trader, sigs: &ExchangedSigs<ByVal>) -> Result<()> {
+        let peers_partial_signatures = ExchangedSigs {
+            peers_warning_tx_buyer_input_partial_signature: sigs
+                .peers_warning_tx_buyer_input_partial_signature,
+            peers_warning_tx_seller_input_partial_signature: sigs
+                .peers_warning_tx_seller_input_partial_signature,
+            peers_redirect_tx_input_partial_signature: sigs
+                .peers_redirect_tx_input_partial_signature,
+            peers_claim_tx_input_partial_signature: sigs.peers_claim_tx_input_partial_signature,
+            swap_tx_input_partial_signature: sigs.swap_tx_input_partial_signature,
+            swap_tx_input_sighash: sigs.swap_tx_input_sighash,
+            contractual_txids: None,
+        };
         trader
             .model
-            .receive_partial_signatures(&mut *trader.wallet, peers_partial_signatures)
+            .receive_partial_signatures(&mut *trader.wallet, Ok(peers_partial_signatures))
     }
 
     /// The two traders after the exchange of the key shares.
@@ -2520,7 +2583,7 @@ mod tests {
                 .receive_key_shares(
                     &mut *peer.wallet,
                     &EngineConfig::default(),
-                    &sent_key_shares(&me),
+                    Ok(sent_key_shares(&me)),
                     peers_params,
                 )
                 .expect("valid key shares");
@@ -2564,7 +2627,7 @@ mod tests {
             let result = me.model.receive_key_shares(
                 &mut *me.wallet,
                 &EngineConfig::default(),
-                &sent_key_shares(&peer),
+                Ok(sent_key_shares(&peer)),
                 invalid_params,
             );
             assert_refused(&result, &me);
@@ -2585,7 +2648,7 @@ mod tests {
             let result = me.model.receive_key_shares(
                 &mut *me.wallet,
                 &EngineConfig::default(),
-                &sent_key_shares(&peer),
+                Ok(sent_key_shares(&peer)),
                 other_params,
             );
             assert_refused(&result, &me);
@@ -2632,6 +2695,58 @@ mod tests {
             other_signatures.peers_redirect_tx_input_partial_signature = random_partial_signature();
             let result = receive_partial_signatures(&mut me, &other_signatures);
             assert_terminated(&result, &me, "differ from the ones that it sent before");
+        }
+    }
+
+    /// G13 and D18: data of the peer that cannot be decoded terminates the trade only if the
+    /// request is allowed. The engine checks the preconditions of the request first.
+    #[test]
+    fn g13_undecodable_peer_data_is_checked_after_the_preconditions() {
+        fn undecodable<T>() -> PeerData<T> {
+            Err(UndecodablePeerData("invalid length".to_owned()))
+        }
+        for roles in ROLE_PAIRS {
+            // None of these requests is allowed before the key shares of the peer arrived.
+            let mut me = new_trader(roles.0);
+            let receivers = receivers(REDIRECTION_RECEIVERS);
+            let result = me.model.receive_nonce_shares(undecodable(), receivers);
+            assert_refused(&result, &me);
+            let result = me
+                .model
+                .receive_partial_signatures(&mut *me.wallet, undecodable());
+            assert_refused(&result, &me);
+            let result = me.model.receive_deposit_psbt(undecodable());
+            assert_refused(&result, &me);
+            let result = me.model.receive_swap_tx_signature(undecodable());
+            assert_refused(&result, &me);
+            let result = me.model.close_with_key_share(undecodable(), None);
+            assert_refused(&result, &me);
+            let result = me
+                .model
+                .finalize_custom_payout(&mut *me.wallet, undecodable());
+            assert_refused(&result, &me);
+            assert_eq!(me.model.state(), TradeState::Init);
+
+            // The key shares of the peer are allowed now.
+            let result = me.model.receive_key_shares(
+                &mut *me.wallet,
+                &EngineConfig::default(),
+                undecodable(),
+                params(),
+            );
+            assert_terminated(&result, &me, "cannot be decoded: invalid length");
+            assert!(
+                me.model.my_half_deposit_psbt().is_err(),
+                "nothing is stored"
+            );
+
+            // A repeated request with data that cannot be decoded differs from the first one.
+            let (mut me, _peer) = traders_after_deposit_signature(roles);
+            let result = me
+                .model
+                .receive_partial_signatures(&mut *me.wallet, undecodable());
+            assert_terminated(&result, &me, "cannot be decoded: invalid length");
+            assert_eq!(me.model.state(), TradeState::Deposit);
         }
     }
 
