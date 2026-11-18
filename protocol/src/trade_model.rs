@@ -9,19 +9,19 @@ use bdk_wallet::bitcoin::{
 use guardian::ArcMutexGuardian;
 use musig2::secp::{MaybeScalar, Point, Scalar};
 use musig2::{PartialSignature, PubNonce};
-use protocol::multisig::{KeyCtx, KeyPair, PointExt as _, SigCtx};
-use protocol::receiver::{Receiver, ReceiverList};
-use protocol::state::{ClosureType, TradeState};
-use protocol::transaction::{
-    ClaimTxBuilder, CustomPayoutTxBuilder, DepositTxBuilder, NetworkParams as _, PenaltyTxBuilder,
-    RedirectTxBuilder, SwapTxBuilder, TransactionExt as _, WarningTxBuilder,
-};
-use protocol::{mocks, script_paths};
 use thiserror::Error;
 use tracing::{info, instrument};
 use wallet::protocol_wallet_api::ProtocolWalletApi;
 
+use crate::multisig::{KeyCtx, KeyPair, PointExt as _, SigCtx};
+use crate::receiver::{Receiver, ReceiverList};
+use crate::state::{ClosureType, TradeState};
 use crate::storage::{ByRef, ByVal, Storage};
+use crate::transaction::{
+    ClaimTxBuilder, CustomPayoutTxBuilder, DepositTxBuilder, NetworkParams as _, PenaltyTxBuilder,
+    RedirectTxBuilder, SwapTxBuilder, TransactionExt as _, WarningTxBuilder,
+};
+use crate::{mocks, script_paths};
 
 pub trait TradeModelStore {
     /// Stores a new trade model. A trade ID identifies one trade for the whole lifetime of the
@@ -66,6 +66,7 @@ pub struct TradeModel {
     seller_txs: ArbitrationTxs,
 }
 
+#[expect(clippy::exhaustive_enums, reason = "the four trade roles are a closed set")]
 #[derive(Copy, Clone, Eq, PartialEq, Default, Debug)]
 pub enum Role {
     #[default] SellerAsMaker,
@@ -154,8 +155,6 @@ impl<'a> ExchangedAddresses<'a, ByVal, NetworkUnchecked> {
     }
 }
 
-#[expect(clippy::struct_field_names,
-reason = "removing common suffix probably wouldn't make things clearer")]
 pub struct ExchangedNonces<'a, S: Storage> {
     pub swap_tx_input: S::Store<'a, PubNonce>,
     pub buyers_warning_tx_buyer_input: S::Store<'a, PubNonce>,
@@ -952,8 +951,8 @@ pub enum ProtocolErrorKind {
         used_msat: u64,
     },
     AddressParse(#[from] bdk_wallet::bitcoin::address::ParseError),
-    Transaction(#[from] protocol::transaction::TransactionErrorKind),
-    Multisig(#[from] protocol::multisig::MultisigErrorKind),
+    Transaction(#[from] crate::transaction::TransactionErrorKind),
+    Multisig(#[from] crate::multisig::MultisigErrorKind),
     Wallet(#[from] wallet::error::WalletErrorKind),
 }
 
@@ -966,9 +965,9 @@ pub enum ProtocolErrorKind {
 #[cfg(test)]
 mod tests {
     use bdk_wallet::bitcoin::relative;
-    use protocol::multisig::MultisigErrorKind;
 
     use super::*;
+    use crate::multisig::MultisigErrorKind;
 
     //noinspection SpellCheckingInspection
     const REDIRECTION_RECEIVERS: [(&str, u64); 3] = [

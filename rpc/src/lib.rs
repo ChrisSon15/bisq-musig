@@ -8,7 +8,5 @@ pub mod pb {
 
 pub mod bmp_wallet_service;
 mod observable;
-mod protocol;
 pub mod server;
-mod storage;
 pub mod wallet;

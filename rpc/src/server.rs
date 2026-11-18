@@ -9,6 +9,9 @@ use bdk_wallet::serde_json;
 use drop_stream::DropStreamExt as _;
 use futures_util::stream::{self, BoxStream, Stream, TryStream, TryStreamExt as _};
 use protocol::state::{ClosureType, TradeState};
+use protocol::trade_model::{
+    ExchangedKeys, ProtocolErrorKind, TRADE_MODELS, TradeModel, TradeModelStore as _,
+};
 use serde::Serialize;
 use tokio::time::{self, Duration};
 use tonic::{Request, Response, Result, Status};
@@ -23,9 +26,6 @@ use crate::pb::musigrpc::{
     PubKeySharesRequest, PubKeySharesResponse, PublishDepositTxRequest,
     SubscribeTxConfirmationStatusRequest, SwapTxSignatureRequest, SwapTxSignatureResponse,
     TxConfirmationStatus, musig_server,
-};
-use crate::protocol::{
-    ExchangedKeys, ProtocolErrorKind, TRADE_MODELS, TradeModel, TradeModelStore as _,
 };
 
 #[derive(Debug, Default)]

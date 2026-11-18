@@ -1,4 +1,4 @@
-use futures_util::never::Never;
+use std::convert::Infallible;
 
 /// A simple utility trait to allow structs to be polymorphic over the storage type of their fields,
 /// to facilitate passing data to and from functions by reference or value, decided statically for
@@ -9,10 +9,10 @@ pub trait Storage {
 }
 
 /// Hold the struct fields by reference.
-pub struct ByRef(Never);
+pub struct ByRef(Infallible);
 
 /// Hold the struct fields by value.
-pub struct ByVal(Never);
+pub struct ByVal(Infallible);
 
 impl Storage for ByRef {
     // It isn't ideal to make the lifetime a type parameter here, instead of making it a parameter

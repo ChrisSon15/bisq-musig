@@ -7,13 +7,15 @@ use musig2::PubNonce;
 use musig2::secp::{MaybeScalar, Point, Scalar};
 use prost::UnknownEnumValue;
 use protocol::receiver::Receiver;
+use protocol::storage::{ByRef, ByVal};
+use protocol::trade_model::{
+    ContractualTxids, ExchangedAddresses, ExchangedNonces, ExchangedSigs, Role,
+};
 use tonic::{Result, Status};
 
 use crate::pb::musigrpc::{
     self, NonceSharesMessage, PartialSignaturesMessage, ReceiverAddressAndAmount,
 };
-use crate::protocol::{ContractualTxids, ExchangedAddresses, ExchangedNonces, ExchangedSigs, Role};
-use crate::storage::{ByRef, ByVal};
 
 /// Serializers that stand in for a secret's value.
 ///
