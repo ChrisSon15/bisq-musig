@@ -1,3 +1,5 @@
+pub mod client;
+
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;

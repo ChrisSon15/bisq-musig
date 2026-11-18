@@ -625,8 +625,11 @@ checksum = "4b4b0fc281743d80256607bd65e8beedc42cb0787ea119c85b81b4c0eab85e5f"
 name = "chain"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "bdk_bitcoind_rpc",
  "bdk_kyoto",
  "bdk_wallet",
+ "testenv",
  "thiserror",
  "tokio",
  "tracing",

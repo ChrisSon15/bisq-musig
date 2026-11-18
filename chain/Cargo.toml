@@ -10,5 +10,11 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+anyhow = { workspace = true }
+bdk_bitcoind_rpc = { workspace = true }
+testenv = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
 [lints]
 workspace = true
