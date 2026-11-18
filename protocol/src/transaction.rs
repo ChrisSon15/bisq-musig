@@ -1138,12 +1138,18 @@ mod tests {
             },
         );
         let payout_address = "bcrt1pf5vmdnfx03tlwx0j70cpct8zxpg9upf6p5sgsn624yg4a0lnxwxsegnwnx"
-            .parse::<Address<_>>()?.require_network(Network::Regtest)?;
+            .parse::<Address<_>>()?
+            .require_network(Network::Regtest)?;
         let fee_rate = FeeRate::from_sat_per_kwu(2_500);
 
         let mut signed_sighash = None;
         let claim_tx = build_claim_tx(
-            &escrow, &payout_address, lock_time, fee_rate, &script, &control_block,
+            &escrow,
+            &payout_address,
+            lock_time,
+            fee_rate,
+            &script,
+            &control_block,
             |sighash| {
                 signed_sighash = Some(sighash);
                 let message = Message::from_digest(sighash.to_byte_array());
@@ -1158,7 +1164,10 @@ mod tests {
         assert_eq!(claim_tx.input[0].previous_output, escrow.outpoint);
         assert_eq!(claim_tx.input[0].sequence, Sequence::from_height(720));
         assert_eq!(claim_tx.output.len(), 1);
-        assert_eq!(claim_tx.output[0].script_pubkey, payout_address.script_pubkey());
+        assert_eq!(
+            claim_tx.output[0].script_pubkey,
+            payout_address.script_pubkey()
+        );
         let fee = escrow.prevout.value - claim_tx.output[0].value;
         assert_eq!(Some(fee), fee_rate.checked_mul_by_weight(claim_tx.weight()));
 
@@ -1166,7 +1175,11 @@ mod tests {
         assert_eq!(witness.len(), 3);
         assert_eq!(witness[1], script.to_bytes());
         assert_eq!(witness[2], control_block.serialize());
-        assert!(control_block.verify_taproot_commitment(&secp, output_key.to_x_only_public_key(), &script));
+        assert!(control_block.verify_taproot_commitment(
+            &secp,
+            output_key.to_x_only_public_key(),
+            &script
+        ));
         // The signature is valid for the signature hash of the final transaction.
         let sighash = SighashCache::new(&claim_tx).taproot_script_spend_signature_hash(
             0,
@@ -1180,7 +1193,8 @@ mod tests {
             &signature.signature,
             &Message::from_digest(sighash.to_byte_array()),
             &claim_pub_key,
-        ).expect("valid signature of the claim key");
+        )
+        .expect("valid signature of the claim key");
         Ok(())
     }
 

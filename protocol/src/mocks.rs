@@ -253,9 +253,12 @@ impl<Cs: Iterator<Item = TxOutput>, As: Iterator<Item = Address>> ProtocolWallet
 
     fn store_trade_record(&mut self, trade_id: &str, record: &[u8]) -> wallet::error::Result<()> {
         if self.store_fails.load(Ordering::Relaxed) {
-            return Err(WalletErrorKind::Unsupported("the mock wallet was told to fail"));
+            return Err(WalletErrorKind::Unsupported(
+                "the mock wallet was told to fail",
+            ));
         }
-        self.trade_records.insert(trade_id.to_owned(), record.to_vec());
+        self.trade_records
+            .insert(trade_id.to_owned(), record.to_vec());
         Ok(())
     }
 

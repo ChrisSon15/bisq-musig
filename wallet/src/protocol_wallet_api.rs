@@ -135,8 +135,8 @@ pub trait ProtocolWalletApi {
     ///
     /// The wallet does not look into a record. The trade engine writes and reads it. A record
     /// can contain the secret key share of the peer, so the wallet stores it encrypted, like its
-    /// own keys, and the caller wipes its buffer. A record is never deleted: the IDs of all trades of a wallet stay known, so that
-    /// no trade ID is used twice.
+    /// own keys, and the caller wipes its buffer. A record is never deleted: the IDs of all trades
+    /// of a wallet stay known, so that no trade ID is used twice.
     ///
     /// The default implementation fits a wallet without storage and returns an error.
     fn store_trade_record(&mut self, trade_id: &str, record: &[u8]) -> Result<()> {

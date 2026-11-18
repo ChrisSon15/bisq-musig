@@ -86,7 +86,11 @@ fn h2_restart_in_every_state_of_a_cooperative_close() {
         restart_both(&mut buyer, &mut seller);
         observe_both(&mut buyer, &mut seller, &facts(3, &[]));
         assert_eq!(buyer.model.state(), closed(ClosureType::Cooperative));
-        let buyers_key_share = buyer.model.my_private_key_share_for_peer_output().unwrap().clone();
+        let buyers_key_share = buyer
+            .model
+            .my_private_key_share_for_peer_output()
+            .unwrap()
+            .clone();
         seller
             .model
             .close_with_key_share(&mut *seller.wallet, Ok(buyers_key_share), None)
