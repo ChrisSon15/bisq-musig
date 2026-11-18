@@ -899,9 +899,12 @@ async fn run_connections(shared: Arc<Shared>) {
         };
         // Only the given peers: the library would otherwise look for other peers through DNS
         // when the given peers fail.
+        // Blocks are loaded with their witness data: the trade engine reads a key share from the
+        // signature of a transaction, and it tells a claim from a penalty by the witness.
         let mut builder = Builder::new(shared.network)
             .add_peers(shared.peers.iter().cloned())
-            .whitelist_only();
+            .whitelist_only()
+            .fetch_witness_data();
         if let Some((height, hash)) = start {
             builder =
                 builder.chain_state(ChainState::Checkpoint(HashCheckpoint::new(height, hash)));

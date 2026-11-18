@@ -143,6 +143,10 @@ async fn finds_payments_spends_and_confirmations() -> anyhow::Result<()> {
     let spend_height = synced_to_tip(&client, &env).await;
     let spending_tx = client.spending_tx(&coin).expect("the spend is found");
     assert_eq!(spending_tx.tx.compute_txid(), spend_txid);
+    // The client loads blocks with their witness data. The trade engine reads signatures from
+    // the transactions that it finds.
+    assert_eq!(*spending_tx.tx, spend);
+    assert!(!spending_tx.tx.input[0].witness.is_empty());
     assert_eq!(spending_tx.height, spend_height);
     client.shutdown()?;
 
