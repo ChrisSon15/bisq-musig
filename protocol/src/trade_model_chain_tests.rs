@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use super::tests::{ROLE_PAIRS, Trader, config, traders_after_deposit_signature};
 use super::*;
+use crate::transaction::REPLACEMENT_FEE_RATE_STEP;
 
 /// The height of the block that contains the deposit transaction in these tests.
 const DEPOSIT_HEIGHT: u32 = 1_000;
@@ -722,21 +723,48 @@ fn d1_custom_payout_on_chain() {
     }
 }
 
-/// A1, A3 (N2): the trader who holds all signatures wants to send the deposit transaction until
-/// it is confirmed, and no longer when the deposit timeout has passed.
-#[test]
-fn a1_deposit_is_sent_until_it_is_confirmed_or_timed_out() {
-    let (mut buyer, mut seller) = trade(BUYER_SELLER_ROLES[0]);
-    // The taker holds the deposit transaction with all signatures.
+/// The facts when the deposit transaction is unconfirmed, `blocks_passed` blocks after the first
+/// observation of these tests.
+pub(super) fn unconfirmed(blocks_passed: u32) -> ChainFacts {
+    ChainFacts {
+        tip_height: DEPOSIT_HEIGHT + blocks_passed,
+        ..ChainFacts::default()
+    }
+}
+
+/// A buyer and a seller who have signed the deposit transaction. The buyer is the taker and
+/// holds the deposit transaction with all signatures.
+fn trade_with_signed_deposit() -> (Trader, Trader) {
+    let (mut buyer, seller) = trade(BUYER_SELLER_ROLES[0]);
     let sellers_deposit_psbt = seller.model.deposit_psbt().unwrap().clone();
     buyer
         .model
         .receive_deposit_psbt(&mut *buyer.wallet, Ok(sellers_deposit_psbt))
         .expect("signed by both");
-    let unconfirmed = |blocks_passed: u32| ChainFacts {
-        tip_height: DEPOSIT_HEIGHT + blocks_passed,
-        ..ChainFacts::default()
-    };
+    (buyer, seller)
+}
+
+fn fee(tx: &Transaction, inputs: &Psbt) -> Amount {
+    let paid: Amount = inputs
+        .unsigned_tx
+        .input
+        .iter()
+        .zip(&inputs.inputs)
+        .filter(|(tx_in, _)| {
+            tx.input
+                .iter()
+                .any(|spent| spent.previous_output == tx_in.previous_output)
+        })
+        .map(|(_, input)| input.witness_utxo.as_ref().unwrap().value)
+        .sum();
+    paid - tx.output.iter().map(|output| output.value).sum()
+}
+
+/// A1 (N2): the trader who holds all signatures wants to send the deposit transaction until it
+/// is confirmed, and until the deposit timeout has passed.
+#[test]
+fn a1_deposit_is_sent_until_it_is_confirmed_or_timed_out() {
+    let (mut buyer, mut seller) = trade_with_signed_deposit();
     observe_both(&mut buyer, &mut seller, &unconfirmed(0));
     assert_eq!(kinds(&buyer), vec![TxKind::Deposit]);
     assert_eq!(
@@ -749,11 +777,150 @@ fn a1_deposit_is_sent_until_it_is_confirmed_or_timed_out() {
     observe(&mut buyer, &unconfirmed(timeout));
     assert_eq!(kinds(&buyer), vec![TxKind::Deposit]);
     observe(&mut buyer, &unconfirmed(timeout + 1));
-    assert_eq!(kinds(&buyer), vec![], "the deposit timeout has passed");
+    assert_eq!(
+        kinds(&buyer),
+        vec![TxKind::DepositAbort],
+        "the deposit timeout has passed"
+    );
 
     observe(&mut buyer, &facts(1, &[]));
     assert_eq!(kinds(&buyer), vec![], "a confirmed deposit is not sent");
     assert_eq!(buyer.model.state(), TradeState::Deposit);
+}
+
+/// A3 (D13): when the deposit timeout has passed without a confirmation of the deposit
+/// transaction, each trader wants to send his deposit abort transaction. It spends the coins
+/// that he put into the deposit, pays to his own address, and pays more than the whole deposit
+/// transaction, so that it replaces the deposit transaction in a node that holds it.
+#[test]
+fn a3_deposit_abort_after_the_timeout() {
+    let (mut buyer, mut seller) = trade_with_signed_deposit();
+    let timeout = u32::from(config().deposit_timeout());
+    observe_both(&mut buyer, &mut seller, &unconfirmed(0));
+    observe_both(&mut buyer, &mut seller, &unconfirmed(timeout + 1));
+
+    let deposit_psbt = buyer.model.deposit_psbt().unwrap().clone();
+    let deposit_tx = buyer.model.signed_deposit_tx().unwrap();
+    let deposit_fee = fee(&deposit_tx, &deposit_psbt);
+    for trader in [&mut buyer, &mut seller] {
+        assert_eq!(kinds(trader), vec![TxKind::DepositAbort]);
+        let abort_tx = tx_to_send(trader, TxKind::DepositAbort);
+        let spent = abort_tx
+            .input
+            .iter()
+            .map(|input| input.previous_output)
+            .collect::<Vec<_>>();
+        assert_eq!(spent, trader.model.reserved_coins());
+        assert!(abort_tx.input.iter().all(|input| input.sequence.is_rbf()));
+        let own_address = trader.model.my_addresses().unwrap().claim_tx_payout;
+        assert_eq!(abort_tx.output.len(), 1);
+        assert_eq!(
+            abort_tx.output[0].script_pubkey,
+            own_address.script_pubkey()
+        );
+        let abort_fee = fee(&abort_tx, &deposit_psbt);
+        let step = REPLACEMENT_FEE_RATE_STEP
+            .checked_mul_by_weight(abort_tx.weight())
+            .unwrap();
+        assert!(
+            abort_fee >= deposit_fee + step,
+            "{abort_fee} replaces a deposit transaction with the fee {deposit_fee}"
+        );
+        assert!(abort_tx.weight() < deposit_tx.weight());
+        assert!(
+            !trader.model.reserved_coins().is_empty(),
+            "the coins stay reserved until one of the two transactions is confirmed"
+        );
+        assert_eq!(trader.model.state(), TradeState::Deposit);
+
+        // The next look at the chain names the same transaction.
+        observe(trader, &unconfirmed(timeout + 2));
+        assert_eq!(tx_to_send(trader, TxKind::DepositAbort), abort_tx);
+    }
+
+    // The abort of the seller confirms. Both trades are closed and the coins are free.
+    let sellers_abort_tx = tx_to_send(&seller, TxKind::DepositAbort);
+    let aborted = ChainFacts {
+        tip_height: DEPOSIT_HEIGHT + timeout + 3,
+        ..facts(0, &[(&sellers_abort_tx, 1)])
+    };
+    for trader in [&mut buyer, &mut seller] {
+        observe(trader, &aborted);
+        assert_eq!(trader.model.state(), closed(ClosureType::DepositAborted));
+        assert_eq!(trader.model.reserved_coins(), &[]);
+        assert_eq!(kinds(trader), vec![]);
+    }
+}
+
+/// A3, A5: the engine follows the transaction that confirms. A deposit transaction that
+/// confirms after the timeout continues the trade, and the abort is no longer sent. If a
+/// reorganisation removes the deposit transaction again, the timeout starts again.
+#[test]
+fn a5_deposit_confirms_after_the_timeout() {
+    let (mut buyer, mut seller) = trade_with_signed_deposit();
+    let timeout = u32::from(config().deposit_timeout());
+    observe_both(&mut buyer, &mut seller, &unconfirmed(0));
+    observe_both(&mut buyer, &mut seller, &unconfirmed(timeout + 1));
+    assert_eq!(kinds(&buyer), vec![TxKind::DepositAbort]);
+    assert_eq!(kinds(&seller), vec![TxKind::DepositAbort]);
+
+    let confirmed = ChainFacts {
+        tip_height: DEPOSIT_HEIGHT + timeout + 2,
+        deposit_confirmations: 1,
+        ..ChainFacts::default()
+    };
+    observe_both(&mut buyer, &mut seller, &confirmed);
+    for trader in [&buyer, &seller] {
+        assert_eq!(kinds(trader), vec![]);
+        assert_eq!(trader.model.state(), TradeState::Deposit);
+        assert!(!trader.model.reserved_coins().is_empty());
+    }
+
+    // A reorganisation removes the deposit transaction. The taker sends it again, and no
+    // trader aborts before the timeout has passed once more.
+    let removed_at = timeout + 3;
+    observe_both(&mut buyer, &mut seller, &unconfirmed(removed_at));
+    assert_eq!(kinds(&buyer), vec![TxKind::Deposit]);
+    assert_eq!(kinds(&seller), vec![]);
+    observe_both(&mut buyer, &mut seller, &unconfirmed(removed_at + timeout));
+    assert_eq!(kinds(&buyer), vec![TxKind::Deposit]);
+    observe_both(
+        &mut buyer,
+        &mut seller,
+        &unconfirmed(removed_at + timeout + 1),
+    );
+    assert_eq!(kinds(&buyer), vec![TxKind::DepositAbort]);
+    assert_eq!(kinds(&seller), vec![TxKind::DepositAbort]);
+}
+
+/// J1, D13: the engine does not abort the deposit on its own after the buyer has started the
+/// payment. If a reorganisation removes the deposit transaction then, the trader who holds it
+/// sends it again, also after the deposit timeout.
+#[test]
+fn j1_no_deposit_abort_after_the_payment_started() {
+    let (mut buyer, mut seller) = trade_with_signed_deposit();
+    observe_both(&mut buyer, &mut seller, &facts(3, &[]));
+    let signature = {
+        buyer.model.start_payment().expect("payment starts");
+        *buyer
+            .model
+            .my_partial_signatures_on_peer_txs()
+            .unwrap()
+            .swap_tx_input_partial_signature
+            .expect("message E")
+    };
+    seller
+        .model
+        .receive_swap_tx_signature(Ok(signature))
+        .expect("valid signature");
+
+    let timeout = u32::from(config().deposit_timeout());
+    observe_both(&mut buyer, &mut seller, &unconfirmed(10));
+    observe_both(&mut buyer, &mut seller, &unconfirmed(10 + timeout + 1));
+    assert_eq!(kinds(&buyer), vec![TxKind::Deposit]);
+    assert_eq!(kinds(&seller), vec![]);
+    assert_eq!(buyer.model.state(), TradeState::BuyerReadyToRelease);
+    assert_eq!(seller.model.state(), TradeState::BuyerReadyToRelease);
 }
 
 /// A3, A13, J2: a confirmed transaction that is not the deposit transaction spends an input of

@@ -25,14 +25,18 @@ use wallet::protocol_wallet_api::ProtocolWalletApi;
 
 use crate::chain_facts::{ChainFacts, Spend, TradeEvent, TxKind, TxToSend};
 use crate::multisig::{KeyCtx, KeyPair, PointExt as _, SigCtx};
-use crate::params::{EngineConfig, MIN_CONFIRMATIONS, REDIRECT_LOCK_TIME, TradeParams};
+use crate::params::{
+    EngineConfig, MIN_CONFIRMATIONS, REDIRECT_LOCK_TIME, TradeParams, engine_fee_rate,
+};
+use crate::psbt::extract_signed_tx;
 use crate::receiver::{Receiver, ReceiverList};
 use crate::script_paths;
 use crate::state::{ClosureType, TradeState};
 use crate::storage::{ByRef, ByVal, Storage};
 use crate::transaction::{
     CustomPayoutTxBuilder, DepositTxBuilder, PenaltyTxBuilder, RedirectTxBuilder, SwapTxBuilder,
-    TransactionExt as _, WarningTxBuilder, build_claim_tx,
+    TransactionErrorKind, TransactionExt as _, WarningTxBuilder, build_claim_tx,
+    build_deposit_abort_psbt,
 };
 
 /// Holds the trades of one trader.
@@ -132,9 +136,13 @@ pub struct TradeModel {
     observed_state: Option<TradeState>,
     /// The facts about the chain that the engine was told last.
     chain: ChainFacts,
-    /// The height of the chain tip at the first observation after the trader signed the deposit
-    /// transaction. The deposit timeout is counted from here.
+    /// The height of the chain tip at the first observation at which the deposit transaction was
+    /// unconfirmed: after the trader signed it, or after a reorganisation removed it. The deposit
+    /// timeout is counted from here. `None` while the deposit transaction is confirmed.
     deposit_watch_start: Option<u32>,
+    /// The signed deposit abort transaction, from the moment the deposit timeout has passed
+    /// (D13). It is not stored: after a restart the engine builds it again.
+    deposit_abort_tx: Option<Transaction>,
     /// Set, with the reason, when the peer sent data that an unmodified client never produces.
     /// A terminated trade accepts no further data. Its state changes only once more, and only
     /// if it was terminated during the setup: then the trade is abandoned.
@@ -439,6 +447,7 @@ impl TradeModel {
             observed_state: None,
             chain: ChainFacts::default(),
             deposit_watch_start: None,
+            deposit_abort_tx: None,
             terminated: None,
             reserved_coins: Vec::new(),
             deposit_signing_height: None,
@@ -1255,8 +1264,14 @@ impl TradeModel {
         if self.state == not_started || self.state == abandoned {
             return events;
         }
-        self.deposit_watch_start
-            .get_or_insert(self.chain.tip_height);
+        if self.chain.deposit_confirmations > 0 {
+            // The timeout starts again if a reorganisation removes the deposit transaction.
+            self.deposit_watch_start = None;
+            self.deposit_abort_tx = None;
+        } else {
+            self.deposit_watch_start
+                .get_or_insert(self.chain.tip_height);
+        }
 
         let situation = match self.situation() {
             Ok(situation) => situation,
@@ -1269,6 +1284,7 @@ impl TradeModel {
         };
         self.read_key_share_from_spend(wallet, &situation, &mut events);
         self.close_by_force_before_the_warning_is_valid(&situation);
+        self.abort_deposit_after_the_timeout(wallet, &situation);
 
         let observed = self.state_from(&situation);
         self.observed_state = (observed != self.state).then_some(observed);
@@ -1380,13 +1396,20 @@ impl TradeModel {
             return Vec::new();
         };
         if self.chain.deposit_confirmations == 0 {
-            // Only the trader who holds all signatures can send the deposit transaction.
-            let waiting = situation == Situation::PayoutsUnspent && !self.deposit_timed_out();
-            return if waiting {
-                to_send(TxKind::Deposit, self.signed_deposit_tx())
-            } else {
-                Vec::new()
-            };
+            if situation != Situation::PayoutsUnspent {
+                return Vec::new();
+            }
+            if self.deposit_abort_is_due(&situation) {
+                let abort_tx = self.deposit_abort_tx.clone();
+                return to_send(
+                    TxKind::DepositAbort,
+                    abort_tx.ok_or(ProtocolErrorKind::MissingDepositAbortTx),
+                );
+            }
+            // Only the trader who holds all signatures can send the deposit transaction. In a
+            // state after `Deposit` the deposit transaction was confirmed before and a
+            // reorganisation removed it: the trader then sends it again without a time limit.
+            return to_send(TxKind::Deposit, self.signed_deposit_tx());
         }
         let seller_closed_by_force =
             !self.am_buyer() && self.state == TradeState::TradeClosed(ClosureType::Forced);
@@ -1454,6 +1477,80 @@ impl TradeModel {
             .into();
         self.chain.deposit_confirmations == 0
             && self.chain.tip_height.saturating_sub(start) > timeout
+    }
+
+    /// Whether the trader should have his deposit abort transaction on the network (D13): the
+    /// deposit timeout has passed, the deposit transaction is unconfirmed, and no other
+    /// transaction has spent one of its inputs.
+    ///
+    /// The engine aborts on its own only in the state `Deposit`. In a later state the deposit
+    /// transaction was confirmed before, the buyer can have started the payment, and a
+    /// reorganisation removed the deposit transaction. It is then still valid and can confirm
+    /// again.
+    fn deposit_abort_is_due(&self, situation: &Situation) -> bool {
+        self.state == TradeState::Deposit
+            && *situation == Situation::PayoutsUnspent
+            && self.deposit_timed_out()
+    }
+
+    /// Builds and signs the deposit abort transaction when it is due, and records it in the
+    /// wallet as unconfirmed. From then on [`Self::transactions_to_send`] names it in place of
+    /// the deposit transaction, until one of the two is confirmed.
+    fn abort_deposit_after_the_timeout(
+        &mut self,
+        wallet: &mut dyn ProtocolWalletApi,
+        situation: &Situation,
+    ) {
+        if self.deposit_abort_tx.is_some() || !self.deposit_abort_is_due(situation) {
+            return;
+        }
+        match self.sign_deposit_abort_tx(wallet) {
+            Ok(abort_tx) => {
+                info!(
+                    trade_id = self.trade_id,
+                    txid = %abort_tx.compute_txid(),
+                    "The deposit transaction was not confirmed within the deposit timeout. \
+                     Aborting the deposit."
+                );
+                self.deposit_abort_tx = Some(abort_tx);
+            }
+            Err(error) => {
+                error!(trade_id = self.trade_id, %error, "Could not build the deposit abort transaction.");
+            }
+        }
+    }
+
+    /// The deposit abort transaction pays the coins of the trader's half of the deposit to his
+    /// payout address. No other transaction of the trade can pay to this address when the
+    /// deposit is aborted, so the address is used once.
+    fn sign_deposit_abort_tx(&self, wallet: &mut dyn ProtocolWalletApi) -> Result<Transaction> {
+        let mut psbt = build_deposit_abort_psbt(
+            self.my_half_deposit_psbt()?,
+            self.my_txs().payout_address()?,
+            engine_fee_rate(),
+            self.deposit_fee()?,
+        )?;
+        wallet.sign_selected_inputs(&mut psbt, &|_| true)?;
+        let abort_tx = extract_signed_tx(&psbt)?;
+        wallet.record_transaction(&abort_tx)?;
+        Ok(abort_tx)
+    }
+
+    /// The fee of the whole deposit transaction.
+    fn deposit_fee(&self) -> Result<Amount> {
+        let psbt = self.deposit_tx.builder.psbt()?;
+        let mut fee = Some(Amount::ZERO);
+        for input in &psbt.inputs {
+            let coin = input
+                .witness_utxo
+                .as_ref()
+                .ok_or(TransactionErrorKind::InvalidPsbt)?;
+            fee = fee.and_then(|fee| fee.checked_add(coin.value));
+        }
+        for output in &psbt.unsigned_tx.output {
+            fee = fee.and_then(|fee| fee.checked_sub(output.value));
+        }
+        Ok(fee.ok_or(TransactionErrorKind::Overflow)?)
     }
 
     /// Sorts the confirmed spends of the outputs of the trade.
@@ -2797,6 +2894,8 @@ pub enum ProtocolErrorKind {
     },
     #[error("the custom payout PSBT of the peer does not contain its signatures")]
     MissingPeerSignature,
+    #[error("the deposit abort transaction is not built yet")]
+    MissingDepositAbortTx,
     #[error("unsupported closure type: {0:?}")]
     UnsupportedClosureType(ClosureType),
     #[error("illegal state transition for {role:?}: {old_state} -> {new_state}")]
@@ -2819,7 +2918,7 @@ pub enum ProtocolErrorKind {
     },
     TradeParams(#[from] crate::params::TradeParamsError),
     AddressParse(#[from] bdk_wallet::bitcoin::address::ParseError),
-    Transaction(#[from] crate::transaction::TransactionErrorKind),
+    Transaction(#[from] TransactionErrorKind),
     Multisig(#[from] crate::multisig::MultisigErrorKind),
     Wallet(#[from] wallet::error::WalletErrorKind),
 }

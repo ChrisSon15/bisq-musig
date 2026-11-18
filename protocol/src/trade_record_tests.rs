@@ -6,9 +6,9 @@ use bdk_wallet::bitcoin::hex::DisplayHex as _;
 
 use super::chain_tests::{
     BUYER_SELLER_ROLES, FEE_RATE, WARNING_LOCK_TIME, close_cooperatively, closed, facts, kinds,
-    observe, observe_both, start_payment_and_release, trade, tx_to_send,
+    observe, observe_both, start_payment_and_release, trade, tx_to_send, unconfirmed,
 };
-use super::tests::{Trader, new_trader_for_trade};
+use super::tests::{Trader, config, new_trader_for_trade};
 use super::*;
 use crate::mocks::{mock_buyer_trade_wallet, mock_seller_trade_wallet};
 
@@ -174,6 +174,29 @@ fn h2_h5_restart_in_the_states_of_the_other_outcomes() {
             .sign_custom_payout(&mut *buyer.wallet, Amount::from_sat(100_001), FEE_RATE),
         Err(ProtocolErrorKind::ConflictingRequest(_))
     ));
+}
+
+/// H5, A3: the deposit timeout is counted from a stored height, so it continues after a restart.
+/// The deposit abort transaction is not stored. The engine builds it again, and it is the same
+/// transaction.
+#[test]
+fn h5_deposit_timeout_continues_after_a_restart() {
+    let (mut buyer, mut seller) = trade(BUYER_SELLER_ROLES[0]);
+    let timeout = u32::from(config().deposit_timeout());
+    observe_both(&mut buyer, &mut seller, &unconfirmed(0));
+    restart_both(&mut buyer, &mut seller);
+    assert_eq!(kinds(&seller), vec![], "the chain is not known yet");
+    observe_both(&mut buyer, &mut seller, &unconfirmed(timeout));
+    assert_eq!(kinds(&seller), vec![]);
+    observe_both(&mut buyer, &mut seller, &unconfirmed(timeout + 1));
+    for trader in [&mut buyer, &mut seller] {
+        let abort_tx = tx_to_send(trader, TxKind::DepositAbort);
+        *trader = restart(trader);
+        assert_eq!(kinds(trader), vec![], "the chain is not known yet");
+        observe(trader, &unconfirmed(timeout + 2));
+        let rebuilt = tx_to_send(trader, TxKind::DepositAbort);
+        assert_eq!(rebuilt.compute_txid(), abort_tx.compute_txid());
+    }
 }
 
 /// H1, H8: a trade whose deposit transaction the trader has not signed is stored with its ID

@@ -598,6 +598,90 @@ pub fn build_claim_tx(
 
 type Descriptor = bdk_wallet::miniscript::Descriptor<DefiniteDescriptorKey>;
 
+/// The fee rate by which a replacement must pay more than the transactions that it replaces, for
+/// its own weight: 1 sat per vbyte, the default incremental relay fee of Bitcoin Core up to 29.
+pub const REPLACEMENT_FEE_RATE_STEP: FeeRate = FeeRate::from_sat_per_kwu(250);
+
+/// Builds the deposit abort transaction of a trader, as a PSBT without signatures. It spends the
+/// coins that the trader put into the deposit transaction, the inputs of `half_deposit_psbt`, and
+/// pays the rest after the fee to `payout_address`.
+///
+/// The trader cannot see whether a node holds the deposit transaction as unconfirmed. The abort
+/// must then replace it there, so it pays more than the fee `deposit_fee` of the whole deposit
+/// transaction, by [`REPLACEMENT_FEE_RATE_STEP`] for its own weight. It pays at least `fee_rate`.
+/// The abort is smaller than the deposit, so its fee rate is the higher one as well.
+pub fn build_deposit_abort_psbt(
+    half_deposit_psbt: &Psbt,
+    payout_address: &Address,
+    fee_rate: FeeRate,
+    deposit_fee: Amount,
+) -> Result<Psbt> {
+    // The weight that the witness of an input adds to an input without a witness.
+    const INPUT_NON_WITNESS_WEIGHT: Weight = Weight::from_wu(164);
+    // The marker and the flag of a transaction with witness data.
+    const SEGWIT_MARKER_WEIGHT: Weight = Weight::from_wu(2);
+
+    let coins = half_deposit_psbt
+        .unsigned_tx
+        .input
+        .iter()
+        .zip(&half_deposit_psbt.inputs);
+    let mut tx = Transaction {
+        version: Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: Vec::new(),
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: payout_address.script_pubkey(),
+        }],
+    };
+    let mut inputs = Vec::new();
+    let mut input_amount = Amount::ZERO;
+    let mut witness_weight = SEGWIT_MARKER_WEIGHT;
+    for (tx_in, input) in coins {
+        let prevout = input
+            .witness_utxo
+            .clone()
+            .ok_or(TransactionErrorKind::InvalidPsbt)?;
+        let coin = TxOutput::new(tx_in.previous_output, prevout);
+        witness_weight += coin
+            .estimated_input_weight()
+            .ok_or(TransactionErrorKind::InvalidPsbt)?
+            - INPUT_NON_WITNESS_WEIGHT;
+        input_amount = input_amount
+            .checked_add(coin.prevout.value)
+            .ok_or(TransactionErrorKind::Overflow)?;
+        tx.input.push(TxIn {
+            previous_output: tx_in.previous_output,
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            ..TxIn::default()
+        });
+        inputs.push(bdk_wallet::bitcoin::psbt::Input {
+            witness_utxo: Some(coin.prevout),
+            non_witness_utxo: input.non_witness_utxo.clone(),
+            ..Default::default()
+        });
+    }
+    if tx.input.is_empty() {
+        return Err(TransactionErrorKind::InvalidPsbt);
+    }
+    let weight = tx.weight() + witness_weight;
+    let fee = (|| {
+        let own_fee = fee_rate.checked_mul_by_weight(weight)?;
+        let replacement_fee =
+            deposit_fee.checked_add(REPLACEMENT_FEE_RATE_STEP.checked_mul_by_weight(weight)?)?;
+        Some(own_fee.max(replacement_fee))
+    })()
+    .ok_or(TransactionErrorKind::Overflow)?;
+    tx.output[0].value = input_amount
+        .checked_sub(fee)
+        .ok_or(TransactionErrorKind::Overflow)?;
+    tx.check_no_dust_outputs()?;
+    let mut psbt = Psbt::from_unsigned_tx(tx).expect("tx is unsigned by construction");
+    psbt.inputs = inputs;
+    Ok(psbt)
+}
+
 #[derive(Clone, Default)]
 pub struct CustomPayoutTxBuilder {
     // Supplied fields:

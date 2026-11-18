@@ -1968,20 +1968,29 @@ async fn j5_deposit_is_sent_when_a_peer_is_reachable_again() {
     assert_eq!(event.num_confirmations, 1);
 }
 
-/// J9 for the service: a deposit transaction that no node accepts is sent again after every
-/// block, as the schedule of N2 says, also when no peer asks for it. Nothing is reported as
-/// confirmed, the trade stays in its state, and the sending ends after the deposit timeout.
+/// J9 and A3 for the service: a deposit transaction that no node accepts is sent again after
+/// every block, as the schedule of N2 says, also when no peer asks for it. Nothing is reported as
+/// confirmed, and the trade stays in its state. After the deposit timeout the services of both
+/// traders send their deposit abort transactions in place of the deposit transaction (D13). When
+/// a block contains one of them, both trades are closed as `DepositAborted`.
 #[tokio::test]
-async fn j9_deposit_that_never_confirms_is_sent_on_schedule_and_never_reported() {
+async fn j9_a3_deposit_that_never_confirms_is_sent_on_schedule_and_then_aborted() {
     let mut trade = trade_with_signed_deposit().await;
-    let taker_side = trade.taker_side();
+    let (maker_side, taker_side) = (trade.maker_side(), trade.taker_side());
     let takers_chain = Arc::clone(&trade.party(taker_side).chain);
+    let makers_chain = Arc::clone(&trade.party(maker_side).chain);
     let mut events = trade.publish_deposit_tx().await;
+    let mut takers_trade_events = trade
+        .party_mut(taker_side)
+        .subscribe_trade_events()
+        .await
+        .unwrap();
     assert!(sent_count_reaches(&takers_chain, 1).await);
+    let deposit_txid = trade.deposit_tx().compute_txid();
 
     // The peer does not ask for a transaction that it has rejected since the last block.
     takers_chain.ignore_broadcasts(true);
-    takers_chain.mine(&[]);
+    trade.mine(&[]);
     for _ in 0..100 {
         if takers_chain.ignored_broadcasts() >= 1 {
             break;
@@ -1994,7 +2003,7 @@ async fn j9_deposit_that_never_confirms_is_sent_on_schedule_and_never_reported()
     // One sending per block, up to the deposit timeout of the configuration.
     let deposit_timeout = usize::from(EngineConfig::default().deposit_timeout());
     for block in 2..=deposit_timeout {
-        takers_chain.mine(&[]);
+        trade.mine(&[]);
         assert!(
             sent_count_reaches(&takers_chain, block).await,
             "sent again after block {block}"
@@ -2003,12 +2012,13 @@ async fn j9_deposit_that_never_confirms_is_sent_on_schedule_and_never_reported()
     // One sending at the start and one after every block of the timeout, less the one for
     // which no peer asked.
     assert_eq!(takers_chain.sent().len(), deposit_timeout);
-    // After the timeout the sending ends.
-    takers_chain.mine(&[]);
-    takers_chain.mine(&[]);
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert_eq!(takers_chain.sent().len(), deposit_timeout);
-
+    assert!(
+        takers_chain
+            .sent()
+            .iter()
+            .all(|tx| tx.compute_txid() == deposit_txid)
+    );
+    assert_eq!(makers_chain.sent(), vec![], "the maker has nothing to send");
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(300), events.next())
             .await
@@ -2016,6 +2026,61 @@ async fn j9_deposit_that_never_confirms_is_sent_on_schedule_and_never_reported()
         "no confirmation event for a transaction that is in no block"
     );
     trade.assert_states(TradeState::Deposit, TradeState::Deposit);
+
+    // After the timeout each service sends the abort of its trader, once per block.
+    trade.mine(&[]);
+    let takers_abort_tx = sent_tx(&takers_chain, deposit_timeout + 1).await;
+    let makers_abort_tx = sent_tx(&makers_chain, 1).await;
+    for (side, abort_tx) in [
+        (taker_side, &takers_abort_tx),
+        (maker_side, &makers_abort_tx),
+    ] {
+        let party = trade.party(side);
+        let stored = party.trades.get_trade_model(&party.trade_id).unwrap();
+        let reserved = stored.lock().unwrap().reserved_coins().to_vec();
+        let spent = abort_tx
+            .input
+            .iter()
+            .map(|input| input.previous_output)
+            .collect::<Vec<_>>();
+        assert_eq!(spent, reserved, "the abort spends the coins of its trader");
+    }
+    let event = loop {
+        let event = trade_event_of_type(&mut takers_trade_events, TradeEventType::TxSent).await;
+        if event.tx_kind() != TradeTxKind::DepositTx {
+            break event;
+        }
+    };
+    assert_eq!(event.tx_kind(), TradeTxKind::DepositAbortTx);
+    assert_eq!(
+        event.tx_id,
+        Some(takers_abort_tx.compute_txid().to_string())
+    );
+    assert_eq!(event.state(), TradeStateKind::Deposit);
+    trade.mine(&[]);
+    assert_eq!(
+        sent_tx(&takers_chain, deposit_timeout + 2).await,
+        takers_abort_tx,
+        "the same abort is sent again after the next block"
+    );
+    trade.assert_states(TradeState::Deposit, TradeState::Deposit);
+
+    // The abort of the maker gets into a block. Both trades end.
+    trade.mine(std::slice::from_ref(&makers_abort_tx));
+    let event = trade_event_of_type(&mut takers_trade_events, TradeEventType::State).await;
+    assert_eq!(event.state(), TradeStateKind::TradeClosed);
+    assert_eq!(event.closure_type(), ClosureKind::DepositAborted);
+    let aborted = TradeState::TradeClosed(ClosureType::DepositAborted);
+    trade.assert_states(aborted, aborted);
+    for side in SIDES {
+        let party = trade.party(side);
+        let stored = party.trades.get_trade_model(&party.trade_id).unwrap();
+        assert_eq!(stored.lock().unwrap().reserved_coins(), &[]);
+    }
+    let sent = takers_chain.sent().len();
+    trade.mine(&[]);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(takers_chain.sent().len(), sent, "nothing more is sent");
 }
 
 /// Reads the next event of a trade, with a limit for the waiting time.

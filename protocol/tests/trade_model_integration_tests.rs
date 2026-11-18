@@ -1579,3 +1579,131 @@ fn outcome_deposit_aborted_by_a_conflicting_spend() -> anyhow::Result<()> {
     send_to_node(&env, &buyers_payment).map_err(anyhow::Error::msg)?;
     Ok(())
 }
+
+/// A buyer (taker) and a seller (maker) who have both signed the deposit transaction and watch
+/// its outputs. Nobody has published it.
+fn traders_with_signed_deposit(env: &mut TestEnv) -> (Trader, Trader) {
+    let mut buyer = Trader::new(env, Role::BuyerAsTaker);
+    let mut seller = Trader::new(env, Role::SellerAsMaker);
+    seller.receive_key_shares(&buyer);
+    buyer.receive_key_shares(&seller);
+    let redirection_amount_msat = buyer
+        .model
+        .redirection_amount_msat()
+        .expect("the parameters are set");
+    let receivers = Receiver::compute_receivers_from_shares(
+        vec![(env.new_address().expect("address"), 1.0)],
+        redirection_amount_msat,
+        FEE_RATE,
+    )
+    .expect("the redirection amount is large enough for one receiver");
+    let receiver = Receiver {
+        address: receivers[0].address.as_unchecked().clone(),
+        amount: receivers[0].amount,
+    };
+    buyer.receive_nonce_shares(&seller, std::slice::from_ref(&receiver));
+    seller.receive_nonce_shares(&buyer, std::slice::from_ref(&receiver));
+    let buyers_partial_signatures = buyer.sent_partial_signatures();
+    let sellers_partial_signatures = seller.sent_partial_signatures();
+    seller.receive_partial_signatures(buyers_partial_signatures);
+    buyer.receive_partial_signatures(sellers_partial_signatures);
+    buyer.watch_trade();
+    seller.watch_trade();
+    (buyer, seller)
+}
+
+/// The number of blocks after which the engines of these tests abort an unconfirmed deposit.
+const DEPOSIT_TIMEOUT: usize = 6;
+
+/// The wallet holds its funding again, apart from the fee of one transaction, and can pay.
+fn assert_coins_are_back(trader: &mut Trader, env: &TestEnv) -> anyhow::Result<()> {
+    trader.assert_coins_reserved(false);
+    trader.chain.sync(env, &mut trader.wallet);
+    let balance = trader.wallet.balance();
+    assert!(
+        balance < FUNDING && balance > FUNDING - Amount::from_sat(20_000),
+        "{balance}"
+    );
+    let payment =
+        trader
+            .wallet
+            .send_to_address(&env.new_address()?, Amount::from_sat(100_000), FEE_RATE)?;
+    send_to_node(env, &payment).map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
+/// A3 (D13): both traders signed the deposit transaction, and the taker never publishes it. When
+/// the deposit timeout has passed, the maker's engine publishes the deposit abort transaction.
+/// It confirms, both trades are closed as `DepositAborted`, and the maker's coins are in his
+/// wallet again. The node rejects the deposit transaction from then on.
+#[test]
+fn outcome_deposit_abort_of_a_deposit_that_was_never_published() -> anyhow::Result<()> {
+    let mut env = TestEnv::new()?;
+    let (mut buyer, mut seller) = traders_with_signed_deposit(&mut env);
+    assert_eq!(seller.react(&env), vec![]);
+    env.mine_blocks(DEPOSIT_TIMEOUT)?;
+    assert_eq!(seller.react(&env), vec![], "the timeout has not passed");
+    seller.assert_coins_reserved(true);
+
+    env.mine_block()?;
+    assert_eq!(seller.react(&env), vec![TxKind::DepositAbort]);
+    assert_eq!(seller.model.state(), TradeState::Deposit);
+    seller.assert_coins_reserved(true);
+    env.mine_block()?;
+
+    let aborted = closed(ClosureType::DepositAborted);
+    for trader in [&mut buyer, &mut seller] {
+        trader.observe(&env);
+        assert_eq!(trader.model.state(), aborted);
+        assert_eq!(trader.model.transactions_to_send(FEE_RATE), vec![]);
+        trader.assert_coins_reserved(false);
+    }
+    assert_coins_are_back(&mut seller, &env)?;
+
+    // The taker publishes the deposit transaction too late.
+    let sellers_deposit_psbt = seller.model.deposit_psbt()?.clone();
+    let deposit_tx = buyer
+        .model
+        .receive_deposit_psbt(&mut buyer.wallet, Ok(sellers_deposit_psbt))?;
+    let rejected = send_to_node(&env, &deposit_tx).expect_err("an input is spent");
+    assert!(rejected.contains("inputs-missingorspent"), "{rejected}");
+    Ok(())
+}
+
+/// A3, A5 (D13): the deposit transaction reaches the node only after the deposit timeout, and
+/// stays unconfirmed. The deposit abort transaction of the maker replaces it in the node. The
+/// taker, whose wallet has recorded the deposit transaction as the spend of his coins, aborts as
+/// well. Both aborts confirm, and both wallets hold their coins again.
+#[test]
+fn outcome_deposit_abort_replaces_an_unconfirmed_deposit() -> anyhow::Result<()> {
+    let mut env = TestEnv::new()?;
+    let (mut buyer, mut seller) = traders_with_signed_deposit(&mut env);
+    for trader in [&mut buyer, &mut seller] {
+        assert_eq!(trader.react(&env), vec![]);
+    }
+    env.mine_blocks(DEPOSIT_TIMEOUT + 1)?;
+
+    let sellers_deposit_psbt = seller.model.deposit_psbt()?.clone();
+    let deposit_tx = buyer
+        .model
+        .receive_deposit_psbt(&mut buyer.wallet, Ok(sellers_deposit_psbt))?;
+    let deposit_txid = send_to_node(&env, &deposit_tx).map_err(anyhow::Error::msg)?;
+    assert!(env.mempool_contains(&deposit_txid)?);
+
+    // `react` waits until the node holds the transaction that the engine names.
+    assert_eq!(seller.react(&env), vec![TxKind::DepositAbort]);
+    assert!(
+        !env.mempool_contains(&deposit_txid)?,
+        "the abort replaced the deposit transaction"
+    );
+    assert_eq!(buyer.react(&env), vec![TxKind::DepositAbort]);
+    env.mine_block()?;
+
+    let aborted = closed(ClosureType::DepositAborted);
+    for trader in [&mut buyer, &mut seller] {
+        trader.observe(&env);
+        assert_eq!(trader.model.state(), aborted);
+        assert_coins_are_back(trader, &env)?;
+    }
+    Ok(())
+}

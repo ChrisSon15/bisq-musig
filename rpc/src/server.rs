@@ -817,15 +817,16 @@ fn chain_facts(chain: &dyn ChainAccess, trade_model: &TradeModel) -> Option<Chai
 }
 
 /// Tells the engine the current facts about the chain for one trade, and publishes the events
-/// that follow.
+/// that follow. Returns `false` if the facts are not known at the moment, so that the engine was
+/// told nothing.
 fn observe_chain(
     chain: &dyn ChainAccess,
     trade_model: &mut TradeModel,
     wallet: &mut dyn ProtocolWalletApi,
     events: &broadcast::Sender<TradeEvent>,
-) {
+) -> bool {
     let Some(facts) = chain_facts(chain, trade_model) else {
-        return;
+        return false;
     };
     for event in trade_model.observe_chain(wallet, facts) {
         let (event_type, message) = match event {
@@ -848,6 +849,7 @@ fn observe_chain(
             ..trade_event(trade_model, Some(chain), event_type)
         });
     }
+    true
 }
 
 /// An event of a trade with the current state of the trade.
@@ -947,7 +949,12 @@ async fn watch_trades(
                     }
                     ensure_watched(&*chain, &watched, &trade_model, wallet);
                     let stored = trade_model.to_record().ok();
-                    observe_chain(&*chain, &mut trade_model, wallet, &events);
+                    // Without the current facts nothing is sent: a transaction that the engine
+                    // does not know can be in a block that is not evaluated yet, for example
+                    // after a restart.
+                    if !observe_chain(&*chain, &mut trade_model, wallet, &events) {
+                        continue;
+                    }
                     // What the engine decided at this look at the chain is on disk before a
                     // transaction that follows from it leaves the service.
                     if trade_model.to_record().ok() != stored {
