@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use bdk_wallet::bitcoin::address::{NetworkChecked, NetworkUnchecked, NetworkValidation};
@@ -64,6 +64,10 @@ pub struct TradeModel {
     custom_payout_tx: CustomPayoutTx,
     buyer_txs: ArbitrationTxs,
     seller_txs: ArbitrationTxs,
+    /// Set when a request failed a validation. A failed validation terminates the trade: a blocked
+    /// trade accepts no corrected data and never changes its state again. Today only the check
+    /// of the peer's nonce shares sets this mark.
+    blocked: bool,
 }
 
 #[expect(clippy::exhaustive_enums, reason = "the four trade roles are a closed set")]
@@ -232,8 +236,16 @@ impl TradeModel {
             .ok_or(ProtocolErrorKind::MissingTradeWallet)?).unwrap())
     }
 
+    const fn check_not_blocked(&self) -> Result<()> {
+        if self.blocked {
+            return Err(ProtocolErrorKind::TradeBlocked);
+        }
+        Ok(())
+    }
+
     #[instrument(skip_all)]
     fn update_state(&mut self, new_state: TradeState) -> Result<bool> {
+        self.check_not_blocked()?;
         if self.state >= new_state {
             return Ok(false);
         }
@@ -555,17 +567,45 @@ impl TradeModel {
         ]
     }
 
-    pub fn set_peer_nonce_shares(&mut self, nonce_shares: ExchangedNonces<ByVal>) {
+    /// Stores the nonce shares of the peer.
+    ///
+    /// A nonce share belongs to exactly one signature. If a nonce share of the peer is equal to
+    /// another nonce share of the peer or to one of our own nonce shares of this trade, none of
+    /// them is stored and the trade is blocked.
+    pub fn set_peer_nonce_shares(&mut self, nonce_shares: ExchangedNonces<ByVal>) -> Result<()> {
+        self.check_not_blocked()?;
+        // The order is the order of `all_sig_ctxs_mut`.
+        let peers_nonce_shares = [
+            nonce_shares.swap_tx_input,
+            nonce_shares.buyers_warning_tx_buyer_input,
+            nonce_shares.buyers_warning_tx_seller_input,
+            nonce_shares.sellers_warning_tx_buyer_input,
+            nonce_shares.sellers_warning_tx_seller_input,
+            nonce_shares.buyers_redirect_tx_input,
+            nonce_shares.sellers_redirect_tx_input,
+            nonce_shares.buyers_claim_tx_input,
+            nonce_shares.sellers_claim_tx_input,
+        ];
+        if !self.are_unused_nonce_shares(&peers_nonce_shares)? {
+            self.blocked = true;
+            return Err(ProtocolErrorKind::RepeatedNonceShare);
+        }
+        for (sig_ctx, nonce_share) in self.all_sig_ctxs_mut().into_iter().zip(peers_nonce_shares) {
+            sig_ctx.set_peers_nonce_share(nonce_share);
+        }
+        Ok(())
+    }
+
+    /// Returns whether the nonce shares differ from each other and from our own nonce shares.
+    fn are_unused_nonce_shares(&mut self, nonce_shares: &[PubNonce]) -> Result<bool> {
         let sig_ctxs = self.all_sig_ctxs_mut();
-        sig_ctxs[0].set_peers_nonce_share(nonce_shares.swap_tx_input);
-        sig_ctxs[1].set_peers_nonce_share(nonce_shares.buyers_warning_tx_buyer_input);
-        sig_ctxs[2].set_peers_nonce_share(nonce_shares.buyers_warning_tx_seller_input);
-        sig_ctxs[3].set_peers_nonce_share(nonce_shares.sellers_warning_tx_buyer_input);
-        sig_ctxs[4].set_peers_nonce_share(nonce_shares.sellers_warning_tx_seller_input);
-        sig_ctxs[5].set_peers_nonce_share(nonce_shares.buyers_redirect_tx_input);
-        sig_ctxs[6].set_peers_nonce_share(nonce_shares.sellers_redirect_tx_input);
-        sig_ctxs[7].set_peers_nonce_share(nonce_shares.buyers_claim_tx_input);
-        sig_ctxs[8].set_peers_nonce_share(nonce_shares.sellers_claim_tx_input);
+        let mut used_nonce_shares = BTreeSet::new();
+        for sig_ctx in &sig_ctxs {
+            used_nonce_shares.insert(sig_ctx.my_nonce_share()?);
+        }
+        Ok(nonce_shares
+            .iter()
+            .all(|nonce_share| used_nonce_shares.insert(nonce_share)))
     }
 
     pub fn aggregate_nonce_shares(&mut self) -> Result<()> {
@@ -932,6 +972,10 @@ pub enum ProtocolErrorKind {
     DuplicateTradeId(String),
     #[error("unsupported closure type: {0:?}")]
     UnsupportedClosureType(ClosureType),
+    #[error("nonce share of the peer is used for more than one signature")]
+    RepeatedNonceShare,
+    #[error("trade is blocked after a rejected request")]
+    TradeBlocked,
     #[error("illegal state transition for {role:?}: {old_state} -> {new_state}")]
     IllegalStateTransition {
         role: Role,
@@ -1091,7 +1135,7 @@ mod tests {
         trade_model.check_redirect_tx_params()?;
         trade_model.set_peer_addresses(peers_addresses)?;
         trade_model.compute_unsigned_prepared_txs()?;
-        trade_model.set_peer_nonce_shares(peers_nonce_shares);
+        trade_model.set_peer_nonce_shares(peers_nonce_shares)?;
         trade_model.aggregate_nonce_shares()?;
         trade_model.sign_partial()
     }
@@ -1258,28 +1302,92 @@ mod tests {
         }
     }
 
+    /// The two trade models after the exchange of the key shares, before the nonce shares of the
+    /// peer are processed.
+    fn trade_models_before_nonce_exchange(
+        (my_role, peers_role): (Role, Role),
+    ) -> (TradeModel, TradeModel) {
+        let mut me = new_trade_model(my_role);
+        let mut peer = new_trade_model(peers_role);
+        receive_key_shares(&mut me, &sent_key_shares(&peer)).expect("valid key shares");
+        receive_key_shares(&mut peer, &sent_key_shares(&me)).expect("valid key shares");
+        (me, peer)
+    }
+
+    /// Checks that the nonce shares are rejected and not stored, and that the rejection blocks the
+    /// trade: the valid nonce shares of the peer are refused afterwards.
+    #[track_caller]
+    fn assert_repeated_nonce_share(
+        me: &mut TradeModel,
+        peer: &TradeModel,
+        change: impl FnOnce(&mut ExchangedNonces<ByVal>, &ExchangedNonces<ByVal>),
+    ) {
+        let (half_deposit_psbt, addresses, mut nonces) = sent_nonce_shares(peer);
+        change(&mut nonces, &sent_nonce_shares(me).2);
+        let result = receive_nonce_shares(
+            me,
+            (half_deposit_psbt, addresses, nonces),
+            REDIRECTION_RECEIVERS,
+        );
+        assert!(
+            matches!(result, Err(ProtocolErrorKind::RepeatedNonceShare)),
+            "unexpected result: {result:?}"
+        );
+        assert!(
+            matches!(
+                me.aggregate_nonce_shares(),
+                Err(ProtocolErrorKind::Multisig(_))
+            ),
+            "no nonce share of the rejected request is stored"
+        );
+
+        let result = receive_nonce_shares(me, sent_nonce_shares(peer), REDIRECTION_RECEIVERS);
+        assert!(
+            matches!(result, Err(ProtocolErrorKind::TradeBlocked)),
+            "unexpected result: {result:?}"
+        );
+        assert!(
+            matches!(
+                me.update_state(TradeState::Deposit),
+                Err(ProtocolErrorKind::TradeBlocked)
+            ),
+            "a blocked trade does not change its state"
+        );
+        assert_eq!(me.state(), TradeState::Init);
+    }
+
     /// G4: the peer uses one nonce for two signatures.
     #[test]
-    #[ignore = "G4: a nonce of the peer that is used for two signatures is accepted"]
     fn g4_peers_nonce_is_repeated() {
-        for (my_role, peers_role) in ROLE_PAIRS {
-            let mut me = new_trade_model(my_role);
-            let mut peer = new_trade_model(peers_role);
-            receive_key_shares(&mut me, &sent_key_shares(&peer)).expect("valid key shares");
-            receive_key_shares(&mut peer, &sent_key_shares(&me)).expect("valid key shares");
+        for roles in ROLE_PAIRS {
+            let (mut me, peer) = trade_models_before_nonce_exchange(roles);
+            assert_repeated_nonce_share(&mut me, &peer, |nonces, _| {
+                nonces.buyers_redirect_tx_input = nonces.sellers_redirect_tx_input.clone();
+            });
 
-            let (half_deposit_psbt, addresses, nonces) = sent_nonce_shares(&peer);
-            let repeated_nonces = ExchangedNonces {
-                buyers_redirect_tx_input: nonces.sellers_redirect_tx_input.clone(),
-                ..nonces
-            };
-            let result = receive_nonce_shares(
-                &mut me,
-                (half_deposit_psbt, addresses, repeated_nonces),
-                REDIRECTION_RECEIVERS,
-            );
-            assert!(result.is_err(), "{my_role:?}");
-            assert_eq!(me.state(), TradeState::Init);
+            // The nonce for the swap transaction belongs to an adaptor signature. It is checked
+            // like all others.
+            let (mut me, peer) = trade_models_before_nonce_exchange(roles);
+            assert_repeated_nonce_share(&mut me, &peer, |nonces, _| {
+                nonces.swap_tx_input = nonces.sellers_warning_tx_seller_input.clone();
+            });
+        }
+    }
+
+    /// G4: the peer sends one of our own nonces back, for the same signature or for another one.
+    #[test]
+    fn g4_peers_nonce_is_equal_to_own() {
+        for roles in ROLE_PAIRS {
+            let (mut me, peer) = trade_models_before_nonce_exchange(roles);
+            assert_repeated_nonce_share(&mut me, &peer, |nonces, my_nonces| {
+                nonces.buyers_warning_tx_buyer_input =
+                    my_nonces.buyers_warning_tx_buyer_input.clone();
+            });
+
+            let (mut me, peer) = trade_models_before_nonce_exchange(roles);
+            assert_repeated_nonce_share(&mut me, &peer, |nonces, my_nonces| {
+                nonces.sellers_redirect_tx_input = my_nonces.swap_tx_input.clone();
+            });
         }
     }
 

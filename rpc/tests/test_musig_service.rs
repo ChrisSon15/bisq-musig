@@ -1912,6 +1912,42 @@ async fn g1_g4_invalid_encodings_are_rejected() {
     trade.sign_deposit_tx().await;
 }
 
+/// G4: nonce shares of the peer in which one nonce is used for two signatures are rejected. The
+/// rejection blocks the trade (D17): the valid nonce shares are refused afterwards.
+#[tokio::test]
+async fn g4_repeated_nonce_is_rejected() {
+    type Change = fn(&mut NonceSharesMessage, &NonceSharesMessage);
+    let changes: [Change; 2] = [
+        // The peer uses one nonce for both warning transactions.
+        |peers, _| {
+            peers.sellers_warning_tx_buyer_input_nonce_share =
+                peers.buyers_warning_tx_buyer_input_nonce_share.clone();
+        },
+        // The peer sends our own nonce back.
+        |peers, own| peers.swap_tx_input_nonce_share = own.swap_tx_input_nonce_share.clone(),
+    ];
+    for trade_type in TRADE_TYPES {
+        for (side, peer_side) in [(Side::Buyer, Side::Seller), (Side::Seller, Side::Buyer)] {
+            for change in changes {
+                let mut trade = Trade::new(trade_type).await;
+                trade.init_trades().await;
+                trade.exchange_nonce_shares().await;
+                let own_nonce_shares = trade.party(side).nonce_shares.clone().expect("B/C");
+                let peers_nonce_shares = trade.party(peer_side).nonce_shares.clone().expect("B/C");
+                let mut repeated_nonce_shares = peers_nonce_shares.clone();
+                change(&mut repeated_nonce_shares, &own_nonce_shares);
+
+                let party = trade.party_mut(side);
+                let result = party.get_partial_signatures(&repeated_nonce_shares).await;
+                assert_refused(result, Code::Internal, "used for more than one signature");
+                let result = party.get_partial_signatures(&peers_nonce_shares).await;
+                assert_refused(result, Code::Internal, "trade is blocked");
+                assert_eq!(party.state(), TradeState::Init);
+            }
+        }
+    }
+}
+
 /// G10: a private key share that does not match the public key share of the peer is rejected, and
 /// the state does not change.
 #[tokio::test]

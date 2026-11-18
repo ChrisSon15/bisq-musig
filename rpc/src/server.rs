@@ -105,7 +105,7 @@ impl musig_server::Musig for MusigImpl {
                 let (addresses, nonce_shares) = peer_nonce_shares.try_proto_into()?;
                 trade_model.set_peer_addresses(addresses)?;
                 trade_model.compute_unsigned_prepared_txs()?;
-                trade_model.set_peer_nonce_shares(nonce_shares);
+                trade_model.set_peer_nonce_shares(nonce_shares)?;
                 trade_model.aggregate_nonce_shares()?;
                 trade_model.sign_partial()?;
             }
