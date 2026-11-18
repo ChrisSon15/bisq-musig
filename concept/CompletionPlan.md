@@ -719,12 +719,14 @@ Not done:
 Done when: stopping and starting `musigd` in every state leads to the same final result as an
 uninterrupted run.
 
-Status on 2026-11-18 (branch `wp5-persistence`, on top of `wp4-trade-flows`): the condition holds
-at the level of the engine for every state after the deposit signature, and for the setup in the
-specified way (the trade is abandoned). At the level of the service it is tested for the
-cooperative close, the setup, the forced close and the warning. With two real `musigd` processes
-it is tested for the forced close. The restore from the seed or from a backup is not part of
-this status: the project owner postponed it (section 12, row 9).
+Status on 2026-11-18 (branches `wp5-persistence` and `wp5-finish`; the second one is on top of
+`wp4-finish`): the condition holds at the level of the engine for every state after the deposit
+signature, and for the setup in the specified way (the trade is abandoned). At the level of the
+service it is tested for the cooperative close, the setup, the forced close and the warning.
+With two real `musigd` processes it is tested for every outcome: the cooperative close, the
+forced close, the redirect, the claim, the custom payout and the deposit abort. The restore from
+the seed or from a backup is not part of this status: the project owner postponed it
+(section 12, row 9).
 
 Done:
 
@@ -756,6 +758,12 @@ Done:
   (`rpc/tests/test_musig_service.rs`); H2, H3, H5 and K2 with two `musigd` processes that are
   stopped and started (`rpc/tests/test_musigd.rs`); K5 for the logged messages. H9 and H10 exist
   since WP2.
+- Tests with two `musigd` processes that are ended at once and started again (branch
+  `wp5-finish`): the redirect, the claim with the loss of the trader who was away (M6), the
+  custom payout, and the deposit abort after a timeout that passed while no process ran (H2, H3,
+  H5). One test ends the process 1 to 60 ms after a request was sent, for one request of the
+  setup and for each request of a cooperative close (H3, H4, H8). These tests changed no
+  production code.
 
 Not done:
 
@@ -764,11 +772,21 @@ Not done:
 - No way exists to leave the condition "a record cannot be loaded" except a copy of the wallet
   database from before the damage (open point O17 of the specification).
 - A stored drain transaction is not sent again at the next start (N5). Done in WP4.
-- Secrets in memory are not zeroised.
-- H3 and H4 are tested by restarting the service between requests and by a wallet that cannot
-  store. No test stops the process inside a request.
-- With two `musigd` processes only the forced close is tested with restarts. The dispute path
-  and the custom payout are tested with restarts at the level of the engine only.
+- Secrets in memory are not zeroised, except the ones that the wallet wiped before: the seed
+  words, the seed and the passwords. Examined on 2026-11-18, and no code was added, for this
+  reason: the libraries for the keys and nonces of a trade (`secp` 0.7.0, `musig2` 0.4.1) offer
+  no way to wipe a secret, and their scalar type is copied freely, also inside the libraries.
+  The wallet library keeps the signing keys of the seed in memory from the first signature to
+  the end of the process. A key share, the peer's secret key share and the seed keys therefore
+  stay in the memory of the process while the wallet is open, whatever the engine wipes. Wiping
+  the buffers that the engine owns (the serialised trade record) would not remove one secret
+  from the process. What would change this: key and nonce types with wiping in these libraries
+  or in a wrapper of our own, and a wallet that loads the signing keys only for a signature.
+- The stop inside a request (H3, H4) is tested with real processes, at a moment that the test
+  does not control: one run covers one moment per request. No test stops the process at each
+  named point of a request, for example between the storing and the response.
+- H6 (a damaged record) is tested at the level of the service with a wallet of the tests, not
+  with a damaged database file of a real process.
 - The record format has version 1. No rule exists yet for reading a record of an older version
   after a change of the format.
 
