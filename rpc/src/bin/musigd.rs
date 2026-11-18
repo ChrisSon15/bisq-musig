@@ -8,10 +8,12 @@ use bdk_wallet::bitcoin::Network;
 use bmp_tracing::tracing::{info, warn};
 use chain::CBFScanner;
 use clap::Parser;
+use protocol::params::EngineConfig;
+use protocol::trade_model::MemoryTradeStore;
 use rpc::bmp_wallet_service::{
     BMPWalletServiceImpl, BitcoinCoreChainApi, BmpWalletImpl, BmpWalletServer,
 };
-use rpc::server::{MusigImpl, MusigServer};
+use rpc::server::{MusigImpl, MusigServer, NoTradeWallet, TradeWalletProvider};
 use tonic::transport::Server;
 
 #[derive(Debug, Parser)]
@@ -76,12 +78,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let addr = format!("127.0.0.1:{}", cli.port).parse()?;
-    let musig = MusigImpl::default();
-
-    let mut server = Server::builder().add_service(MusigServer::new(musig));
 
     // The bisq2-facing wallet service is optional: without --wallet-dir there is no BMPWallet to
-    // serve, and musigd serves the trade protocol only.
+    // serve.
     let bmp_wallet = if let Some(dir) = &cli.wallet_dir {
         let mut service = BMPWalletServiceImpl::new(dir.clone(), cli.wallet_network)
             .with_broadcaster(Arc::new(BitcoinCoreChainApi::new(Arc::clone(&rpc_client))));
@@ -108,6 +107,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None
     };
 
+    // The trade service uses the wallet of the wallet service. Without a wallet it refuses every
+    // request that needs one.
+    let trade_wallet: Arc<dyn TradeWalletProvider> = if let Some(service) = &bmp_wallet {
+        Arc::clone(service) as _
+    } else {
+        warn!("No --wallet-dir given: the trade service has no wallet and cannot start a trade.");
+        Arc::new(NoTradeWallet)
+    };
+    let musig = MusigImpl::new(
+        Arc::new(MemoryTradeStore::default()),
+        trade_wallet,
+        EngineConfig::default(),
+    );
+
+    let mut server = Server::builder().add_service(MusigServer::new(musig));
     if let Some(service) = bmp_wallet {
         server = server.add_service(BmpWalletServer::new(BmpWalletImpl {
             wallet_service: service,

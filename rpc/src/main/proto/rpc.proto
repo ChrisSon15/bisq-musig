@@ -67,6 +67,8 @@ message NonceSharesRequest {
   uint64 buyersSecurityDeposit = 8;  // sats
   uint64 sellersSecurityDeposit = 9; // sats
   optional ReceiverAddressAndAmount tradeFeeReceiver = 10;
+  uint32 warningLockTime = 11;       // blocks after the confirmation of the deposit transaction
+  uint32 claimLockTime = 12;         // blocks after the confirmation of the warning transaction
 }
 
 message NonceSharesMessage {

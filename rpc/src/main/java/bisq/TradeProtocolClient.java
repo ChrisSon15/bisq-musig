@@ -12,21 +12,40 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 public class TradeProtocolClient {
-    private final MusigGrpc.MusigBlockingStub stub;
+    // Lock times in blocks. They are trade parameters and must be the same for both traders.
+    private static final int WARNING_LOCK_TIME = 1440;
+    private static final int CLAIM_LOCK_TIME = 720;
 
-    public TradeProtocolClient(Channel channel) {
-        this.stub = MusigGrpc.newBlockingStub(channel);
+    private final MusigGrpc.MusigBlockingStub buyerStub;
+    private final MusigGrpc.MusigBlockingStub sellerStub;
+
+    public TradeProtocolClient(Channel buyerChannel, Channel sellerChannel) {
+        this.buyerStub = MusigGrpc.newBlockingStub(buyerChannel);
+        this.sellerStub = MusigGrpc.newBlockingStub(sellerChannel);
     }
 
+    /**
+     * Carries out mock trades between two MuSig daemons, one for the buyer and one for the seller.
+     *
+     * <p>Each daemon must run with a wallet directory, and its wallet must be open and hold
+     * enough funds for the deposits, because the trade service uses the wallet of the daemon. The
+     * ports are taken from the system properties {@code buyer.port} (default 50051) and
+     * {@code seller.port} (default 50052).
+     */
     public static void main(String[] args) {
-        var channel = Grpc.newChannelBuilderForAddress(
+        var buyerChannel = Grpc.newChannelBuilderForAddress(
                 "127.0.0.1",
-                50051,
+                Integer.getInteger("buyer.port", 50051),
+                InsecureChannelCredentials.create()
+        ).build();
+        var sellerChannel = Grpc.newChannelBuilderForAddress(
+                "127.0.0.1",
+                Integer.getInteger("seller.port", 50052),
                 InsecureChannelCredentials.create()
         ).build();
 
         try {
-            var client = new TradeProtocolClient(channel);
+            var client = new TradeProtocolClient(buyerChannel, sellerChannel);
             client.testMusigService_twoParties(0, TradeType.TAKER_IS_BUYER, ClosureType.COOPERATIVE);
             client.testMusigService_twoParties(1, TradeType.TAKER_IS_BUYER, ClosureType.FORCED);
             client.testMusigService_twoParties(2, TradeType.TAKER_IS_SELLER, ClosureType.COOPERATIVE);
@@ -34,7 +53,8 @@ public class TradeProtocolClient {
             client.testMusigService_twoParties(4, TradeType.TAKER_IS_BUYER, ClosureType.MEDIATED);
             client.testMusigService_twoParties(5, TradeType.TAKER_IS_BUYER, ClosureType.FORCED_AFTER_MEDIATION);
         } finally {
-            channel.shutdown();
+            buyerChannel.shutdown();
+            sellerChannel.shutdown();
         }
     }
 
@@ -48,7 +68,7 @@ public class TradeProtocolClient {
 
     private void testMusigService_twoParties(int tradeNum, TradeType tradeType, ClosureType closureType) {
         // Two peers, buyer & seller (one taker, one maker), talk to their respective Rust servers
-        // via gRPC, simulated here as two sessions (trade IDs) with the same test server.
+        // via gRPC. Each server uses its own wallet, so the two peers need two servers.
         //
         // Communication with the gRPC server is interspersed with messages exchanged between the
         // peers. These are the messages A-G defined in $SRC_ROOT/musig_trade_protocol_messages.txt,
@@ -67,7 +87,7 @@ public class TradeProtocolClient {
     }
 
     private void setupTakerIsBuyerTrade(String buyerTradeId, String sellerTradeId) {
-        var buyerPubKeyShareResponse = stub.initTrade(PubKeySharesRequest.newBuilder()
+        var buyerPubKeyShareResponse = buyerStub.initTrade(PubKeySharesRequest.newBuilder()
                 .setTradeId(buyerTradeId)
                 .setMyRole(Role.BUYER_AS_TAKER)
                 .build());
@@ -75,13 +95,13 @@ public class TradeProtocolClient {
 
         // Buyer sends Message A to seller.
 
-        var sellerPubKeyShareResponse = stub.initTrade(PubKeySharesRequest.newBuilder()
+        var sellerPubKeyShareResponse = sellerStub.initTrade(PubKeySharesRequest.newBuilder()
                 .setTradeId(sellerTradeId)
                 .setMyRole(Role.SELLER_AS_MAKER)
                 .build());
         System.out.println("Got reply: " + sellerPubKeyShareResponse);
 
-        var sellerNonceShareMessage = stub.getNonceShares(NonceSharesRequest.newBuilder()
+        var sellerNonceShareMessage = sellerStub.getNonceShares(NonceSharesRequest.newBuilder()
                 .setTradeId(sellerTradeId)
                 .setBuyerOutputPeersPubKeyShare(buyerPubKeyShareResponse.getBuyerOutputPubKeyShare())
                 .setSellerOutputPeersPubKeyShare(buyerPubKeyShareResponse.getSellerOutputPubKeyShare())
@@ -92,12 +112,14 @@ public class TradeProtocolClient {
                 .setBuyersSecurityDeposit(30_000)
                 .setSellersSecurityDeposit(30_000)
                 .setTradeFeeReceiver(mockTradeFeeReceiver())
+                .setWarningLockTime(WARNING_LOCK_TIME)
+                .setClaimLockTime(CLAIM_LOCK_TIME)
                 .build());
         System.out.println("Got reply: " + sellerNonceShareMessage);
 
         // Seller sends Message B to buyer.
 
-        var buyerNonceShareMessage = stub.getNonceShares(NonceSharesRequest.newBuilder()
+        var buyerNonceShareMessage = buyerStub.getNonceShares(NonceSharesRequest.newBuilder()
                 .setTradeId(buyerTradeId)
                 .setBuyerOutputPeersPubKeyShare(sellerPubKeyShareResponse.getBuyerOutputPubKeyShare())
                 .setSellerOutputPeersPubKeyShare(sellerPubKeyShareResponse.getSellerOutputPubKeyShare())
@@ -108,10 +130,12 @@ public class TradeProtocolClient {
                 .setBuyersSecurityDeposit(30_000)
                 .setSellersSecurityDeposit(30_000)
                 .setTradeFeeReceiver(mockTradeFeeReceiver())
+                .setWarningLockTime(WARNING_LOCK_TIME)
+                .setClaimLockTime(CLAIM_LOCK_TIME)
                 .build());
         System.out.println("Got reply: " + buyerNonceShareMessage);
 
-        var buyerPartialSignatureMessage = stub.getPartialSignatures(PartialSignaturesRequest.newBuilder()
+        var buyerPartialSignatureMessage = buyerStub.getPartialSignatures(PartialSignaturesRequest.newBuilder()
                 .setTradeId(buyerTradeId)
                 .setPeersNonceShares(sellerNonceShareMessage)
                 .addAllRedirectionReceivers(mockRedirectionReceivers(buyerNonceShareMessage.getRedirectionAmountMsat()))
@@ -120,14 +144,14 @@ public class TradeProtocolClient {
 
         // Buyer sends Message C to seller. (Buyer's swapTxInputPartialSignature is withheld from it.)
 
-        var sellerPartialSignatureMessage = stub.getPartialSignatures(PartialSignaturesRequest.newBuilder()
+        var sellerPartialSignatureMessage = sellerStub.getPartialSignatures(PartialSignaturesRequest.newBuilder()
                 .setTradeId(sellerTradeId)
                 .setPeersNonceShares(buyerNonceShareMessage)
                 .addAllRedirectionReceivers(mockRedirectionReceivers(sellerNonceShareMessage.getRedirectionAmountMsat()))
                 .build());
         System.out.println("Got reply: " + sellerPartialSignatureMessage);
 
-        var sellerDepositPsbt = stub.signDepositTx(DepositTxSignatureRequest.newBuilder()
+        var sellerDepositPsbt = sellerStub.signDepositTx(DepositTxSignatureRequest.newBuilder()
                 .setTradeId(sellerTradeId)
                 // Don't include contract-forming (Deposit/Warning/Redirect) txids, as they are ignored:
                 .setPeersPartialSignatures(buyerPartialSignatureMessage.toBuilder().clearContractualTxIds())
@@ -135,13 +159,13 @@ public class TradeProtocolClient {
         System.out.println("Got reply: " + sellerDepositPsbt);
 
         // Seller subscribes to be notified of Deposit Tx confirmation:
-        var sellerDepositTxConfirmationIter = stub.subscribeTxConfirmationStatus(SubscribeTxConfirmationStatusRequest.newBuilder()
+        var sellerDepositTxConfirmationIter = sellerStub.subscribeTxConfirmationStatus(SubscribeTxConfirmationStatusRequest.newBuilder()
                 .setTradeId(sellerTradeId)
                 .build());
 
         // Seller sends Message D to buyer. (Seller's swapTxInputPartialSignature is NOT withheld from it.)
 
-        var buyerDepositPsbt = stub.signDepositTx(DepositTxSignatureRequest.newBuilder()
+        var buyerDepositPsbt = buyerStub.signDepositTx(DepositTxSignatureRequest.newBuilder()
                 .setTradeId(buyerTradeId)
                 // Don't include contract-forming (Deposit/Warning/Redirect) txids, as they are ignored:
                 .setPeersPartialSignatures(sellerPartialSignatureMessage.toBuilder().clearContractualTxIds())
@@ -149,7 +173,7 @@ public class TradeProtocolClient {
         System.out.println("Got reply: " + buyerDepositPsbt);
 
         // *** BUYER BROADCASTS DEPOSIT TX ***
-        var buyerDepositTxConfirmationIter = stub.publishDepositTx(PublishDepositTxRequest.newBuilder()
+        var buyerDepositTxConfirmationIter = buyerStub.publishDepositTx(PublishDepositTxRequest.newBuilder()
                 .setTradeId(buyerTradeId)
                 .setPeersDepositPsbt(sellerDepositPsbt)
                 .build());
@@ -162,7 +186,7 @@ public class TradeProtocolClient {
     }
 
     private void setupTakerIsSellerTrade(String buyerTradeId, String sellerTradeId) {
-        var sellerPubKeyShareResponse = stub.initTrade(PubKeySharesRequest.newBuilder()
+        var sellerPubKeyShareResponse = sellerStub.initTrade(PubKeySharesRequest.newBuilder()
                 .setTradeId(sellerTradeId)
                 .setMyRole(Role.SELLER_AS_TAKER)
                 .build());
@@ -170,13 +194,13 @@ public class TradeProtocolClient {
 
         // Seller sends Message A to buyer.
 
-        var buyerPubKeyShareResponse = stub.initTrade(PubKeySharesRequest.newBuilder()
+        var buyerPubKeyShareResponse = buyerStub.initTrade(PubKeySharesRequest.newBuilder()
                 .setTradeId(buyerTradeId)
                 .setMyRole(Role.BUYER_AS_MAKER)
                 .build());
         System.out.println("Got reply: " + buyerPubKeyShareResponse);
 
-        var buyerNonceShareMessage = stub.getNonceShares(NonceSharesRequest.newBuilder()
+        var buyerNonceShareMessage = buyerStub.getNonceShares(NonceSharesRequest.newBuilder()
                 .setTradeId(buyerTradeId)
                 .setBuyerOutputPeersPubKeyShare(sellerPubKeyShareResponse.getBuyerOutputPubKeyShare())
                 .setSellerOutputPeersPubKeyShare(sellerPubKeyShareResponse.getSellerOutputPubKeyShare())
@@ -187,12 +211,14 @@ public class TradeProtocolClient {
                 .setBuyersSecurityDeposit(30_000)
                 .setSellersSecurityDeposit(30_000)
                 .setTradeFeeReceiver(mockTradeFeeReceiver())
+                .setWarningLockTime(WARNING_LOCK_TIME)
+                .setClaimLockTime(CLAIM_LOCK_TIME)
                 .build());
         System.out.println("Got reply: " + buyerNonceShareMessage);
 
         // Buyer sends Message B to seller.
 
-        var sellerNonceShareMessage = stub.getNonceShares(NonceSharesRequest.newBuilder()
+        var sellerNonceShareMessage = sellerStub.getNonceShares(NonceSharesRequest.newBuilder()
                 .setTradeId(sellerTradeId)
                 .setBuyerOutputPeersPubKeyShare(buyerPubKeyShareResponse.getBuyerOutputPubKeyShare())
                 .setSellerOutputPeersPubKeyShare(buyerPubKeyShareResponse.getSellerOutputPubKeyShare())
@@ -203,10 +229,12 @@ public class TradeProtocolClient {
                 .setBuyersSecurityDeposit(30_000)
                 .setSellersSecurityDeposit(30_000)
                 .setTradeFeeReceiver(mockTradeFeeReceiver())
+                .setWarningLockTime(WARNING_LOCK_TIME)
+                .setClaimLockTime(CLAIM_LOCK_TIME)
                 .build());
         System.out.println("Got reply: " + sellerNonceShareMessage);
 
-        var sellerPartialSignatureMessage = stub.getPartialSignatures(PartialSignaturesRequest.newBuilder()
+        var sellerPartialSignatureMessage = sellerStub.getPartialSignatures(PartialSignaturesRequest.newBuilder()
                 .setTradeId(sellerTradeId)
                 .setPeersNonceShares(buyerNonceShareMessage)
                 .addAllRedirectionReceivers(mockRedirectionReceivers(sellerNonceShareMessage.getRedirectionAmountMsat()))
@@ -215,14 +243,14 @@ public class TradeProtocolClient {
 
         // Seller sends Message C to buyer. (Seller's swapTxInputPartialSignature is NOT withheld from it.)
 
-        var buyerPartialSignatureMessage = stub.getPartialSignatures(PartialSignaturesRequest.newBuilder()
+        var buyerPartialSignatureMessage = buyerStub.getPartialSignatures(PartialSignaturesRequest.newBuilder()
                 .setTradeId(buyerTradeId)
                 .setPeersNonceShares(sellerNonceShareMessage)
                 .addAllRedirectionReceivers(mockRedirectionReceivers(buyerNonceShareMessage.getRedirectionAmountMsat()))
                 .build());
         System.out.println("Got reply: " + buyerPartialSignatureMessage);
 
-        var buyerDepositPsbt = stub.signDepositTx(DepositTxSignatureRequest.newBuilder()
+        var buyerDepositPsbt = buyerStub.signDepositTx(DepositTxSignatureRequest.newBuilder()
                 .setTradeId(buyerTradeId)
                 // Don't include contract-forming (Deposit/Warning/Redirect) txids, as they are ignored:
                 .setPeersPartialSignatures(sellerPartialSignatureMessage.toBuilder().clearContractualTxIds())
@@ -230,13 +258,13 @@ public class TradeProtocolClient {
         System.out.println("Got reply: " + buyerDepositPsbt);
 
         // Buyer subscribes to be notified of Deposit Tx confirmation:
-        var buyerDepositTxConfirmationIter = stub.subscribeTxConfirmationStatus(SubscribeTxConfirmationStatusRequest.newBuilder()
+        var buyerDepositTxConfirmationIter = buyerStub.subscribeTxConfirmationStatus(SubscribeTxConfirmationStatusRequest.newBuilder()
                 .setTradeId(buyerTradeId)
                 .build());
 
         // Buyer sends Message D to seller. (Buyer's swapTxInputPartialSignature is withheld from it.)
 
-        var sellerDepositPsbt = stub.signDepositTx(DepositTxSignatureRequest.newBuilder()
+        var sellerDepositPsbt = sellerStub.signDepositTx(DepositTxSignatureRequest.newBuilder()
                 .setTradeId(sellerTradeId)
                 // Don't include contract-forming (Deposit/Warning/Redirect) txids, as they are ignored:
                 .setPeersPartialSignatures(buyerPartialSignatureMessage.toBuilder().clearContractualTxIds())
@@ -244,7 +272,7 @@ public class TradeProtocolClient {
         System.out.println("Got reply: " + sellerDepositPsbt);
 
         // *** SELLER BROADCASTS DEPOSIT TX ***
-        var sellerDepositTxConfirmationIter = stub.publishDepositTx(PublishDepositTxRequest.newBuilder()
+        var sellerDepositTxConfirmationIter = sellerStub.publishDepositTx(PublishDepositTxRequest.newBuilder()
                 .setTradeId(sellerTradeId)
                 .setPeersDepositPsbt(buyerDepositPsbt)
                 .build());
@@ -267,7 +295,7 @@ public class TradeProtocolClient {
         // (Buyer calls 'GetPartialSignatures' a second time, this time with the ready-to-release flag set, so that his
         // previously withheld swapTxInputPartialSignature is revealed, to pass to the seller. All other request proto
         // fields besides the trade ID may be left as their default values.)
-        var buyerPartialSignatureMessage = stub.getPartialSignatures(PartialSignaturesRequest.newBuilder()
+        var buyerPartialSignatureMessage = buyerStub.getPartialSignatures(PartialSignaturesRequest.newBuilder()
                 .setTradeId(buyerTradeId)
                 .setBuyerReadyToRelease(true)
                 .build());
@@ -277,7 +305,7 @@ public class TradeProtocolClient {
 
         // (Seller should compute Swap Tx signature immediately upon receipt of Message E, instead of waiting until the
         // end of the trade, to make sure that there's no problem with it and raise a dispute ASAP otherwise.)
-        var blankSwapTxSignatureResponse = stub.signSwapTx(SwapTxSignatureRequest.newBuilder()
+        var blankSwapTxSignatureResponse = sellerStub.signSwapTx(SwapTxSignatureRequest.newBuilder()
                 .setTradeId(sellerTradeId)
                 .setSwapTxInputPeersPartialSignature(buyerPartialSignatureMessage.getSwapTxInputPartialSignature())
                 .build());
@@ -288,7 +316,7 @@ public class TradeProtocolClient {
         // (Seller calls 'SignSwapTx' a second time, this time with the ready-to-release flag set, so that a non-blank
         // response is returned, containing the peerOutputPrvKeyShare to pass to the buyer, which releases his payout.
         // All other request proto fields besides the trade ID may be left as their default values.)
-        var swapTxSignatureResponse = stub.signSwapTx(SwapTxSignatureRequest.newBuilder()
+        var swapTxSignatureResponse = sellerStub.signSwapTx(SwapTxSignatureRequest.newBuilder()
                 .setTradeId(sellerTradeId)
                 .setSellerReadyToRelease(true)
                 .build());
@@ -298,7 +326,7 @@ public class TradeProtocolClient {
             // Seller sends Message F to buyer.
 
             // *** BUYER CLOSES TRADE ***
-            var buyersCloseTradeResponse = stub.closeTrade(CloseTradeRequest.newBuilder()
+            var buyersCloseTradeResponse = buyerStub.closeTrade(CloseTradeRequest.newBuilder()
                     .setTradeId(buyerTradeId)
                     .setMyOutputPeersPrvKeyShare(swapTxSignatureResponse.getPeerOutputPrvKeyShare())
                     .setPenaltyTxFeeRate(3750) // 15.0 sats per vbyte -- optionally set by either trader at closure time
@@ -309,7 +337,7 @@ public class TradeProtocolClient {
             // Buyer sends Message G to seller.
 
             // *** SELLER CLOSES TRADE ***
-            var sellersCloseTradeResponse = stub.closeTrade(CloseTradeRequest.newBuilder()
+            var sellersCloseTradeResponse = sellerStub.closeTrade(CloseTradeRequest.newBuilder()
                     .setTradeId(sellerTradeId)
                     .setMyOutputPeersPrvKeyShare(buyersCloseTradeResponse.getPeerOutputPrvKeyShare())
                     .build());
@@ -321,7 +349,7 @@ public class TradeProtocolClient {
             if (closureType == ClosureType.FORCED_AFTER_MEDIATION) {
                 // Meanwhile, buyer accepts solution from mediator (fiat received, 50% seller security deposit penalty).
 
-                var buyersCustomPayoutPsbt = stub.signCustomPayoutTx(CustomPayoutPsbtRequest.newBuilder()
+                var buyersCustomPayoutPsbt = buyerStub.signCustomPayoutTx(CustomPayoutPsbtRequest.newBuilder()
                         .setTradeId(buyerTradeId)
                         .setSellersPayoutAmountExcludingFee(15_000)
                         .setFeeRate(3_750) // 15.0 sats per vbyte
@@ -335,7 +363,7 @@ public class TradeProtocolClient {
             // Seller never gets expected Message G from buyer -- gives up waiting.
 
             // *** SELLER FORCE-CLOSES TRADE ***
-            var sellersCloseTradeResponse = stub.closeTrade(CloseTradeRequest.newBuilder()
+            var sellersCloseTradeResponse = sellerStub.closeTrade(CloseTradeRequest.newBuilder()
                     .setTradeId(sellerTradeId)
                     .build());
             System.out.println("Got reply: " + sellersCloseTradeResponse);
@@ -344,7 +372,7 @@ public class TradeProtocolClient {
             // Buyer never got Message F from seller -- picks up Swap Tx from bitcoin network instead.
 
             // *** BUYER CLOSES TRADE ***
-            var buyersCloseTradeResponse = stub.closeTrade(CloseTradeRequest.newBuilder()
+            var buyersCloseTradeResponse = buyerStub.closeTrade(CloseTradeRequest.newBuilder()
                     .setTradeId(buyerTradeId)
                     .setSwapTx(sellersCloseTradeResponse.getSwapTx())
                     .build());
@@ -356,7 +384,7 @@ public class TradeProtocolClient {
     private void doMediatedTradeClosure(String buyerTradeId, String sellerTradeId) {
         // DELAY: Buyer accepts solution from mediator (cancelled trade, 50% buyer security deposit penalty).
 
-        var buyersCustomPayoutPsbt = stub.signCustomPayoutTx(CustomPayoutPsbtRequest.newBuilder()
+        var buyersCustomPayoutPsbt = buyerStub.signCustomPayoutTx(CustomPayoutPsbtRequest.newBuilder()
                 .setTradeId(buyerTradeId)
                 .setSellersPayoutAmountExcludingFee(245_000)
                 .setFeeRate(3_750) // 15.0 sats per vbyte
@@ -367,7 +395,7 @@ public class TradeProtocolClient {
 
         // DELAY: Seller accepts solution from mediator.
 
-        var sellersCustomPayoutPsbt = stub.signCustomPayoutTx(CustomPayoutPsbtRequest.newBuilder()
+        var sellersCustomPayoutPsbt = sellerStub.signCustomPayoutTx(CustomPayoutPsbtRequest.newBuilder()
                 .setTradeId(sellerTradeId)
                 .setSellersPayoutAmountExcludingFee(245_000)
                 .setFeeRate(3_750) // 15.0 sats per vbyte
@@ -375,7 +403,7 @@ public class TradeProtocolClient {
         System.out.println("Got reply: " + sellersCustomPayoutPsbt);
 
         // *** SELLER CUSTOM-CLOSES TRADE ***
-        var sellersCustomCloseTradeResponse = stub.customCloseTrade(CustomCloseTradeRequest.newBuilder()
+        var sellersCustomCloseTradeResponse = sellerStub.customCloseTrade(CustomCloseTradeRequest.newBuilder()
                 .setTradeId(sellerTradeId)
                 .setPeersCustomPayoutPsbt(buyersCustomPayoutPsbt.getPsbt())
                 .build());

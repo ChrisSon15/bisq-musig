@@ -264,7 +264,11 @@ fn spawn_musigd(
     client: Arc<BitcoinCoreClient>,
     electrum_url: String,
 ) -> JoinHandle<Result<(), transport::Error>> {
-    let musig = MusigImpl::default();
+    let musig = MusigImpl::new(
+        Arc::new(protocol::trade_model::MemoryTradeStore::default()),
+        Arc::new(rpc::server::NoTradeWallet),
+        protocol::params::EngineConfig::default(),
+    );
 
     let bmp_protocol_impl = BmpServiceImpl::new(client, electrum_url);
 

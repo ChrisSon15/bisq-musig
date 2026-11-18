@@ -10,6 +10,7 @@ use musig2::{
 };
 use thiserror::Error;
 
+#[derive(Clone)]
 pub struct KeyPair {
     pub_key: Point,
     prv_key: Option<Scalar>,
@@ -42,6 +43,7 @@ impl KeyPair {
     }
 }
 
+#[derive(Clone)]
 struct NoncePair {
     pub_nonce: PubNonce,
     sec_nonce: Option<SecNonce>,
@@ -56,7 +58,7 @@ impl NoncePair {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct KeyCtx {
     my_key_share: Option<KeyPair>,
     peers_key_share: Option<KeyPair>,
@@ -156,7 +158,7 @@ impl TweakedKeyCtx {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SigCtx {
     tweaked_key_ctx: Option<TweakedKeyCtx>,
     adaptor_point: MaybePoint,

@@ -7,8 +7,8 @@ use bdk_wallet::bitcoin::sighash::{Prevouts, SighashCache};
 use bdk_wallet::bitcoin::taproot::{Signature, TAPROOT_ANNEX_PREFIX};
 use bdk_wallet::bitcoin::transaction::Version;
 use bdk_wallet::bitcoin::{
-    Address, Amount, FeeRate, Network, OutPoint, Psbt, Sequence, TapSighash, TapSighashType,
-    Transaction, TxIn, TxOut, Txid, Weight, Witness, absolute, relative, script,
+    Address, Amount, FeeRate, OutPoint, Psbt, Sequence, TapSighash, TapSighashType, Transaction,
+    TxIn, TxOut, Txid, Weight, Witness, absolute, relative,
 };
 use bdk_wallet::miniscript::DefiniteDescriptorKey;
 use bdk_wallet::miniscript::psbt::PsbtInputExt as _;
@@ -21,53 +21,11 @@ use wallet::protocol_wallet_api::ProtocolWalletApi;
 use crate::psbt;
 use crate::receiver::ReceiverList;
 
-pub const REGTEST_WARNING_LOCK_TIME: LockTime = LockTime::from_height(5);
-pub const REGTEST_REDIRECT_LOCK_TIME: LockTime = LockTime::ZERO;
-pub const REGTEST_CLAIM_LOCK_TIME: LockTime = LockTime::from_height(5);
-
-// TODO: Consider further (also, we may want different delays for fiat & altcoin trades):
-pub const MAINNET_WARNING_LOCK_TIME: LockTime = LockTime::from_height(144 * 10);
-// TODO: Consider further (zero disables relative lock time):
-pub const MAINNET_REDIRECT_LOCK_TIME: LockTime = LockTime::ZERO;
-// TODO: Consider further:
-pub const MAINNET_CLAIM_LOCK_TIME: LockTime = LockTime::from_height(144 * 5);
-
 pub const ANCHOR_AMOUNT: Amount = Amount::from_sat(330);
 pub const SIGNED_FORWARDING_TX_WEIGHT: Weight = Weight::from_wu(444);
 pub const SIGNED_WARNING_TX_WEIGHT: Weight = Weight::from_wu(846);
 pub const SIGNED_REDIRECT_TX_BASE_WEIGHT: Weight = SIGNED_FORWARDING_TX_WEIGHT;
 pub const SIGNED_CUSTOM_PAYOUT_TX_WEIGHT: Weight = Weight::from_wu(1182);
-
-pub trait NetworkParams {
-    fn warning_lock_time(&self) -> LockTime;
-
-    fn redirect_lock_time(&self) -> LockTime;
-
-    fn claim_lock_time(&self) -> LockTime;
-}
-
-impl NetworkParams for Network {
-    fn warning_lock_time(&self) -> LockTime {
-        match self {
-            Self::Regtest => REGTEST_WARNING_LOCK_TIME,
-            _ => MAINNET_WARNING_LOCK_TIME
-        }
-    }
-
-    fn redirect_lock_time(&self) -> LockTime {
-        match self {
-            Self::Regtest => REGTEST_REDIRECT_LOCK_TIME,
-            _ => MAINNET_REDIRECT_LOCK_TIME
-        }
-    }
-
-    fn claim_lock_time(&self) -> LockTime {
-        match self {
-            Self::Regtest => REGTEST_CLAIM_LOCK_TIME,
-            _ => MAINNET_CLAIM_LOCK_TIME
-        }
-    }
-}
 
 macro_rules! make_getter {
     ($field_name:ident: $field_type:ident) => {
@@ -129,8 +87,12 @@ impl TxOutput {
         }))
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn mock_1_btc_coin(outpoint: &'static str) -> Self {
-        let script_pubkey = script::Builder::new().push_int(1).push_slice([0; 32]).into_script();
+        let script_pubkey = bdk_wallet::bitcoin::script::Builder::new()
+            .push_int(1)
+            .push_slice([0; 32])
+            .into_script();
         Self {
             outpoint: outpoint.parse().expect("for mocking only; assumed valid outpoint str"),
             prevout: TxOut { value: Amount::ONE_BTC, script_pubkey },
@@ -221,7 +183,7 @@ trait WithFixedInputs<const N: usize> {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct DepositTxBuilder {
     // Supplied fields:
     trade_amount: Option<Amount>,
@@ -348,7 +310,7 @@ impl DepositTxBuilder {
     pub fn signed_tx(&self) -> Result<Transaction> { psbt::extract_signed_tx(self.psbt()?) }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct WarningTxBuilder {
     // Supplied fields:
     buyer_input: Option<TxOutput>,
@@ -433,7 +395,7 @@ impl WithFixedInputs<2> for WarningTxBuilder {
     fn inputs(&self) -> Result<[&TxOutput; 2]> { Ok([self.buyer_input()?, self.seller_input()?]) }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct RedirectTxBuilder {
     // Supplied fields:
     input: Option<TxOutput>,
@@ -502,7 +464,7 @@ impl WithFixedInputs<1> for RedirectTxBuilder {
     fn inputs(&self) -> Result<[&TxOutput; 1]> { Ok([self.input()?]) }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ForwardingTxBuilder {
     // Supplied fields:
     input: Option<TxOutput>,
@@ -568,7 +530,7 @@ impl WithFixedInputs<1> for ForwardingTxBuilder {
 
 type Descriptor = bdk_wallet::miniscript::Descriptor<DefiniteDescriptorKey>;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct CustomPayoutTxBuilder {
     // Supplied fields:
     buyer_input: Option<TxOutput>,
@@ -725,8 +687,8 @@ impl From<ExtractTxError> for TransactionErrorKind {
 mod tests {
     use std::sync::Arc;
 
-    use bdk_wallet::bitcoin::consensus;
     use bdk_wallet::bitcoin::hex::test_hex_unwrap as hex;
+    use bdk_wallet::bitcoin::{Network, consensus};
     use const_format::str_index;
     use rand::SeedableRng as _;
     use rand_chacha::ChaCha20Rng;

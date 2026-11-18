@@ -494,6 +494,20 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
     }
 }
 
+/// The trade service uses the wallet of this service: one wallet for the user and for his trades.
+#[tonic::async_trait]
+impl<S: Send + Sync> crate::server::TradeWalletProvider for BMPWalletServiceImpl<S> {
+    async fn with_trade_wallet(&self, operation: &mut crate::server::WalletOperation<'_>) -> bool {
+        match self.wallet.lock().await.as_mut() {
+            Some(wallet) => {
+                operation(wallet);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 /// Publishes transactions through a Bitcoin Core node.
 pub struct BitcoinCoreChainApi(Arc<Client>);
 

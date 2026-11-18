@@ -1,5 +1,7 @@
+#[cfg(any(test, feature = "test-utils"))]
 pub mod mocks;
 pub mod multisig;
+pub mod params;
 pub mod protocol_musig_adaptor;
 mod psbt;
 pub mod receiver;

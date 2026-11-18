@@ -16,6 +16,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 wallet = { workspace = true }
 
+[features]
+# Mock wallets with fixed keys and signatures, for the tests of this crate and of other crates.
+test-utils = []
+
 [dev-dependencies]
 bdk_wallet = { workspace = true, features = ["test-utils"] }
 wallet = { workspace = true, features = ["test-utils"] }

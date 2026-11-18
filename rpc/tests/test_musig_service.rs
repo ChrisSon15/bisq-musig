@@ -9,13 +9,14 @@
 //! The services use the mock wallets of `protocol::mocks` and no chain. For this reason the tests
 //! check states, returned data and errors, but no wallet balance and no confirmation.
 //!
-//! The trade store is one static of the process, so both services share it. The buyer and the
-//! seller therefore use different trade IDs, as the Java client does. Every test uses new IDs,
-//! which keeps the tests independent when they run in parallel.
+//! Each service has its own trade store and its own mock wallet, like the `musigd` of one trader.
+//! The buyer and the seller of a trade use the same trade ID. A mock wallet has the coins, keys
+//! and addresses for one trade, so every trade of a test starts two new services.
 //!
 //! The test IDs in the comments (B1, C1, K1, ...) refer to section 9.4 of
 //! `concept/CompletionPlan.md`, the F numbers to its findings.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use bdk_wallet::bitcoin::hashes::Hash as _;
@@ -28,7 +29,10 @@ use bdk_wallet::bitcoin::{
 };
 use futures_util::StreamExt as _;
 use musig2::secp::{Point, Scalar};
+use protocol::mocks::{mock_buyer_trade_wallet, mock_seller_trade_wallet};
+use protocol::params::EngineConfig;
 use protocol::state::{ClosureType, TradeState};
+use protocol::trade_model::{MemoryTradeStore, TradeModelStore as _};
 use rpc::pb::musigrpc::musig_client::MusigClient;
 use rpc::pb::musigrpc::{
     CloseTradeRequest, CloseTradeResponse, ContractualTxIds, CustomCloseTradeRequest,
@@ -38,11 +42,12 @@ use rpc::pb::musigrpc::{
     ReceiverAddressAndAmount, Role, SubscribeTxConfirmationStatusRequest, SwapTxSignatureRequest,
     SwapTxSignatureResponse, TxConfirmationStatus,
 };
-use rpc::server::{MusigImpl, MusigServer, trade_state};
+use rpc::server::{MusigImpl, MusigServer, TradeWalletProvider, WalletOperation};
 use tokio::net::TcpListener;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Channel, Server};
 use tonic::{Code, Response, Status, Streaming};
+use wallet::protocol_wallet_api::ProtocolWalletApi;
 
 // Trade parameters of the Java test client. Fee rates are in sat per kwu, amounts in sat.
 const DEPOSIT_TX_FEE_RATE: u64 = 3_125;
@@ -52,6 +57,9 @@ const BUYERS_SECURITY_DEPOSIT: u64 = 30_000;
 const SELLERS_SECURITY_DEPOSIT: u64 = 30_000;
 const BUYERS_PENALTY_TX_FEE_RATE: u64 = 3_750;
 const CUSTOM_PAYOUT_TX_FEE_RATE: u64 = 3_750;
+// Lock times in blocks. The values have no meaning for these tests, because no chain is used.
+const WARNING_LOCK_TIME: u32 = 20;
+const CLAIM_LOCK_TIME: u32 = 10;
 
 //noinspection SpellCheckingInspection
 const TRADE_FEE_RECEIVER: (&str, u64) = ("bcrt1qwk6p86mzqmstcsg99qlu2mhsp3766u68jktv6k", 5_000);
@@ -146,20 +154,45 @@ const STAGES: [Stage; 12] = [
     Stage::ClosedByCustomPayout,
 ];
 
-/// Starts a `musigrpc.Musig` service on a free loopback port and returns a connected client.
-async fn start_service() -> MusigClient<Channel> {
+/// Gives a service the mock wallet of one trader.
+struct MockWalletProvider(tokio::sync::Mutex<Box<dyn ProtocolWalletApi + Send>>);
+
+#[tonic::async_trait]
+impl TradeWalletProvider for MockWalletProvider {
+    async fn with_trade_wallet(&self, operation: &mut WalletOperation<'_>) -> bool {
+        operation(&mut **self.0.lock().await);
+        true
+    }
+}
+
+/// Starts a `musigrpc.Musig` service for one trader on a free loopback port. Returns a connected
+/// client and the trade store of the service, from which the tests read the state of a trade.
+async fn start_service(is_buyer: bool) -> (MusigClient<Channel>, Arc<MemoryTradeStore>) {
+    let wallet: Box<dyn ProtocolWalletApi + Send> = if is_buyer {
+        Box::new(mock_buyer_trade_wallet())
+    } else {
+        Box::new(mock_seller_trade_wallet())
+    };
+    let trades = Arc::new(MemoryTradeStore::default());
+    let service = MusigImpl::new(
+        Arc::clone(&trades) as _,
+        Arc::new(MockWalletProvider(tokio::sync::Mutex::new(wallet))),
+        EngineConfig::default(),
+    );
+
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("free loopback port");
     let addr = listener.local_addr().expect("listener has a local address");
     tokio::spawn(
         Server::builder()
-            .add_service(MusigServer::new(MusigImpl::default()))
+            .add_service(MusigServer::new(service))
             .serve_with_incoming(TcpIncoming::from(listener)),
     );
-    MusigClient::connect(format!("http://{addr}"))
+    let client = MusigClient::connect(format!("http://{addr}"))
         .await
-        .expect("service accepts connections")
+        .expect("service accepts connections");
+    (client, trades)
 }
 
 /// Returns a number that no other test of this process uses, to build unique trade IDs.
@@ -189,6 +222,7 @@ fn mock_redirection_receivers() -> Vec<ReceiverAddressAndAmount> {
 /// One trader: a client of its own service, and the messages that this service returned so far.
 struct Party {
     client: MusigClient<Channel>,
+    trades: Arc<MemoryTradeStore>,
     trade_id: String,
     role: Role,
     key_shares: Option<PubKeySharesResponse>,
@@ -201,8 +235,11 @@ struct Party {
 
 impl Party {
     async fn new(trade_id: String, role: Role) -> Self {
+        let is_buyer = matches!(role, Role::BuyerAsMaker | Role::BuyerAsTaker);
+        let (client, trades) = start_service(is_buyer).await;
         Self {
-            client: start_service().await,
+            client,
+            trades,
             trade_id,
             role,
             key_shares: None,
@@ -220,7 +257,22 @@ impl Party {
 
     /// The state of this party's trade, read from the trade store of the service.
     fn state(&self) -> TradeState {
-        trade_state(&self.trade_id).expect("trade is stored")
+        let trade_model = self
+            .trades
+            .get_trade_model(&self.trade_id)
+            .expect("trade is stored");
+        let state = trade_model.lock().unwrap().state();
+        state
+    }
+
+    /// Whether the service terminated this party's trade.
+    fn is_terminated(&self) -> bool {
+        let trade_model = self
+            .trades
+            .get_trade_model(&self.trade_id)
+            .expect("trade is stored");
+        let is_terminated = trade_model.lock().unwrap().termination_reason().is_some();
+        is_terminated
     }
 
     async fn init_trade(&mut self) -> Result<PubKeySharesResponse, Status> {
@@ -246,6 +298,8 @@ impl Party {
             buyers_security_deposit: BUYERS_SECURITY_DEPOSIT,
             sellers_security_deposit: SELLERS_SECURITY_DEPOSIT,
             trade_fee_receiver: Some(mock_trade_fee_receiver()),
+            warning_lock_time: WARNING_LOCK_TIME,
+            claim_lock_time: CLAIM_LOCK_TIME,
         }
     }
 
@@ -472,8 +526,8 @@ impl Trade {
         };
         Self {
             kind: trade_type,
-            buyer: Party::new(format!("buyer-trade-{number}"), buyer_role).await,
-            seller: Party::new(format!("seller-trade-{number}"), seller_role).await,
+            buyer: Party::new(format!("trade-{number}"), buyer_role).await,
+            seller: Party::new(format!("trade-{number}"), seller_role).await,
             payment_started: None,
             release: None,
         }
@@ -1137,6 +1191,31 @@ fn assert_refused<T>(result: Result<T, Status>, code: Code, message: &str) {
     );
 }
 
+/// Checks that the service terminated the trade of `party` with this response: the status is
+/// `ABORTED`, and its message names the termination and contains `reason`.
+#[track_caller]
+fn assert_terminated<T>(result: Result<T, Status>, party: &Party, reason: &str) {
+    let Err(status) = result else {
+        panic!("the trade must be terminated ({reason})")
+    };
+    assert_eq!(status.code(), Code::Aborted, "unexpected status: {status}");
+    assert!(
+        status.message().contains("trade was terminated") && status.message().contains(reason),
+        "unexpected status: {status}"
+    );
+    assert!(party.is_terminated());
+}
+
+/// Checks that the request was refused because it is not allowed in the state `state`, and that
+/// the trade was not terminated.
+#[track_caller]
+fn assert_not_allowed<T>(result: Result<T, Status>, party: &Party, state: TradeState) {
+    let message = format!("request is not allowed in state {state}");
+    assert_refused(result, Code::FailedPrecondition, &message);
+    assert!(!party.is_terminated());
+    assert_eq!(party.state(), state);
+}
+
 /// Checks that `key_share` is the private key of the public key share `pub_key_share`.
 #[track_caller]
 fn assert_key_pair(key_share: &[u8], pub_key_share: &[u8]) {
@@ -1378,7 +1457,7 @@ async fn repeated_setup_calls_return_the_same_messages() {
 }
 
 /// A trader who did not sign the deposit transaction cannot publish it, also if the peer's signed
-/// PSBT is already there (part of K1).
+/// PSBT is already there (part of K1). The request can be repeated after he signed (G15).
 #[tokio::test]
 async fn deposit_tx_is_not_published_before_it_is_signed() {
     for trade_type in TRADE_TYPES {
@@ -1390,6 +1469,11 @@ async fn deposit_tx_is_not_published_before_it_is_signed() {
             .partial_signatures
             .clone()
             .expect("C");
+        let makers_signatures = trade
+            .party(maker_side)
+            .partial_signatures
+            .clone()
+            .expect("D");
         let makers_deposit_psbt = trade
             .party_mut(maker_side)
             .sign_deposit_tx(&takers_signatures)
@@ -1398,8 +1482,16 @@ async fn deposit_tx_is_not_published_before_it_is_signed() {
 
         let taker = trade.party_mut(taker_side);
         let result = taker.publish_deposit_tx(&makers_deposit_psbt).await;
-        assert_refused(result, Code::Internal, "access denied");
-        assert_eq!(taker.state(), TradeState::Init);
+        assert_not_allowed(result, taker, TradeState::Init);
+
+        taker
+            .sign_deposit_tx(&makers_signatures)
+            .await
+            .expect("taker signs the deposit transaction");
+        taker
+            .publish_deposit_tx(&makers_deposit_psbt)
+            .await
+            .expect("taker publishes the deposit transaction");
     }
 }
 
@@ -1468,8 +1560,7 @@ async fn b3_seller_cannot_release_before_payment_started() {
         ] {
             let mut trade = Trade::at(trade_type, stage).await;
             let result = trade.seller.release_payout().await;
-            assert_refused(result, Code::Internal, "missing aggregated signature");
-            assert_eq!(trade.seller.state(), state, "{stage:?}");
+            assert_not_allowed(result, &trade.seller, state);
         }
     }
 }
@@ -1488,50 +1579,76 @@ async fn b4_buyer_gets_no_key_share_before_release() {
             let mut trade = Trade::at(trade_type, stage).await;
             let buyer = &mut trade.buyer;
 
+            let seller_only = "operation only available for seller";
             let result = buyer.close_trade_without_arguments().await;
-            assert_refused(result, Code::Internal, "missing private key");
-            let result = buyer.close_trade_with_key_share(&random_scalar()).await;
-            assert_refused(result, Code::Internal, "public-private key mismatch");
-            let result = buyer.close_trade_with_swap_tx(&unrelated_tx()).await;
-            assert_refused(result, Code::Internal, "missing signature");
+            assert_refused(result, Code::FailedPrecondition, seller_only);
             let result = buyer.release_payout().await;
-            assert_refused(
-                result,
-                Code::FailedPrecondition,
-                "only available for seller",
-            );
+            assert_refused(result, Code::FailedPrecondition, seller_only);
+
+            // A transaction that does not spend the seller's payout reveals no key share.
+            let result = buyer.close_trade_with_swap_tx(&unrelated_tx()).await;
+            match state {
+                TradeState::Init | TradeState::Deposit => assert_not_allowed(result, buyer, state),
+                _ => assert_refused(
+                    result,
+                    Code::FailedPrecondition,
+                    "does not reveal the seller's key share",
+                ),
+            }
+            assert_eq!(buyer.state(), state, "{stage:?}");
+            assert!(!buyer.is_terminated(), "{stage:?}");
+
+            // A key share that the seller did not create. Where the buyer may close, it proves a
+            // modified client of the seller.
+            let result = buyer.close_trade_with_key_share(&random_scalar()).await;
+            if state == TradeState::BuyerReadyToRelease {
+                assert_terminated(result, buyer, "does not match its public key share");
+            } else {
+                assert_not_allowed(result, buyer, state);
+            }
             assert_eq!(buyer.state(), state, "{stage:?}");
         }
     }
 }
 
-/// The buyer's partial signature for the swap transaction leaves the buyer's service only in
-/// state `BuyerReadyToRelease` (belongs to B3 and C4).
+/// The buyer's partial signature for the swap transaction leaves the buyer's service only after
+/// he started the payment (belongs to B3 and C4).
 #[tokio::test]
 async fn buyers_swap_tx_signature_is_returned_only_after_payment_start() {
     for trade_type in TRADE_TYPES {
         // Before the deposit is signed, the buyer cannot start the payment.
         let mut trade = Trade::at(trade_type, Stage::SignaturesExchanged).await;
         let result = trade.buyer.start_payment().await;
-        assert_refused(result, Code::Internal, "missing aggregated signature");
-        assert_eq!(trade.buyer.state(), TradeState::Init);
+        assert_not_allowed(result, &trade.buyer, TradeState::Init);
 
-        // The signature that the seller needs is in message E and in every repetition of it.
-        let mut trade = Trade::at(trade_type, Stage::PaymentStarted).await;
-        let repeated = trade
-            .buyer
-            .start_payment()
-            .await
-            .expect("repeated call succeeds");
-        assert_eq!(Some(repeated), trade.payment_started);
+        // The signature that the seller needs is in message E and in every repetition of it,
+        // also after the trade moved on.
+        for stage in [
+            Stage::PaymentStarted,
+            Stage::ClosedCooperatively,
+            Stage::CustomPayoutSignedAfterPaymentStart,
+        ] {
+            let mut trade = Trade::at(trade_type, stage).await;
+            let state = trade.buyer.state();
+            let repeated = trade
+                .buyer
+                .start_payment()
+                .await
+                .expect("repeated call succeeds");
+            assert_eq!(
+                repeated.swap_tx_input_partial_signature,
+                Some(trade.buyers_swap_tx_signature()),
+                "{stage:?}"
+            );
+            assert_eq!(trade.buyer.state(), state, "{stage:?}");
+        }
 
-        // After a custom payout was signed, the call succeeds but returns no signature.
+        // A buyer who signed a custom payout does not start the payment any more.
         for stage in [Stage::CustomPayoutSigned, Stage::ClosedByCustomPayout] {
             let mut trade = Trade::at(trade_type, stage).await;
             let state = trade.buyer.state();
-            let message = trade.buyer.start_payment().await.expect("call succeeds");
-            assert_eq!(message.swap_tx_input_partial_signature, None, "{stage:?}");
-            assert_eq!(trade.buyer.state(), state, "{stage:?}");
+            let result = trade.buyer.start_payment().await;
+            assert_not_allowed(result, &trade.buyer, state);
         }
     }
 }
@@ -1610,21 +1727,14 @@ async fn c1_forced_close_after_buyer_signed_custom_payout() {
             .expect("buyer signs the custom payout");
         assert_eq!(trade.buyer.state(), TradeState::CustomPayoutSigned);
 
+        let state = TradeState::SellerReadyToRelease;
         let result = trade
             .seller
             .custom_close_trade(&custom_payout_psbt.psbt)
             .await;
-        assert_refused(result, Code::Internal, "missing transaction");
+        assert_not_allowed(result, &trade.seller, state);
         let result = trade.seller.sign_custom_payout_tx(15_000).await;
-        assert_refused(result, Code::Internal, "illegal state transition");
-        // The message of this error depends on data that the refused call above left in the
-        // trade, so only the code is checked.
-        let result = trade
-            .seller
-            .custom_close_trade(&custom_payout_psbt.psbt)
-            .await;
-        assert_refused(result, Code::Internal, "");
-        assert_eq!(trade.seller.state(), TradeState::SellerReadyToRelease);
+        assert_not_allowed(result, &trade.seller, state);
 
         trade.seller_closes_by_force().await;
         assert_swap_tx(&trade, &trade.swap_tx());
@@ -1641,44 +1751,46 @@ async fn c4_seller_gets_no_swap_tx_before_payment_started() {
             (Stage::SignaturesExchanged, TradeState::Init),
             (Stage::DepositSigned, TradeState::Deposit),
             (Stage::BuyerStartedPayment, TradeState::Deposit),
+            // With the buyer's signature, the seller must still confirm the payment first.
+            (Stage::PaymentStarted, TradeState::BuyerReadyToRelease),
         ] {
             let mut trade = Trade::at(trade_type, stage).await;
-            let seller = &mut trade.seller;
-
-            let result = seller.close_trade_without_arguments().await;
-            assert_refused(result, Code::Internal, "missing transaction");
-            // A signature of the right form that is not the buyer's signature (G5).
-            let result = seller.sign_swap_tx(&random_scalar()).await;
-            assert_refused(result, Code::Internal, "signature is invalid");
-            let result = seller.sign_swap_tx(&[]).await;
-            assert_refused(result, Code::InvalidArgument, "could not decode");
-            assert_eq!(seller.state(), state, "{stage:?}");
+            let result = trade.seller.close_trade_without_arguments().await;
+            assert_not_allowed(result, &trade.seller, state);
         }
 
-        // With the buyer's signature, the seller must still confirm the payment first.
-        let mut trade = Trade::at(trade_type, Stage::PaymentStarted).await;
-        let result = trade.seller.close_trade_without_arguments().await;
-        assert_refused(result, Code::Internal, "missing transaction");
-        assert_eq!(trade.seller.state(), TradeState::BuyerReadyToRelease);
+        // Before the deposit is signed, the seller takes no signature of the buyer.
+        let mut trade = Trade::at(trade_type, Stage::SignaturesExchanged).await;
+        let result = trade.seller.sign_swap_tx(&random_scalar()).await;
+        assert_not_allowed(result, &trade.seller, TradeState::Init);
+
+        // A signature of the right form that is not the buyer's signature (G5), and a signature
+        // that cannot be decoded, prove a modified client of the buyer.
+        for invalid_signature in [random_scalar(), vec![]] {
+            let mut trade = Trade::at(trade_type, Stage::BuyerStartedPayment).await;
+            let result = trade.seller.sign_swap_tx(&invalid_signature).await;
+            assert_terminated(result, &trade.seller, "");
+            assert_eq!(trade.seller.state(), TradeState::Deposit);
+        }
     }
 }
 
-/// Invalid data of the peer ends the use of the trade (D17): after an invalid partial signature
-/// for the swap transaction, the seller's service refuses the valid one too. Today this follows
-/// from the stored invalid signature, not from the terminated mark of the trade, so the second
-/// error is checked by its code only.
+/// G13: invalid data of the peer ends the use of the trade (D17). After an invalid partial
+/// signature for the swap transaction, the seller's service refuses the valid one and every
+/// further step of the cooperative close.
 #[tokio::test]
 async fn rejected_swap_tx_signature_blocks_the_trade() {
     for trade_type in TRADE_TYPES {
         let mut trade = Trade::at(trade_type, Stage::BuyerStartedPayment).await;
         let valid_signature = trade.buyers_swap_tx_signature();
+        let reason = "the buyer's partial signature for the swap transaction is invalid";
 
         let result = trade.seller.sign_swap_tx(&random_scalar()).await;
-        assert_refused(result, Code::Internal, "signature is invalid");
+        assert_terminated(result, &trade.seller, reason);
         let result = trade.seller.sign_swap_tx(&valid_signature).await;
-        assert_refused(result, Code::Internal, "");
+        assert_terminated(result, &trade.seller, reason);
         let result = trade.seller.release_payout().await;
-        assert_refused(result, Code::Internal, "");
+        assert_terminated(result, &trade.seller, reason);
         assert_eq!(trade.seller.state(), TradeState::Deposit);
     }
 }
@@ -1789,14 +1901,18 @@ async fn d3_custom_payout_with_one_signature() {
             // The side that did not sign cannot finalise the PSBT of the signer.
             let other = trade.party_mut(other_side);
             let result = other.custom_close_trade(&custom_payout_psbt.psbt).await;
-            assert_refused(result, Code::Internal, "missing transaction");
-            assert_eq!(other.state(), TradeState::Deposit);
+            assert_not_allowed(result, other, TradeState::Deposit);
 
             // The signer cannot finalise a PSBT that lacks the signature of the peer.
             let signer = trade.party_mut(signer_side);
             let result = signer.custom_close_trade(&custom_payout_psbt.psbt).await;
-            assert_refused(result, Code::Internal, "missing signature");
+            assert_refused(
+                result,
+                Code::FailedPrecondition,
+                "does not contain its signatures",
+            );
             assert_eq!(signer.state(), TradeState::CustomPayoutSigned);
+            assert!(!signer.is_terminated());
         }
     }
 }
@@ -1821,7 +1937,7 @@ async fn d5_custom_payout_with_changed_peer_psbt() {
         for (side, peers_psbt) in [(Side::Buyer, &psbts[1]), (Side::Seller, &psbts[0])] {
             let party = trade.party_mut(side);
             let result = party.custom_close_trade(peers_psbt).await;
-            assert_refused(result, Code::Internal, "different unsigned transaction");
+            assert_refused(result, Code::FailedPrecondition, "is for the transaction");
             assert_eq!(party.state(), TradeState::CustomPayoutSigned);
         }
 
@@ -1845,7 +1961,7 @@ async fn d5_custom_payout_with_changed_peer_psbt() {
             let party = trade.party_mut(side);
             for changed_psbt in [changed_amounts, changed_output] {
                 let result = party.custom_close_trade(&changed_psbt.serialize()).await;
-                assert_refused(result, Code::Internal, "different unsigned transaction");
+                assert_refused(result, Code::FailedPrecondition, "is for the transaction");
                 assert_eq!(party.state(), TradeState::CustomPayoutSigned);
             }
         }
@@ -1857,60 +1973,52 @@ async fn d5_custom_payout_with_changed_peer_psbt() {
 
 // ---- G. Invalid peer messages ----
 
-/// G1 and G4, encoding part: key shares and nonces that are no valid points are rejected by the
-/// conversion of the request. The remaining cases of G1 and G4 are unit tests of the engine.
+/// G1 and G4, encoding part: key shares and nonces that are no valid points cannot be decoded.
+/// An unmodified client never sends such a field, so the trade is terminated (D17). The remaining
+/// cases of G1 and G4 are unit tests of the engine.
 #[tokio::test]
 async fn g1_g4_invalid_encodings_are_rejected() {
-    let mut trade = Trade::new(TradeType::TakerIsBuyer).await;
-    trade.init_trades().await;
+    // 33 bytes with a valid prefix, but the X coordinate is not smaller than the field size.
+    let no_point = [&[2][..], &[0xff; 32]].concat();
+    type Change = fn(&mut PubKeySharesResponse, &[u8]);
+    let changes: [Change; 3] = [
+        |key_shares, no_point| key_shares.buyer_output_pub_key_share = no_point.to_vec(),
+        |key_shares, no_point| key_shares.seller_output_pub_key_share = no_point[..32].to_vec(),
+        |key_shares, _| key_shares.multisig_script_key = vec![0xff; 32],
+    ];
     for (side, peer_side) in [(Side::Buyer, Side::Seller), (Side::Seller, Side::Buyer)] {
-        let peers_key_shares = trade
-            .party(peer_side)
-            .key_shares
-            .clone()
-            .expect("message A/B");
-        let party = trade.party_mut(side);
-        // 33 bytes with a valid prefix, but the X coordinate is not smaller than the field size.
-        let no_point = [&[2][..], &[0xff; 32]].concat();
-        for invalid_key_shares in [
-            PubKeySharesResponse {
-                buyer_output_pub_key_share: no_point.clone(),
-                ..peers_key_shares.clone()
-            },
-            PubKeySharesResponse {
-                seller_output_pub_key_share: no_point[..32].to_vec(),
-                ..peers_key_shares.clone()
-            },
-            PubKeySharesResponse {
-                multisig_script_key: vec![0xff; 32],
-                ..peers_key_shares.clone()
-            },
-        ] {
+        for change in changes {
+            let mut trade = Trade::new(TradeType::TakerIsBuyer).await;
+            trade.init_trades().await;
+            let mut invalid_key_shares = trade
+                .party(peer_side)
+                .key_shares
+                .clone()
+                .expect("message A/B");
+            change(&mut invalid_key_shares, &no_point);
+
+            let party = trade.party_mut(side);
             let result = party.get_nonce_shares(&invalid_key_shares).await;
-            assert_refused(result, Code::InvalidArgument, "could not decode");
+            assert_terminated(result, party, "could not decode");
             assert_eq!(party.state(), TradeState::Init);
         }
-    }
 
-    // The nonce shares are checked with a new trade, because invalid data of the peer ends the
-    // use of a trade (D17).
-    let mut trade = Trade::new(TradeType::TakerIsBuyer).await;
-    trade.init_trades().await;
-    trade.exchange_nonce_shares().await;
-    for (side, peer_side) in [(Side::Buyer, Side::Seller), (Side::Seller, Side::Buyer)] {
+        let mut trade = Trade::new(TradeType::TakerIsBuyer).await;
+        trade.init_trades().await;
+        trade.exchange_nonce_shares().await;
         let peers_nonce_shares = trade
             .party(peer_side)
             .nonce_shares
             .clone()
             .expect("message B/C");
-        let party = trade.party_mut(side);
         // 66 bytes are the right length for a nonce, but they are no pair of points.
         let invalid_nonce_shares = NonceSharesMessage {
             buyers_warning_tx_buyer_input_nonce_share: vec![0xff; 66],
             ..peers_nonce_shares
         };
+        let party = trade.party_mut(side);
         let result = party.get_partial_signatures(&invalid_nonce_shares).await;
-        assert_refused(result, Code::InvalidArgument, "could not decode pub nonce");
+        assert_terminated(result, party, "could not decode pub nonce");
         assert_eq!(party.state(), TradeState::Init);
     }
 }
@@ -1942,9 +2050,9 @@ async fn g4_repeated_nonce_is_rejected() {
 
                 let party = trade.party_mut(side);
                 let result = party.get_partial_signatures(&repeated_nonce_shares).await;
-                assert_refused(result, Code::Internal, "used for more than one signature");
+                assert_terminated(result, party, "the peer's nonce share for the");
                 let result = party.get_partial_signatures(&peers_nonce_shares).await;
-                assert_refused(result, Code::Internal, "trade was terminated");
+                assert_terminated(result, party, "the peer's nonce share for the");
                 assert_eq!(party.state(), TradeState::Init);
             }
         }
@@ -1952,52 +2060,48 @@ async fn g4_repeated_nonce_is_rejected() {
 }
 
 /// G10: a private key share that does not match the public key share of the peer is rejected, and
-/// the state does not change.
+/// the state does not change. An unmodified client never sends such a key share, so the trade is
+/// terminated (D17).
 #[tokio::test]
 async fn g10_wrong_key_share_at_close() {
+    let mismatch = "does not match its public key share";
     for trade_type in TRADE_TYPES {
-        // The buyer receives a wrong message F.
-        let mut trade = Trade::at(trade_type, Stage::SellerReleased).await;
-        let result = trade
-            .buyer
-            .close_trade_with_key_share(&random_scalar())
-            .await;
-        assert_refused(result, Code::Internal, "public-private key mismatch");
-        // A zero scalar is no valid private key share.
-        let result = trade.buyer.close_trade_with_key_share(&[0; 32]).await;
-        assert_refused(
-            result,
-            Code::InvalidArgument,
-            "could not decode nonzero scalar",
-        );
-        assert_eq!(trade.buyer.state(), TradeState::BuyerReadyToRelease);
+        // The buyer receives a wrong message F: another key share, or a zero scalar, which is no
+        // valid key share.
+        for (wrong_key_share, reason) in [
+            (random_scalar(), mismatch),
+            (vec![0; 32], "could not decode nonzero scalar"),
+        ] {
+            let mut trade = Trade::at(trade_type, Stage::SellerReleased).await;
+            let result = trade
+                .buyer
+                .close_trade_with_key_share(&wrong_key_share)
+                .await;
+            assert_terminated(result, &trade.buyer, reason);
+            assert_eq!(trade.buyer.state(), TradeState::BuyerReadyToRelease);
+        }
 
-        // The seller receives a wrong message G.
-        let mut trade = Trade::at(trade_type, Stage::BuyerClosedCooperatively).await;
-        let result = trade
-            .seller
-            .close_trade_with_key_share(&random_scalar())
-            .await;
-        assert_refused(result, Code::Internal, "public-private key mismatch");
-        // The seller's own key share is not the key share of the buyer.
-        let own_key_share = trade.sellers_key_share();
-        let result = trade
-            .seller
-            .close_trade_with_key_share(&own_key_share)
-            .await;
-        assert_refused(result, Code::Internal, "public-private key mismatch");
-        assert_eq!(trade.seller.state(), TradeState::SellerReadyToRelease);
+        // The seller receives a wrong message G: another key share, or his own key share.
+        for use_own_key_share in [false, true] {
+            let mut trade = Trade::at(trade_type, Stage::BuyerClosedCooperatively).await;
+            let wrong_key_share = if use_own_key_share {
+                trade.sellers_key_share()
+            } else {
+                random_scalar()
+            };
+            let result = trade
+                .seller
+                .close_trade_with_key_share(&wrong_key_share)
+                .await;
+            assert_terminated(result, &trade.seller, mismatch);
+            assert_eq!(trade.seller.state(), TradeState::SellerReadyToRelease);
+        }
     }
 }
 
 /// G13: data of the peer that an unmodified client never produces terminates the trade (D17). The
-/// valid data is refused afterwards.
-///
-/// The service terminates a trade only for repeated nonces so far
-/// (`g4_repeated_nonce_is_rejected`). In the cases of this test it accepts the valid data after
-/// the invalid data.
+/// valid data is refused afterwards, and the state does not change.
 #[tokio::test]
-#[ignore = "D17: only the nonce check terminates the trade so far"]
 async fn g13_invalid_peer_data_terminates_the_trade() {
     for trade_type in TRADE_TYPES {
         // A public key share that is no point of the curve.
@@ -2009,23 +2113,39 @@ async fn g13_invalid_peer_data_terminates_the_trade() {
             ..sellers_key_shares.clone()
         };
         let result = trade.buyer.get_nonce_shares(&invalid_key_shares).await;
-        assert_refused(result, Code::InvalidArgument, "could not decode");
+        assert_terminated(result, &trade.buyer, "could not decode");
         let result = trade.buyer.get_nonce_shares(&sellers_key_shares).await;
-        assert!(result.is_err(), "valid key shares after invalid ones");
+        assert_terminated(result, &trade.buyer, "could not decode");
+        assert_eq!(trade.buyer.state(), TradeState::Init);
+
+        // An invalid partial signature during the setup.
+        let mut trade = Trade::at(trade_type, Stage::SignaturesExchanged).await;
+        let sellers_signatures = trade.seller.partial_signatures.clone().expect("C/D");
+        let invalid_signatures = PartialSignaturesMessage {
+            peers_redirect_tx_input_partial_signature: random_scalar(),
+            ..sellers_signatures.clone()
+        };
+        let reason = "a partial signature of the peer is not valid";
+        let result = trade.buyer.sign_deposit_tx(&invalid_signatures).await;
+        assert_terminated(result, &trade.buyer, reason);
+        let result = trade.buyer.sign_deposit_tx(&sellers_signatures).await;
+        assert_terminated(result, &trade.buyer, reason);
+        assert_eq!(trade.buyer.state(), TradeState::Init);
 
         // A wrong private key share in message F.
+        let reason = "does not match its public key share";
         let mut trade = Trade::at(trade_type, Stage::SellerReleased).await;
         let sellers_key_share = trade.sellers_key_share();
         let result = trade
             .buyer
             .close_trade_with_key_share(&random_scalar())
             .await;
-        assert_refused(result, Code::Internal, "public-private key mismatch");
+        assert_terminated(result, &trade.buyer, reason);
         let result = trade
             .buyer
             .close_trade_with_key_share(&sellers_key_share)
             .await;
-        assert!(result.is_err(), "valid message F after an invalid one");
+        assert_terminated(result, &trade.buyer, reason);
         assert_eq!(trade.buyer.state(), TradeState::BuyerReadyToRelease);
 
         // A wrong private key share in message G.
@@ -2035,22 +2155,32 @@ async fn g13_invalid_peer_data_terminates_the_trade() {
             .seller
             .close_trade_with_key_share(&random_scalar())
             .await;
-        assert_refused(result, Code::Internal, "public-private key mismatch");
+        assert_terminated(result, &trade.seller, reason);
         let result = trade
             .seller
             .close_trade_with_key_share(&buyers_key_share)
             .await;
-        assert!(result.is_err(), "valid message G after an invalid one");
+        assert_terminated(result, &trade.seller, reason);
         assert_eq!(trade.seller.state(), TradeState::SellerReadyToRelease);
 
         // A custom payout PSBT of the peer that cannot be decoded.
         let mut trade = Trade::at(trade_type, Stage::CustomPayoutSigned).await;
         let buyers_psbt = trade.buyer.custom_payout_psbt.clone().expect("signed").psbt;
         let result = trade.seller.custom_close_trade(b"no PSBT").await;
-        assert_refused(result, Code::InvalidArgument, "could not decode PSBT");
+        assert_terminated(result, &trade.seller, "could not decode PSBT");
         let result = trade.seller.custom_close_trade(&buyers_psbt).await;
-        assert!(result.is_err(), "valid PSBT after an invalid one");
+        assert_terminated(result, &trade.seller, "could not decode PSBT");
         assert_eq!(trade.seller.state(), TradeState::CustomPayoutSigned);
+
+        // A second message of the peer with other data than the first one (G12).
+        let mut trade = Trade::at(trade_type, Stage::PaymentStarted).await;
+        let result = trade.seller.sign_swap_tx(&random_scalar()).await;
+        assert_terminated(
+            result,
+            &trade.seller,
+            "differs from the one that he sent before",
+        );
+        assert_eq!(trade.seller.state(), TradeState::BuyerReadyToRelease);
     }
 }
 
@@ -2063,13 +2193,17 @@ async fn g15_refused_request_can_be_repeated() {
 
         // Requests that come too early, or from the wrong role.
         let result = trade.seller.release_payout().await;
-        assert_refused(result, Code::Internal, "missing aggregated signature");
+        assert_not_allowed(result, &trade.seller, TradeState::Deposit);
         let result = trade.seller.close_trade_without_arguments().await;
-        assert_refused(result, Code::Internal, "missing transaction");
+        assert_not_allowed(result, &trade.seller, TradeState::Deposit);
         let result = trade.seller.start_payment().await;
         assert_refused(result, Code::FailedPrecondition, "only available for buyer");
         let result = trade.buyer.close_trade_without_arguments().await;
-        assert_refused(result, Code::Internal, "missing private key");
+        assert_refused(
+            result,
+            Code::FailedPrecondition,
+            "only available for seller",
+        );
         let result = trade.buyer.release_payout().await;
         assert_refused(
             result,
@@ -2077,6 +2211,23 @@ async fn g15_refused_request_can_be_repeated() {
             "only available for seller",
         );
         trade.assert_states(TradeState::Deposit, TradeState::Deposit);
+
+        // Invalid data that the caller itself supplied: a fee rate that makes an output dust.
+        let request = CustomPayoutPsbtRequest {
+            trade_id: trade.buyer.trade_id.clone(),
+            sellers_payout_amount_excluding_fee: 100,
+            fee_rate: CUSTOM_PAYOUT_TX_FEE_RATE,
+        };
+        assert!(
+            trade
+                .buyer
+                .client
+                .sign_custom_payout_tx(request)
+                .await
+                .is_err()
+        );
+        trade.assert_states(TradeState::Deposit, TradeState::Deposit);
+        assert!(!trade.buyer.is_terminated());
 
         // Requests that are repeated with the same data. The response of the publisher of the
         // deposit now also contains the signatures of the peer, so only the transactions are
@@ -2160,7 +2311,11 @@ fn expected_outcome(side: Side, stage: Stage, call: Call) -> Outcome {
             _ => Accepted,
         },
         (Call::StartPayment, Side::Buyer) => match stage {
-            Stage::SignaturesExchanged => Refused,
+            // A buyer who signed a custom payout directly after the deposit does not start the
+            // payment any more.
+            Stage::SignaturesExchanged
+            | Stage::CustomPayoutSigned
+            | Stage::ClosedByCustomPayout => Refused,
             Stage::DepositSigned => MovedTo(BuyerReadyToRelease),
             _ => Accepted,
         },
@@ -2305,7 +2460,7 @@ async fn k1_every_call_in_every_stage() {
 /// K1 for `InitTrade`: an unknown role is rejected and no trade is stored.
 #[tokio::test]
 async fn k1_init_trade_with_unknown_role() {
-    let mut client = start_service().await;
+    let (mut client, trades) = start_service(true).await;
     let trade_id = format!("unknown-role-{}", next_trade_number());
     let request = PubKeySharesRequest {
         trade_id: trade_id.clone(),
@@ -2316,7 +2471,7 @@ async fn k1_init_trade_with_unknown_role() {
         Code::OutOfRange,
         "unknown enum value: 4",
     );
-    assert_eq!(trade_state(&trade_id), None);
+    assert!(!trades.contains_trade(&trade_id));
 }
 
 /// K2, first part: every call for an unknown trade ID is rejected and stores no trade.
@@ -2362,7 +2517,7 @@ async fn k2_unknown_trade_id() {
         &message,
     );
 
-    assert_eq!(trade_state(&trade_id), None);
+    assert!(!party.trades.contains_trade(&trade_id));
 }
 
 /// K2, second part: a second `InitTrade` with the ID of an open trade is rejected, and the trade
@@ -2473,7 +2628,11 @@ async fn k3_buyer_only_close_by_seller() {
             };
             let state = trade.seller.state();
             let result = trade.seller.close_trade_with_swap_tx(&swap_tx).await;
-            assert_refused(result, Code::Internal, "missing private key");
+            assert_refused(
+                result,
+                Code::FailedPrecondition,
+                "operation only available for buyer",
+            );
             assert_eq!(trade.seller.state(), state, "{stage:?}");
         }
     }

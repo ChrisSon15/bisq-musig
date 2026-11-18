@@ -6,7 +6,7 @@ use bdk_wallet::bitcoin::{ScriptBuf, TapNodeHash, XOnlyPublicKey, relative, scri
 use bdk_wallet::miniscript::descriptor::TapTree;
 use bdk_wallet::miniscript::{DefiniteDescriptorKey, Descriptor, Miniscript, Tap};
 
-use crate::transaction::{NetworkParams, Result};
+use crate::transaction::Result;
 
 pub fn deposit_payout_merkle_root(
     buyer_pub_key: &XOnlyPublicKey,
@@ -17,9 +17,9 @@ pub fn deposit_payout_merkle_root(
 
 pub fn warning_escrow_merkle_root(
     claim_pub_key: &XOnlyPublicKey,
-    network: impl NetworkParams + Copy,
+    claim_lock_time: relative::LockTime,
 ) -> Result<TapNodeHash> {
-    single_path_merkle_root(claim_script(claim_pub_key, network.claim_lock_time()))
+    single_path_merkle_root(claim_script(claim_pub_key, claim_lock_time))
 }
 
 pub fn deposit_payout_descriptor(
@@ -43,9 +43,9 @@ pub fn deposit_payout_tap_tree(
 /// The tap tree of a Warning Tx escrow output; see [`deposit_payout_tap_tree`].
 pub fn warning_escrow_tap_tree(
     claim_pub_key: &XOnlyPublicKey,
-    network: impl NetworkParams + Copy,
+    claim_lock_time: relative::LockTime,
 ) -> Result<TapTree<XOnlyPublicKey>> {
-    single_path_tap_tree(&claim_script(claim_pub_key, network.claim_lock_time()))
+    single_path_tap_tree(&claim_script(claim_pub_key, claim_lock_time))
 }
 
 fn single_path_tap_tree(script: &ScriptBuf) -> Result<TapTree<XOnlyPublicKey>> {
@@ -145,7 +145,7 @@ mod tests {
         let seller_pub_key = &"0000000000000000000000000000000000000000000000000000000000000003"
             .parse()
             .unwrap();
-        let network = bdk_wallet::bitcoin::Network::Regtest;
+        let lock_time = relative::LockTime::from_height(5);
 
         // Deposit payout: same leaf as the descriptor, same merkle root, same SPK
         let tree = deposit_payout_tap_tree(buyer_pub_key, seller_pub_key).unwrap();
@@ -159,11 +159,11 @@ mod tests {
         assert_eq!(tr.script_pubkey(), desc.script_pubkey());
 
         // Warning escrow: same merkle root
-        let tree = warning_escrow_tap_tree(buyer_pub_key, network).unwrap();
+        let tree = warning_escrow_tap_tree(buyer_pub_key, lock_time).unwrap();
         let tr = Tr::new(*internal_key, Some(tree)).unwrap();
         assert_eq!(
             tr.spend_info().merkle_root(),
-            Some(warning_escrow_merkle_root(buyer_pub_key, network).unwrap())
+            Some(warning_escrow_merkle_root(buyer_pub_key, lock_time).unwrap())
         );
     }
 

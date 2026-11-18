@@ -33,6 +33,8 @@ clap = { workspace = true }
 tonic-prost-build = "0.14.6"
 
 [dev-dependencies]
+# The service tests use the mock wallets of the protocol crate.
+protocol = { workspace = true, features = ["test-utils"] }
 rand = { workspace = true }
 tempfile = { workspace = true }
 bdk_electrum = { workspace = true }
