@@ -43,7 +43,7 @@ impl musig_server::Musig for MusigImpl {
                 multisig_script_key: my_key_shares.multisig_script.serialize().into(),
                 current_block_height: 900_000,
             };
-            TRADE_MODELS.add_trade_model(trade_model);
+            TRADE_MODELS.add_trade_model(trade_model)?;
 
             Ok(response)
         })

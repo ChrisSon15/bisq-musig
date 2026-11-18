@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use bdk_wallet::bitcoin::address::{NetworkChecked, NetworkUnchecked, NetworkValidation};
@@ -23,16 +24,24 @@ use wallet::protocol_wallet_api::ProtocolWalletApi;
 use crate::storage::{ByRef, ByVal, Storage};
 
 pub trait TradeModelStore {
-    fn add_trade_model(&self, trade_model: TradeModel);
+    /// Stores a new trade model. A trade ID identifies one trade for the whole lifetime of the
+    /// store, so a trade model with the ID of a stored trade is rejected, also if that trade is
+    /// closed. The stored trade model is not changed.
+    fn add_trade_model(&self, trade_model: TradeModel) -> Result<()>;
     fn get_trade_model(&self, trade_id: &str) -> Option<Arc<Mutex<TradeModel>>>;
 }
 
 type TradeModelMemoryStore = Mutex<BTreeMap<String, Arc<Mutex<TradeModel>>>>;
 
 impl TradeModelStore for TradeModelMemoryStore {
-    fn add_trade_model(&self, trade_model: TradeModel) {
-        // TODO: Maybe use try_insert (or similar), to disallow overwriting a trade model with the same ID.
-        self.lock().unwrap().insert(trade_model.trade_id.clone(), Arc::new(Mutex::new(trade_model)));
+    fn add_trade_model(&self, trade_model: TradeModel) -> Result<()> {
+        match self.lock().unwrap().entry(trade_model.trade_id.clone()) {
+            Entry::Occupied(entry) => Err(ProtocolErrorKind::DuplicateTradeId(entry.key().clone())),
+            Entry::Vacant(entry) => {
+                entry.insert(Arc::new(Mutex::new(trade_model)));
+                Ok(())
+            }
+        }
     }
 
     fn get_trade_model(&self, trade_id: &str) -> Option<Arc<Mutex<TradeModel>>> {
@@ -911,6 +920,8 @@ pub enum ProtocolErrorKind {
     MissingScriptKey,
     #[error("access denied")]
     AccessDenied,
+    #[error("trade with id {0} already exists")]
+    DuplicateTradeId(String),
     #[error("illegal state transition for {role:?}: {old_state} -> {new_state}")]
     IllegalStateTransition {
         role: Role,

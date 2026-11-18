@@ -257,6 +257,9 @@ impl From<ExchangedSigs<'_, ByRef>> for PartialSignaturesMessage {
 
 impl From<ProtocolErrorKind> for Status {
     fn from(value: ProtocolErrorKind) -> Self {
-        Self::internal(value.to_string())
+        match value {
+            ProtocolErrorKind::DuplicateTradeId(_) => Self::already_exists(value.to_string()),
+            _ => Self::internal(value.to_string()),
+        }
     }
 }

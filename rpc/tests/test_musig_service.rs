@@ -2225,7 +2225,6 @@ async fn k2_unknown_trade_id() {
 /// K2, second part: a second `InitTrade` with the ID of an open trade is rejected, and the trade
 /// continues with the key shares of the first call.
 #[tokio::test]
-#[ignore = "F2: InitTrade with an existing trade ID replaces the stored trade"]
 async fn k2_duplicate_init_trade() {
     for trade_type in TRADE_TYPES {
         // Directly after the first call.
@@ -2233,7 +2232,7 @@ async fn k2_duplicate_init_trade() {
         trade.init_trades().await;
         for side in SIDES {
             let result = trade.party_mut(side).init_trade().await;
-            assert_refused(result, Code::AlreadyExists, "trade");
+            assert_refused(result, Code::AlreadyExists, "already exists");
         }
         // The setup needs the key shares of the first calls, so it proves that they are kept.
         trade.exchange_nonce_shares().await;
@@ -2243,7 +2242,11 @@ async fn k2_duplicate_init_trade() {
         // After the deposit is signed, also with the other role.
         for side in SIDES {
             let party = trade.party_mut(side);
-            assert_refused(party.init_trade().await, Code::AlreadyExists, "trade");
+            assert_refused(
+                party.init_trade().await,
+                Code::AlreadyExists,
+                "already exists",
+            );
             let request = PubKeySharesRequest {
                 trade_id: party.trade_id.clone(),
                 my_role: if party.is_buyer() {
@@ -2270,7 +2273,6 @@ async fn k2_duplicate_init_trade() {
 
 /// K2, third part: `InitTrade` with the ID of a closed trade is rejected (N6).
 #[tokio::test]
-#[ignore = "F2: InitTrade with an existing trade ID replaces the stored trade"]
 async fn k2_init_trade_with_id_of_closed_trade() {
     for stage in [
         Stage::ClosedCooperatively,
@@ -2281,7 +2283,11 @@ async fn k2_init_trade_with_id_of_closed_trade() {
         for side in SIDES {
             let party = trade.party_mut(side);
             let state = party.state();
-            assert_refused(party.init_trade().await, Code::AlreadyExists, "trade");
+            assert_refused(
+                party.init_trade().await,
+                Code::AlreadyExists,
+                "already exists",
+            );
             assert_eq!(party.state(), state, "{stage:?}");
         }
     }
