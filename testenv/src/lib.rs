@@ -431,6 +431,41 @@ impl TestEnv {
         Ok(hash)
     }
 
+    /// The hash of the block at `height` in the chain with the most work.
+    pub fn block_hash(&self, height: u64) -> Result<BlockHash> {
+        Ok(self.bitcoin_core_rpc_client()?.get_block_hash(height)?)
+    }
+
+    /// Replaces the last `depth` blocks of the chain by `new_blocks` new blocks. The node puts
+    /// the transactions of the replaced blocks back into its mempool, so the new blocks contain
+    /// them again. `new_blocks` must be larger than `depth`, so that the new chain has more work.
+    pub fn reorganize(&mut self, depth: u64, new_blocks: usize) -> Result<Vec<BlockHash>> {
+        anyhow::ensure!(
+            depth > 0 && new_blocks as u64 > depth,
+            "the new chain must be longer than the replaced blocks"
+        );
+        let first_replaced = self.block_hash(self.block_count()? + 1 - depth)?;
+        self.bitcoin_core_rpc_client()?
+            .invalidate_block(&first_replaced)?;
+        self.mine_blocks(new_blocks)
+    }
+
+    /// Switches the peer-to-peer network of the node off or on. A node with the network switched
+    /// off closes all connections and accepts no new one: it is not reachable for its peers. Its
+    /// RPC interface keeps working.
+    pub fn set_network_active(&self, active: bool) -> Result<()> {
+        self.bitcoin_core_rpc_client()?.set_network_active(active)?;
+        Ok(())
+    }
+
+    /// Whether the mempool of the node contains the transaction.
+    pub fn mempool_contains(&self, txid: &Txid) -> Result<bool> {
+        Ok(self
+            .bitcoin_core_rpc_client()?
+            .get_raw_mempool()?
+            .contains(txid))
+    }
+
     /// The work directory of bitcoind
     pub fn workdir(&self) -> std::path::PathBuf {
         self.bitcoind.workdir()
@@ -497,6 +532,31 @@ mod tests {
         rpc.ping()?;
         assert_eq!(rpc.get_block_count()?, 1);
 
+        Ok(())
+    }
+
+    /// A reorganisation replaces the last blocks, and the transaction of a replaced block is
+    /// confirmed again in a new block.
+    #[test]
+    fn test_reorganize_and_mempool() -> Result<()> {
+        let mut env = TestEnv::new()?;
+        env.mine_blocks(101)?;
+        let txid = env.fund_address(&env.new_address()?, Amount::from_sat(10_000))?;
+        assert!(env.mempool_contains(&txid)?);
+        env.mine_blocks(2)?;
+        assert!(!env.mempool_contains(&txid)?);
+        let height = env.block_count()?;
+        let replaced = [env.block_hash(height - 1)?, env.block_hash(height)?];
+
+        let new_blocks = env.reorganize(2, 3)?;
+        assert_eq!(env.block_count()?, height + 1);
+        assert_eq!(env.block_hash(height - 1)?, new_blocks[0]);
+        assert!(!new_blocks.contains(&replaced[0]) && !new_blocks.contains(&replaced[1]));
+        assert!(!env.mempool_contains(&txid)?, "confirmed in a new block");
+        assert!(env.reorganize(2, 2).is_err());
+
+        env.set_network_active(false)?;
+        env.set_network_active(true)?;
         Ok(())
     }
 

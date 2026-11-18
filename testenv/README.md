@@ -151,11 +151,16 @@ The main environment manager that handles the bitcoind instance.
 - `fund_from_prv_key(key, amount)` - Send BTC to the P2TR address of a private key
 - `broadcast(tx)` - Send a transaction to the node through its RPC interface; an error contains the reject reason
 - `new_address()` - Generate new test address
+- `reorganize(depth, new_blocks)` - Replace the last `depth` blocks by `new_blocks` new blocks
+- `set_network_active(active)` - Switch the peer-to-peer network of the node off or on, to make the node unreachable
+  for its peers
+- `mempool_contains(txid)` - Whether the mempool of the node contains a transaction
 
 #### Information
 
 - `block_count()` - Get current blockchain height
 - `best_block_hash()` - Get current tip block hash
+- `block_hash(height)` - Get the hash of the block at a height
 - `genesis_hash()` - Get genesis block hash
 
 ### Utility Methods
