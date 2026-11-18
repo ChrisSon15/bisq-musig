@@ -67,6 +67,11 @@ const WALLET_OPEN_POLL_PERIOD: Duration = Duration::from_millis(500);
 /// Fee rate used when the client doesn't specify one. 2 sat/vB == 500 sat/kwu.
 const DEFAULT_FEE_RATE: FeeRate = FeeRate::from_sat_per_kwu(500);
 
+/// The pause before a failed wallet sync is tried again. It doubles with every failure in a row.
+const FIRST_SYNC_RETRY_DELAY: Duration = Duration::from_millis(500);
+/// The longest pause between two attempts of a wallet sync.
+const MAX_SYNC_RETRY_DELAY: Duration = Duration::from_secs(60);
+
 /// The number of known blocks below the chain tip of the wallet at which a chain client starts.
 const CHAIN_START_DEPTH: usize = 10;
 
@@ -340,8 +345,12 @@ impl<S: ChainDataSource + Send + Sync + 'static> BMPWalletServiceImpl<S> {
     /// The wallet itself is opened by the `OpenOrCreateWallet` RPC, so syncing (and with it the
     /// ready flag) waits until that has happened.
     ///
+    /// A sync that fails does not end the loop: the service tries again after a pause that
+    /// doubles with every failure in a row, up to [`MAX_SYNC_RETRY_DELAY`]. A sync fails for
+    /// example while no peer is reachable.
+    ///
     /// # Errors
-    /// Will return `Err` if the initial or any subsequent sync fails.
+    /// Never, at present. The result type is kept for callers that handle an end of the loop.
     pub async fn connect(&self) -> WalletResult<Never> {
         let Some(chain_data_source) = self.chain_data_source.as_ref() else {
             info!("No chain data source configured; wallet will not sync.");
@@ -351,8 +360,17 @@ impl<S: ChainDataSource + Send + Sync + 'static> BMPWalletServiceImpl<S> {
         };
 
         info!("Waiting for the wallet to be opened, to perform the initial sync...");
-        while !self.sync_once(chain_data_source).await? {
-            time::sleep(WALLET_OPEN_POLL_PERIOD).await;
+        let mut retry_delay = FIRST_SYNC_RETRY_DELAY;
+        loop {
+            match self.sync_once(chain_data_source).await {
+                Ok(true) => break,
+                Ok(false) => time::sleep(WALLET_OPEN_POLL_PERIOD).await,
+                Err(error) => {
+                    warn!(%error, ?retry_delay, "The initial wallet sync failed. Trying again.");
+                    time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(MAX_SYNC_RETRY_DELAY);
+                }
+            }
         }
         self.ready.store(true, Ordering::Release);
         let total = self
@@ -367,9 +385,17 @@ impl<S: ChainDataSource + Send + Sync + 'static> BMPWalletServiceImpl<S> {
         let mut interval = time::interval(self.poll_period);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         interval.tick().await;
+        let mut retry_delay = FIRST_SYNC_RETRY_DELAY;
         loop {
             interval.tick().await;
-            self.sync_once(chain_data_source).await?;
+            match self.sync_once(chain_data_source).await {
+                Ok(_) => retry_delay = FIRST_SYNC_RETRY_DELAY,
+                Err(error) => {
+                    warn!(%error, ?retry_delay, "The wallet sync failed. Trying again.");
+                    time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(MAX_SYNC_RETRY_DELAY);
+                }
+            }
         }
     }
 
@@ -1046,6 +1072,88 @@ mod tests {
         ) -> Result<(), ChainDataSourceError> {
             Ok(())
         }
+    }
+
+    /// A `ChainDataSource` whose first syncs fail.
+    struct FailingChainDataSource {
+        failures_left: std::sync::atomic::AtomicU32,
+        syncs: std::sync::atomic::AtomicU32,
+    }
+
+    impl ChainDataSource for FailingChainDataSource {
+        const RECOVERY_HEIGHT: usize = 0;
+        const BATCH_SIZE: usize = 1;
+        const STOP_GAP: usize = 1;
+
+        #[expect(
+            clippy::unused_async_trait_impl,
+            reason = "the ChainDataSource trait requires an async method"
+        )]
+        async fn sync(
+            &self,
+            _persister: Vec<&mut PersistedWallet<impl wallet::persisted::BMPWalletPersister>>,
+        ) -> Result<(), ChainDataSourceError> {
+            self.syncs.fetch_add(1, Ordering::SeqCst);
+            let failed = self
+                .failures_left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok();
+            if failed {
+                return Err(ChainDataSourceError::MissingWallet { index: 0 });
+            }
+            Ok(())
+        }
+    }
+
+    /// J8 (F18): a sync that fails does not end the sync loop. The service tries again, becomes
+    /// ready when a sync succeeds, and keeps syncing after a later failure.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sync_loop_continues_after_errors() {
+        let dir = tempdir().unwrap();
+        let source = FailingChainDataSource {
+            failures_left: 2.into(),
+            syncs: 0.into(),
+        };
+        let service = Arc::new(
+            BMPWalletServiceImpl::new(dir.path(), Network::Regtest)
+                .with_chain_data_source(source)
+                .with_poll_period(Duration::from_millis(50)),
+        );
+        service.open_or_create_wallet(PASSWORD).await.unwrap();
+        let connection = Arc::clone(&service).spawn_connection();
+
+        let syncs = || {
+            service
+                .chain_data_source
+                .as_ref()
+                .unwrap()
+                .syncs
+                .load(Ordering::SeqCst)
+        };
+        // Two failed syncs with pauses of 0.5 s and 1 s, then the first success.
+        let deadline = time::Instant::now() + Duration::from_secs(20);
+        while !service.is_ready() {
+            assert!(time::Instant::now() < deadline, "not ready in time");
+            time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(syncs() >= 3, "two failed syncs and one success");
+
+        // A later failure does not end the loop either.
+        service
+            .chain_data_source
+            .as_ref()
+            .unwrap()
+            .failures_left
+            .store(1, Ordering::SeqCst);
+        let syncs_before = syncs();
+        while syncs() < syncs_before + 3 {
+            assert!(time::Instant::now() < deadline, "the loop stopped");
+            time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!connection.is_finished());
+        connection.abort();
     }
 
     /// A broadcaster for tests that must fail before anything is broadcast.
