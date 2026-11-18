@@ -66,6 +66,11 @@ service Wallet {
     // rules (INVALID_ARGUMENT otherwise). The wallet is always password-protected: a password can
     // only be replaced, never removed.
     rpc ChangePassword (ChangePasswordRequest) returns (ChangePasswordResponse);
+    // To be called when the user ends the program. Moves the coins of all imported keys, which
+    // are payouts of closed trades, to an address of the seed wallet with one drain transaction.
+    // The transaction is stored in the wallet before it is sent. Coins that are locked for an
+    // open trade are not moved. The wallet stays open. FAILED_PRECONDITION if no wallet is open.
+    rpc Close (CloseRequest) returns (CloseResponse);
 }
 
 
@@ -185,6 +190,14 @@ message ChangePasswordRequest {
 
 message ChangePasswordResponse {
     bool success = 1;
+}
+
+message CloseRequest {
+}
+
+message CloseResponse {
+    // The ID of the drain transaction. Not set if there was nothing to move.
+    optional string drainTxId = 1;
 }
 
 // A bitcoin address.

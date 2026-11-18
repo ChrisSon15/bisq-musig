@@ -101,6 +101,8 @@ fn configure_bmp_wallet_serde(builder: tonic_prost_build::Builder) -> tonic_pros
             ".wallet.GetBalanceResponse",
             ".wallet.OpenOrCreateWalletResponse",
             ".wallet.ChangePasswordResponse",
+            ".wallet.CloseRequest",
+            ".wallet.CloseResponse",
             ".wallet.PubAddressInfo",
             ".wallet.TransactionInput",
             ".wallet.TransactionOutput",

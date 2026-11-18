@@ -15,9 +15,10 @@ use secp::Scalar;
 use tempfile::{TempDir, tempdir};
 use testenv::TestEnv;
 use wallet::bmp_wallet::*;
-use wallet::password::Password;
 use wallet::error::WalletErrorKind;
+use wallet::password::Password;
 use wallet::persisted::DBStorage;
+use wallet::protocol_wallet_api::ProtocolWalletApi as _;
 use wallet::utils::derive_key_from_password;
 
 /// A password that follows the wallet's password rules, for tests that need some password.
@@ -483,6 +484,87 @@ async fn test_drain_wallet_with_main_balance() -> anyhow::Result<()> {
 
     assert_eq!(wallet.balance(), main_wallet_balance);
 
+    Ok(())
+}
+
+/// M1, M3, M7, M9 and I8: the drain of the coins of imported keys at the close of the wallet.
+#[tokio::test]
+async fn m1_drain_imported_coins() -> anyhow::Result<()> {
+    let mut env = TestEnv::new()?;
+    let chain = env.new_testchain()?;
+    env.mine_block()?;
+    let mut wallet = BMPWallet::new(
+        env.new_temp_path().into(),
+        &test_password(),
+        Network::Regtest,
+    )?;
+    let fee_rate = FeeRate::from_sat_per_vb(10).unwrap();
+
+    // M7: nothing to drain.
+    assert!(wallet.drain_imported_coins(fee_rate)?.is_none());
+
+    let keys = [new_private_key(), new_private_key(), new_private_key()];
+    let amount = Amount::from_sat(50_000);
+    for key in &keys {
+        wallet.import_private_key(*key, None)?;
+        env.fund_from_prv_key(key, amount)?;
+    }
+    env.mine_block()?;
+    wallet.sync_all(&chain).await?;
+    assert_eq!(wallet.imported_balance().confirmed, amount * 3);
+
+    // M3: a coin that is locked for an open trade is not moved.
+    let locked_coin = wallet
+        .list_utxos()
+        .into_iter()
+        .find(|utxo| utxo.imported)
+        .map(|utxo| bdk_wallet::bitcoin::OutPoint::new(utxo.tx_id, utxo.vout))
+        .expect("an imported coin");
+    wallet.lock_utxo(locked_coin)?;
+
+    // M1: one transaction moves the other two coins to one address of the seed wallet. The
+    // wallet has stored it and counts the coins as spent before the transaction is sent.
+    let drain_tx = wallet
+        .drain_imported_coins(fee_rate)?
+        .expect("two coins to move");
+    assert_eq!(drain_tx.input.len(), 2);
+    assert_eq!(drain_tx.output.len(), 1);
+    assert!(
+        drain_tx
+            .input
+            .iter()
+            .all(|input| input.previous_output != locked_coin)
+    );
+    assert!(wallet.is_mine(drain_tx.output[0].script_pubkey.clone()));
+    assert!(
+        wallet
+            .list_transactions()
+            .iter()
+            .any(|tx| tx.tx_id == drain_tx.compute_txid())
+    );
+    // I8: the transaction pays the given fee rate (10 sat per vbyte; the weight is rounded up).
+    let fee = amount * 2 - drain_tx.output[0].value;
+    let vsize = drain_tx.weight().to_vbytes_ceil();
+    assert!(
+        (10 * vsize..=10 * vsize + 30).contains(&fee.to_sat()),
+        "fee {fee} for {vsize} vbytes"
+    );
+
+    // M9: a second call finds nothing more to move.
+    assert!(wallet.drain_imported_coins(fee_rate)?.is_none());
+
+    env.broadcast(&drain_tx)?;
+    env.mine_block()?;
+    wallet.sync_all(&chain).await?;
+    // Only the locked coin is left with the imported keys.
+    assert_eq!(wallet.imported_balance().total(), amount);
+    assert_eq!(wallet.balance(), amount * 2 - fee);
+
+    // M7: an amount that does not pay for the fee is not moved.
+    wallet.unlock_utxo(locked_coin)?;
+    let high_fee_rate = FeeRate::from_sat_per_vb(1_000).unwrap();
+    assert!(wallet.drain_imported_coins(high_fee_rate)?.is_none());
+    assert_eq!(wallet.imported_balance().total(), amount);
     Ok(())
 }
 

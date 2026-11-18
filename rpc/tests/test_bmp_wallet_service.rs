@@ -22,9 +22,9 @@ use rpc::bmp_wallet_service::{
 };
 use rpc::pb::bmp_wallet::wallet_client::WalletClient;
 use rpc::pb::bmp_wallet::{
-    ChangePasswordRequest, GetBalanceRequest, GetSeedWordsRequest, GetUnusedAddressRequest,
-    GetWalletAddressesRequest, IsWalletReadyRequest, OpenOrCreateWalletRequest, PubAddressInfo,
-    SendToAddressRequest,
+    ChangePasswordRequest, CloseRequest, GetBalanceRequest, GetSeedWordsRequest,
+    GetUnusedAddressRequest, GetWalletAddressesRequest, IsWalletReadyRequest,
+    OpenOrCreateWalletRequest, PubAddressInfo, SendToAddressRequest,
 };
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -162,6 +162,14 @@ async fn operations_before_open_are_refused_over_grpc() -> anyhow::Result<()> {
         .expect_err("no addresses before the wallet is opened");
     assert_eq!(err.code(), Code::FailedPrecondition, "got: {err}");
 
+    // M9: Close needs an open wallet, too.
+    let err = fixture
+        .client
+        .close(CloseRequest {})
+        .await
+        .expect_err("nothing to close before the wallet is opened");
+    assert_eq!(err.code(), Code::FailedPrecondition, "got: {err}");
+
     let ready = fixture
         .client
         .is_wallet_ready(IsWalletReadyRequest {})
@@ -169,6 +177,13 @@ async fn operations_before_open_are_refused_over_grpc() -> anyhow::Result<()> {
         .into_inner()
         .ready;
     assert!(!ready, "an unopened wallet must not report itself ready");
+
+    // M7: with an open wallet and no coin of an imported key, Close succeeds without a
+    // transaction, and the wallet stays open.
+    fixture.open(PASSWORD).await?;
+    let closed = fixture.client.close(CloseRequest {}).await?.into_inner();
+    assert_eq!(closed.drain_tx_id, None);
+    fixture.client.get_balance(GetBalanceRequest {}).await?;
     fixture.stop();
 
     Ok(())

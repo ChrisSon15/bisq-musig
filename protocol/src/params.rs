@@ -24,6 +24,14 @@ const REDIRECT_LOCK_TIME_BLOCKS: u16 = 1;
 /// depth no signature for the swap transaction and no key share may leave the engine.
 pub const MIN_CONFIRMATIONS: u16 = 3;
 
+/// The fee rate of the transactions that the engine builds on its own, for example the drain
+/// transaction at the close of the wallet.
+// TODO: Use a current fee rate. The source of fee rates is not decided yet (point N1 of the plan).
+pub const fn engine_fee_rate() -> FeeRate {
+    // 10 sat per vbyte.
+    FeeRate::from_sat_per_kwu(2_500)
+}
+
 /// The parameters of one trade. They are part of the contract of the two traders, and both must
 /// use the same values. The caller of the engine supplies them.
 #[derive(Clone, Debug, Eq, PartialEq)]

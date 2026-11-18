@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex};
 // Leading `::` disambiguates the `wallet` *crate* from this crate's own `wallet` module.
 use ::wallet::bmp_wallet::{BMPWallet, WalletApi as _};
 use ::wallet::chain_data_source::ChainDataSource;
-use ::wallet::password::{InvalidPassword, Password, WeakPassword};
 use ::wallet::error::WalletErrorKind;
+use ::wallet::password::{InvalidPassword, Password, WeakPassword};
 use ::wallet::wallet_info::{PubAddressInfo, TxInfo, TxOutputInfo, UtxoInfo};
 use bdk_bitcoind_rpc::bitcoincore_rpc::{Client, RpcApi as _};
 use bdk_wallet::Balance;
@@ -31,6 +31,7 @@ use bdk_wallet::bitcoin::{Address, Amount, FeeRate, Network, Transaction, Txid};
 use chain::{ChainApi, ChainApiError};
 use futures_util::never::Never;
 use futures_util::stream::{BoxStream, StreamExt as _};
+use protocol::params::engine_fee_rate;
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::{self, JoinHandle};
@@ -42,11 +43,12 @@ use zeroize::Zeroizing;
 use crate::observable::ObservableHashMap;
 pub use crate::pb::bmp_wallet::wallet_server::WalletServer as BmpWalletServer;
 use crate::pb::bmp_wallet::{
-    self, ChangePasswordRequest, ChangePasswordResponse, GetBalanceRequest, GetBalanceResponse,
-    GetSeedWordsRequest, GetSeedWordsResponse, GetUnusedAddressRequest, GetUnusedAddressResponse,
-    GetWalletAddressesRequest, GetWalletAddressesResponse, IsWalletReadyRequest,
-    IsWalletReadyResponse, ListTransactionsRequest, ListTransactionsResponse, ListUtxosRequest,
-    ListUtxosResponse, OpenOrCreateWalletRequest, OpenOrCreateWalletResponse, SendToAddressRequest,
+    self, ChangePasswordRequest, ChangePasswordResponse, CloseRequest, CloseResponse,
+    GetBalanceRequest, GetBalanceResponse, GetSeedWordsRequest, GetSeedWordsResponse,
+    GetUnusedAddressRequest, GetUnusedAddressResponse, GetWalletAddressesRequest,
+    GetWalletAddressesResponse, IsWalletReadyRequest, IsWalletReadyResponse,
+    ListTransactionsRequest, ListTransactionsResponse, ListUtxosRequest, ListUtxosResponse,
+    OpenOrCreateWalletRequest, OpenOrCreateWalletResponse, SendToAddressRequest,
     SendToAddressResponse, wallet_server,
 };
 use crate::server::handle_request_async;
@@ -151,6 +153,15 @@ pub trait BmpWalletService {
     /// `password` must be the wallet password; a wrong one fails with [`InvalidPassword`] rather
     /// than revealing anything. A stored seed that is not a valid BIP39 mnemonic also fails.
     async fn seed_words(&self, password: &str) -> anyhow::Result<Vec<String>>;
+
+    /// Prepares the wallet for the end of the program: moves the coins of all imported keys,
+    /// which are payouts of closed trades, to an address of the seed wallet. Returns the ID of
+    /// the drain transaction, or `None` if there was nothing to move.
+    ///
+    /// The drain transaction is stored in the wallet before it is sent. If it cannot be sent,
+    /// the call still succeeds. Locked coins, which belong to open trades, are not moved. The
+    /// wallet stays open.
+    async fn close(&self) -> anyhow::Result<Option<Txid>>;
 }
 
 /// A [`BmpWalletService`] whose every operation is forwarded to [`BMPWallet`].
@@ -471,6 +482,35 @@ impl<S: ChainDataSource + Send + Sync + 'static> BmpWalletService for BMPWalletS
         Ok(txid)
     }
 
+    async fn close(&self) -> anyhow::Result<Option<Txid>> {
+        let mut guard = self.wallet.lock().await;
+        let wallet = require_open(&mut guard)?;
+        let Some(drain_tx) = wallet.drain_imported_coins(engine_fee_rate())? else {
+            return Ok(None);
+        };
+        let txid = drain_tx.compute_txid();
+        // The transaction is stored in the wallet at this point. A failure to send it must not
+        // fail the close: the wallet still knows the transaction and its coins count as spent.
+        // TODO: Send stored unconfirmed transactions again at the next start (point N5 of the
+        //  plan), and send through the peer-to-peer network (F27).
+        let sent = self.broadcaster.as_ref().map_or_else(
+            || Err("no chain backend is configured".to_owned()),
+            |broadcaster| {
+                task::block_in_place(|| broadcaster.transaction_broadcast(&drain_tx))
+                    .map_err(|error| error.to_string())
+            },
+        );
+        match sent {
+            Ok(_) => info!(%txid, "Sent the drain transaction."),
+            Err(error) => warn!(
+                %txid,
+                error,
+                "Could not send the drain transaction. It is stored in the wallet."
+            ),
+        }
+        Ok(Some(txid))
+    }
+
     async fn full_balance(&self) -> anyhow::Result<Balance> {
         let mut guard = self.wallet.lock().await;
         Ok(require_open(&mut guard)?.full_balance())
@@ -733,6 +773,22 @@ impl wallet_server::Wallet for BmpWalletImpl {
                 .map_err(|e| status_from(&e))?;
 
             Ok(ChangePasswordResponse { success: true })
+        })
+        .await
+    }
+
+    #[instrument(skip_all)]
+    async fn close(&self, request: Request<CloseRequest>) -> Result<Response<CloseResponse>> {
+        handle_request_async(request, |_request| async move {
+            let drain_tx_id = self
+                .wallet_service
+                .close()
+                .await
+                .map_err(|e| status_from(&e))?;
+
+            Ok(CloseResponse {
+                drain_tx_id: drain_tx_id.map(|txid| txid.to_string()),
+            })
         })
         .await
     }

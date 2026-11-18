@@ -1469,7 +1469,8 @@ mod tests {
         let tx = psbt.extract_tx()?;
         assert_eq!(tx.input.len(), 2);
         assert_eq!(tx.output.len(), 1);
-        assert_eq!(tx.output[0].value, Amount::from_str("1.99983150 BTC")?);
+        // The signed transaction has 169 vbytes, so the fee at 100 sat per vbyte is 16900 sat.
+        assert_eq!(tx.output[0].value, Amount::from_str("1.99983100 BTC")?);
 
         Ok(())
     }

@@ -14,6 +14,7 @@ use bdk_wallet::chain::{
     BlockId, CanonicalizationParams, ChainPosition, CheckPoint, FullTxOut, Merge as _,
 };
 use bdk_wallet::descriptor::ExtendedDescriptor;
+use bdk_wallet::error::CreateTxError;
 use bdk_wallet::keys::bip39::Mnemonic;
 use bdk_wallet::miniscript::descriptor::{KeyMap, TapTree, Tr};
 use bdk_wallet::miniscript::psbt::PsbtExt as _;
@@ -467,7 +468,11 @@ impl BMPWallet {
                             ..Default::default()
                         }),
                     },
-                    satisfaction_weight: Weight::from_wu_usize(65),
+                    // The witness of a Taproot key spend with the default signature hash
+                    // type: 1 byte for the number of items, 1 byte for the length, and the
+                    // signature of 64 bytes. A smaller value makes the transaction pay less
+                    // than the fee rate that the caller asked for.
+                    satisfaction_weight: Weight::from_wu_usize(66),
                 })
             })
             .collect()
@@ -744,6 +749,34 @@ impl BMPWallet {
         self.record_unconfirmed_transaction(&tx)?;
 
         Ok(tx)
+    }
+
+    /// Moves all coins of imported keys to a new address of the seed wallet: builds the drain
+    /// transaction, signs it, records it as unconfirmed and stores it. The caller is responsible
+    /// for sending the returned transaction to the network.
+    ///
+    /// Returns `None`, and changes nothing, if there is no coin to move or if the coins do not
+    /// pay for the fee and an output above the dust limit. Locked and immature coins are not
+    /// moved.
+    ///
+    /// The coins of imported keys are payouts of closed trades. The peer of such a trade still
+    /// holds a pre-signed transaction that can spend the payout after a lock time, so the coins
+    /// are moved before the user stops watching the chain.
+    pub fn drain_imported_coins(&mut self, fee_rate: FeeRate) -> Result<Option<Transaction>> {
+        if self.imported_utxos().is_empty() {
+            return Ok(None);
+        }
+        let mut psbt = match <Self as WalletApi>::drain_imported_balance(self, fee_rate) {
+            Ok(psbt) => psbt,
+            Err(WalletErrorKind::CreateTx(
+                CreateTxError::CoinSelection(_) | CreateTxError::OutputBelowDustLimit(_),
+            )) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        <Self as WalletApi>::sign(self, &mut psbt, SignOptions::default())?;
+        let tx = psbt.extract_tx()?;
+        self.record_unconfirmed_transaction(&tx)?;
+        Ok(Some(tx))
     }
 
     /// Records a signed transaction as unconfirmed in the main wallet and in the wallets of the
@@ -1260,20 +1293,20 @@ impl WalletApi for BMPWallet {
             .add_recipient(drain_to_address.script_pubkey(), imported_amount);
 
         let psbt = match tx_builder.finish() {
-            Err(bdk_wallet::error::CreateTxError::CoinSelection(insufficient_funds)) => {
+            Err(CreateTxError::CoinSelection(insufficient_funds)) => {
                 let cs = SpendImportedOnly(imported_utxos);
                 let Some(fees) = insufficient_funds
                     .needed
                     .checked_sub(insufficient_funds.available)
                 else {
                     return Err(
-                        bdk_wallet::error::CreateTxError::CoinSelection(insufficient_funds)
+                        CreateTxError::CoinSelection(insufficient_funds)
                             .into(),
                     );
                 };
                 let Some(amount_to_send) = imported_amount.checked_sub(fees) else {
                     return Err(
-                        bdk_wallet::error::CreateTxError::CoinSelection(insufficient_funds)
+                        CreateTxError::CoinSelection(insufficient_funds)
                             .into(),
                     );
                 };
