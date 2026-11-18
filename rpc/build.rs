@@ -2,29 +2,6 @@ use std::borrow::Cow;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
-        // Add Serde serialization for walletrpc request types...
-        .serde_serialized_types(&[
-            "WalletBalanceRequest", "NewAddressRequest", "ListUnspentRequest"
-        ])
-        .serde_serialized_type("ConfRequest", &[
-            rev_hex("txId")
-        ])
-
-        // Add Serde serialization for walletrpc response types...
-        .serde_serialized_types(&["WalletBalanceResponse", "NewAddressResponse", "ListUnspentResponse"])
-        // NB: fully qualified, since `wallet.proto` and `bmp_wallet.proto` both declare a
-        // `TransactionOutput` and unqualified paths match on any suffix.
-        .serde_serialized_type(".walletrpc.TransactionOutput", &[
-            rev_hex("txId"), hex("scriptPubKey")
-        ])
-        .serde_serialized_type("ConfEvent", &[
-            opt_hex("rawTx"), enum_field("confidenceType", "ConfidenceType")
-        ])
-        .serde_serialized_type("ConfirmationBlockTime", &[
-            rev_hex("blockHash")
-        ])
-        .serde_serialized_enum("ConfidenceType")
-
         // Add Serde serialization for musigrpc request types...
         .serde_serialized_types(&[
             "ReceiverAddressAndAmount", "PartialSignaturesRequest", "DepositTxSignatureRequest",
@@ -92,7 +69,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos(
             &[
                 "src/main/proto/rpc.proto",
-                "src/main/proto/wallet.proto",
                 "src/main/proto/bmp_wallet.proto",
                 "src/main/proto/bmp_protocol.proto",
             ],
@@ -103,9 +79,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Serde config for the `wallet` package declared in `bmp_wallet.proto`.
 ///
-/// Every path is fully qualified: `wallet.proto` and `bmp_wallet.proto` both declare a
-/// `TransactionOutput`, and unqualified paths match on any suffix, so a bare name would
-/// silently apply the wrong field attributes to the other package's message.
+/// Every path is fully qualified: unqualified paths match on any suffix, so a bare name would
+/// silently apply the field attributes to a message of the same name in another package.
 ///
 /// Secrets are redacted rather than skipped, so the request log still records that a field was
 /// present without ever writing out its value.
@@ -163,10 +138,6 @@ const fn hex(field: &str) -> CustomField<'_> {
 
 const fn base64(field: &str) -> CustomField<'_> {
     (field, Cow::Borrowed("#[serde_as(as = \"::serde_with::base64::Base64\")]"))
-}
-
-const fn rev_hex(field: &str) -> CustomField<'_> {
-    (field, Cow::Borrowed("#[serde_as(as = \"crate::pb::convert::hex::ByteReversedHex\")]"))
 }
 
 const fn opt_hex(field: &str) -> CustomField<'_> {

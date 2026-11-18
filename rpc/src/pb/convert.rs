@@ -3,8 +3,6 @@ use bdk_wallet::bitcoin::hashes::Hash as _;
 use bdk_wallet::bitcoin::{
     Address, Amount, Psbt, TapSighash, Transaction, Txid, XOnlyPublicKey, consensus,
 };
-use bdk_wallet::chain::ChainPosition;
-use bdk_wallet::{Balance, LocalOutput};
 use musig2::PubNonce;
 use musig2::secp::{MaybeScalar, Point, Scalar};
 use prost::UnknownEnumValue;
@@ -14,14 +12,10 @@ use tonic::{Result, Status};
 use crate::pb::musigrpc::{
     self, NonceSharesMessage, PartialSignaturesMessage, ReceiverAddressAndAmount,
 };
-use crate::pb::walletrpc::{
-    ConfEvent, ConfidenceType, ConfirmationBlockTime, TransactionOutput, WalletBalanceResponse,
-};
 use crate::protocol::{
     ContractualTxids, ExchangedAddresses, ExchangedNonces, ExchangedSigs, ProtocolErrorKind, Role,
 };
 use crate::storage::{ByRef, ByVal};
-use crate::wallet::TxConfidence;
 
 /// Serializers that stand in for a secret's value.
 ///
@@ -39,23 +33,6 @@ pub(crate) mod redact {
 
     pub fn string_vec<S: Serializer>(value: &[String], serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_seq(value.iter().map(|_| PLACEHOLDER))
-    }
-}
-
-pub(crate) mod hex {
-    use serde::Serializer;
-    use serde_with::SerializeAs;
-    use serde_with::formats::Lowercase;
-    use serde_with::hex::Hex;
-
-    pub struct ByteReversedHex;
-
-    impl<T: AsRef<[u8]>> SerializeAs<T> for ByteReversedHex {
-        fn serialize_as<S: Serializer>(source: &T, serializer: S) -> Result<S::Ok, S::Error> {
-            let mut source = source.as_ref().to_owned();
-            source.reverse();
-            Hex::<Lowercase>::serialize_as(&source, serializer)
-        }
     }
 }
 
@@ -278,67 +255,8 @@ impl From<ExchangedSigs<'_, ByRef>> for PartialSignaturesMessage {
     }
 }
 
-impl From<Balance> for WalletBalanceResponse {
-    fn from(value: Balance) -> Self {
-        Self {
-            immature: value.immature.to_sat(),
-            trusted_pending: value.trusted_pending.to_sat(),
-            untrusted_pending: value.untrusted_pending.to_sat(),
-            confirmed: value.confirmed.to_sat(),
-        }
-    }
-}
-
-impl From<LocalOutput> for TransactionOutput {
-    fn from(value: LocalOutput) -> Self {
-        Self {
-            tx_id: value.outpoint.txid.to_byte_array().into(),
-            vout: value.outpoint.vout,
-            script_pub_key: value.txout.script_pubkey.into_bytes(),
-            value: value.txout.value.to_sat(),
-        }
-    }
-}
-
-impl From<TxConfidence> for ConfEvent {
-    fn from(TxConfidence { wallet_tx, num_confirmations }: TxConfidence) -> Self {
-        let raw_tx = Some(consensus::serialize(&wallet_tx.tx));
-        let (confidence_type, confirmation_block_time) = match wallet_tx.chain_position {
-            ChainPosition::Confirmed { anchor, .. } =>
-                (ConfidenceType::Confirmed, Some(ConfirmationBlockTime {
-                    block_hash: anchor.block_id.hash.to_byte_array().into(),
-                    block_height: anchor.block_id.height,
-                    confirmation_time: anchor.confirmation_time,
-                })),
-            ChainPosition::Unconfirmed { .. } => (ConfidenceType::Unconfirmed, None)
-        };
-        Self {
-            raw_tx,
-            confidence_type: confidence_type.into(),
-            num_confirmations,
-            confirmation_block_time,
-        }
-    }
-}
-
 impl From<ProtocolErrorKind> for Status {
     fn from(value: ProtocolErrorKind) -> Self {
         Self::internal(value.to_string())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::pb::walletrpc::{ConfEvent, ConfidenceType};
-
-    #[test]
-    fn conf_event_default() {
-        let missing_tx_conf_event = ConfEvent {
-            raw_tx: None,
-            confidence_type: ConfidenceType::Missing.into(),
-            num_confirmations: 0,
-            confirmation_block_time: None,
-        };
-        assert_eq!(ConfEvent::default(), missing_tx_conf_event);
     }
 }

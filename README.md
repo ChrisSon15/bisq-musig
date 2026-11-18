@@ -27,7 +27,7 @@ The code is organised as a Cargo workspace:
 | `protocol`                      | Cryptographic core: trade transaction builders (deposit, warning, redirect, claim, swap, custom payout), MuSig2 + adaptor signing, Taproot script paths |
 | [`wallet`](wallet/README.md)    | BDK-based wallets (`BMPWallet`, `MemWallet`) and the `ProtocolWalletApi` trait consumed by `protocol`                     |
 | `chain`                         | Small traits (`ChainApi`, `ChainScanner`) that decouple the wallets from a specific chain backend                         |
-| [`rpc`](rpc/README.md)          | gRPC server (`musigd`), wallet test CLI (`musig-cli`) and a Java test client                                              |
+| [`rpc`](rpc/README.md)          | gRPC server (`musigd`) and Java test clients                                                                              |
 | [`testenv`](testenv/README.md)  | Spins up `bitcoind` + `electrs` on regtest for the integration tests                                                      |
 | `mem`                           | ZMQ helper for streaming unconfirmed transactions                                                                         |
 | `bmp_tracing`                   | Shared tracing/logging initialisation                                                                                     |

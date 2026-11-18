@@ -1,14 +1,13 @@
 use std::fmt::{Display, Formatter};
 use std::future::Future;
-use std::marker::{Send, Sync};
+use std::marker::Send;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bdk_wallet::bitcoin::{Amount, FeeRate, consensus};
 use bdk_wallet::serde_json;
 use drop_stream::DropStreamExt as _;
-use futures_util::stream::{self, BoxStream, Stream, StreamExt as _, TryStream, TryStreamExt as _};
+use futures_util::stream::{self, BoxStream, Stream, TryStream, TryStreamExt as _};
 use protocol::state::{ClosureType, TradeState};
 use serde::Serialize;
 use tokio::time::{self, Duration};
@@ -25,13 +24,7 @@ use crate::pb::musigrpc::{
     SubscribeTxConfirmationStatusRequest, SwapTxSignatureRequest, SwapTxSignatureResponse,
     TxConfirmationStatus, musig_server,
 };
-pub use crate::pb::walletrpc::wallet_server::WalletServer;
-use crate::pb::walletrpc::{
-    ConfEvent, ConfRequest, ListUnspentRequest, ListUnspentResponse, NewAddressRequest,
-    NewAddressResponse, WalletBalanceRequest, WalletBalanceResponse, wallet_server,
-};
 use crate::protocol::{ExchangedKeys, TRADE_MODELS, TradeModel, TradeModelStore as _};
-use crate::wallet::WalletService;
 
 #[derive(Debug, Default)]
 pub struct MusigImpl {}
@@ -287,55 +280,6 @@ fn mock_tx_confirmation_status_stream(trade_id: String, tx: Vec<u8>) -> impl Str
         time::sleep(Duration::from_secs(5)).await;
         Ok(confirmation_event)
     }).on_drop(move || debug!(trade_id, "Deposit tx confirmation status stream has been dropped."))
-}
-
-pub struct WalletImpl {
-    pub wallet_service: Arc<dyn WalletService + Send + Sync>,
-}
-
-#[tonic::async_trait]
-impl wallet_server::Wallet for WalletImpl {
-    #[instrument(skip_all)]
-    async fn wallet_balance(&self, request: Request<WalletBalanceRequest>) -> Result<Response<WalletBalanceResponse>> {
-        handle_request(request, |_request| Ok(self.wallet_service.balance().into()))
-    }
-
-    #[instrument(skip_all)]
-    async fn new_address(&self, request: Request<NewAddressRequest>) -> Result<Response<NewAddressResponse>> {
-        handle_request(request, |_request| {
-            let address = self.wallet_service.reveal_next_address();
-
-            Ok(NewAddressResponse {
-                address: address.address.to_string(),
-                derivation_path: format!("m/86'/1'/0'/0/{}", address.index),
-            })
-        })
-    }
-
-    #[instrument(skip_all)]
-    async fn list_unspent(&self, request: Request<ListUnspentRequest>) -> Result<Response<ListUnspentResponse>> {
-        handle_request(request, |_request| {
-            let utxos: Vec<_> = self.wallet_service.list_unspent().into_iter()
-                .map(Into::into)
-                .collect();
-
-            Ok(ListUnspentResponse { utxos })
-        })
-    }
-
-    type RegisterConfidenceNtfnStream = TracedResultStream<ConfEvent>;
-
-    #[instrument(skip_all)]
-    async fn register_confidence_ntfn(&self, request: Request<ConfRequest>) -> Result<Response<Self::RegisterConfidenceNtfnStream>> {
-        handle_request(request, move |request| {
-            let txid = request.tx_id.try_proto_into()?;
-            let conf_events = self.wallet_service.get_tx_confidence_stream(txid)
-                .map(|o| Ok(o.map(Into::into).unwrap_or_default()))
-                .box_traced();
-
-            Ok(conf_events)
-        })
-    }
 }
 
 struct LazyJson<T>(T);

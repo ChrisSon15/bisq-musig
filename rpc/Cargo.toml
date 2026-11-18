@@ -3,7 +3,6 @@ name = "rpc"
 version = "0.1.0"
 # Hold at 2021 for now, since adapting to Rust 2024 needs syntax that the open source IDEA Rust plugin can't yet handle:
 edition = "2021"
-default-run = "musig-cli"
 
 [dependencies]
 anyhow = { workspace = true }
@@ -39,10 +38,7 @@ tonic-prost-build = "0.14.6"
 [dev-dependencies]
 rpc = { path = ".", features = ["unimock"] }
 tempfile = { workspace = true }
-assert_cmd = "2.2.2"
 bdk_electrum = { workspace = true }
-const_format = { workspace = true }
-predicates = "3.1.4"
 testenv = { workspace = true }
 # Pin transitive 'unimock' dependency, as v0.2.3 replaces 'paste' with less reputable 'pastey' to fix a bogus advisory:
 macro_rules_attribute = "=0.2.2"

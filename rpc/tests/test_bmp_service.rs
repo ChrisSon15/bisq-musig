@@ -1,8 +1,8 @@
 //! Integration-test home of the `musigd` daemon (formerly the `rpc/src/bin/musigd.rs` binary).
 //!
-//! The full gRPC server — the `MuSig` trade-protocol service, the wallet service, and the two BMP
-//! services — is built by [`spawn_musigd`] and backed by an external `bitcoind`, so the daemon
-//! can be started as a test case rather than as a standalone process.
+//! The gRPC server — the `MuSig` trade-protocol service and the BMP protocol service — is built by
+//! [`spawn_musigd`] and backed by an external `bitcoind`, so the daemon can be started as a test
+//! case rather than as a standalone process.
 //!
 //! The entry point is [`run_musigd_server`] — an `#[ignore]`d, long-running server on a fixed port
 //! (taken from the `MUSIGD_PORT` env var, default `50051`). It serves until the process is killed,
@@ -27,8 +27,7 @@ use rpc::pb::bmp_protocol::bmp_protocol_service_server::{
 };
 use rpc::pb::bmp_protocol::{self, InitializeRequest, InitializeResponse, Role};
 use rpc::pb::convert::TryProtoInto as _;
-use rpc::server::{MusigImpl, MusigServer, WalletImpl, WalletServer};
-use rpc::wallet::WalletServiceImpl;
+use rpc::server::{MusigImpl, MusigServer};
 use tokio::net::TcpListener;
 use tokio::task::{self, JoinHandle};
 use tonic::transport::Server;
@@ -266,14 +265,6 @@ fn spawn_musigd(
     electrum_url: String,
 ) -> JoinHandle<Result<(), transport::Error>> {
     let musig = MusigImpl::default();
-    let wallet = WalletImpl {
-        wallet_service: Arc::new(WalletServiceImpl::new()),
-    };
-
-    wallet
-        .wallet_service
-        .clone()
-        .spawn_connection(client.clone());
 
     let bmp_protocol_impl = BmpServiceImpl::new(client, electrum_url);
 
@@ -281,7 +272,6 @@ fn spawn_musigd(
     let handle = task::spawn(async move {
         Server::builder()
             .add_service(MusigServer::new(musig))
-            .add_service(WalletServer::new(wallet))
             .add_service(BmpProtocolServiceServer::new(bmp_protocol_impl))
             .serve_with_incoming(incoming)
             .await

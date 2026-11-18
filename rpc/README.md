@@ -8,10 +8,9 @@ them by `build.rs` (into `src/pb`), the Java code by Maven. The server hosts the
 |---------------------------------------|----------------------|--------------------------------------------------------------------------------------------------------------------------------|
 | `musigrpc.Musig`                      | `rpc.proto`          | The original trade protocol mock-up (see below)                                                                                |
 | `bmp_protocol.BmpProtocolService`     | `bmp_protocol.proto` | Round-based (`Initialize`, `ExecuteRound1`…`5`) interface onto the `protocol` crate's `BMPProtocol`                            |
-| `walletrpc.Wallet`                    | `wallet.proto`       | Experimental wallet and chain notification API, used by `musig-cli`                                                            |
 | `wallet.Wallet`                       | `bmp_wallet.proto`   | Bisq2-facing wallet API backed by a persistent `BMPWallet`; derived from bisq2's own `wallet.proto` (see below)                 |
 
-`musigd` serves `Musig` and `walletrpc.Wallet` always, and `wallet.Wallet` when started with `--wallet-dir`.
+`musigd` serves `Musig` always, and `wallet.Wallet` when started with `--wallet-dir`.
 `BmpProtocolService` is currently only served by the test daemon in [tests/test_bmp_service.rs](tests/test_bmp_service.rs)
 (see [Integration tests](#integration-tests-using-testenv-crate)).
 
@@ -30,29 +29,6 @@ See [MuSig trade protocol messages](musig-trade-protocol-messages.txt) for my cu
 trade messages between the peers would look like, and thus the necessary data to exchange in an RPC interface between
 the Bisq2 client and the Rust server managing the wallet and key material.
 
-#### Experimental wallet gRPC interface and test CLI + Java client (`walletrpc.Wallet` service)
-
-To help test and develop the wallet and chain notification API that will be needed by Bisq, a small Rust gRPC client
-with a command-line interface is also included as a binary target (`musig-cli`). Currently, this is providing access to
-a handful of experimental wallet RPC endpoints that will talk to BDK to get account balance, new addresses, UTXO set,
-tx confidence notifications, etc. (only partially implemented). Run `cargo run -- --help` for the available commands.
-
-A non-interactive Java test gRPC client has also been written to query the UTXO set, then open an RPC stream for each
-UTXO and listen for confidence updates (confirmations, reorgs, etc.), running for a few seconds.
-
-This wallet is currently just hardwired to use _regtest_ with a fixed descriptor, without persistence. It uses the
-`bdk_bitcoind_rpc` crate to talk to a `bitcoind` instance via JSON-RPC, by default at `http://localhost:18443`
-(`--bitcoin-rpc-url`), authenticated with `--bitcoin-rpc-user` / `--bitcoin-rpc-pass` if given. It does a full scan
-once upon startup, then polls once per second. A `bitcoind` regtest instance may be started up as follows:
-
-```sh
-bitcoind -regtest -prune=0 -txindex=1 -blockfilterindex=1 -peerblockfilters=1 -server \
-  -rpcuser=bitcoin -rpcpassword=bitcoin -datadir=.localnet/bitcoind
-```
-
-The `-blockfilterindex` and `-peerblockfilters` (compact filters) options are needed if you also want the `BMPWallet`
-below to sync from this node.
-
 #### Bisq2-facing wallet (`wallet.Wallet` service)
 
 When `musigd` is started with `--wallet-dir <dir>`, it serves the `wallet.Wallet` service from a `BMPWallet` stored in
@@ -62,7 +38,17 @@ wallet database exists in the directory (`exists`) and whether it has been opene
 `OpenOrCreateWallet` would open its wallet or create a new, empty one. The wallet syncs over Compact Block Filters
 from the peers given with `--wallet-peer <host:port>` (repeatable), re-syncing every `--wallet-poll-secs` seconds;
 with no peer it does not sync, but all non-chain operations still work. `--wallet-network` selects the network (default `regtest`). Transactions are
-broadcast via the Bitcoin Core RPC connection above.
+broadcast via a Bitcoin Core RPC connection, by default to `http://localhost:18443` (`--bitcoin-rpc-url`),
+authenticated with `--bitcoin-rpc-user` / `--bitcoin-rpc-pass` if given. A `bitcoind` regtest instance may be started
+up as follows:
+
+```sh
+bitcoind -regtest -prune=0 -txindex=1 -blockfilterindex=1 -peerblockfilters=1 -server \
+  -rpcuser=bitcoin -rpcpassword=bitcoin -datadir=.localnet/bitcoind
+```
+
+The `-blockfilterindex` and `-peerblockfilters` (compact filters) options are needed for the wallet to sync from this
+node.
 
 [bmp_wallet.proto](src/main/proto/bmp_wallet.proto) is derived from bisq2's own `wallet/src/main/proto/wallet.proto`
 (same package, service name and field numbers), but it is not a drop-in replacement yet. The wallet is always
@@ -98,27 +84,15 @@ cargo run --bin musigd -- --wallet-dir /tmp/bmp-wallet --wallet-peer 127.0.0.1:1
   --bitcoin-rpc-user bitcoin --bitcoin-rpc-pass bitcoin
 ```
 
-3. To build and run the Rust wallet CLI client (default-run), just run:
-
-```sh
-cargo run -- wallet-balance
-```
-
 The following Java clients are run from this directory (`rpc`):
 
-4. To build and run the Java gRPC test client to carry out a mock trade, run:
+3. To build and run the Java gRPC test client to carry out a mock trade, run:
 
 ```sh
 mvn install exec:java
 ```
 
-5. To subsequently run the Java test client for the wallet gRPC interface, run:
-
-```sh
-mvn exec:java -Pwallet
-```
-
-6. To exercise every RPC of the Bisq2-facing wallet (needs `musigd` started with `--wallet-dir`), run:
+4. To exercise every RPC of the Bisq2-facing wallet (needs `musigd` started with `--wallet-dir`), run:
 
 ```sh
 mvn exec:java -Pbmp-wallet
@@ -126,7 +100,7 @@ mvn exec:java -Pbmp-wallet
 
 The host and port can be overridden with `-Dwallet.host=...` / `-Dwallet.port=...`.
 
-7. To run the `BmpClient` against the `BmpProtocolService` (needs the test daemon from the next section on port 50051):
+5. To run the `BmpClient` against the `BmpProtocolService` (needs the test daemon from the next section on port 50051):
 
 ```bash
 mvn exec:java -Pbmp

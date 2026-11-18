@@ -11,8 +11,7 @@ use clap::Parser;
 use rpc::bmp_wallet_service::{
     BMPWalletServiceImpl, BitcoinCoreChainApi, BmpWalletImpl, BmpWalletServer,
 };
-use rpc::server::{MusigImpl, MusigServer, WalletImpl, WalletServer};
-use rpc::wallet::WalletServiceImpl;
+use rpc::server::{MusigImpl, MusigServer};
 use tonic::transport::Server;
 
 #[derive(Debug, Parser)]
@@ -64,7 +63,8 @@ struct Cli {
 async fn main() -> Result<(), Box<dyn Error>> {
     let cli: Cli = Cli::parse();
     bmp_tracing::init("info");
-    // Create RPC client. (No connection is made at this point.)
+    // Create RPC client. (No connection is made at this point.) Only the broadcaster of the BMP
+    // wallet uses it.
     let rpc_client = {
         let auth = if let (Some(user), Some(pass)) = (&cli.bitcoin_rpc_user, &cli.bitcoin_rpc_pass)
         {
@@ -77,20 +77,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let addr = format!("127.0.0.1:{}", cli.port).parse()?;
     let musig = MusigImpl::default();
-    let wallet = WalletImpl {
-        wallet_service: Arc::new(WalletServiceImpl::new()),
-    };
-    wallet
-        .wallet_service
-        .clone()
-        .spawn_connection(Arc::clone(&rpc_client));
 
-    let mut server = Server::builder()
-        .add_service(MusigServer::new(musig))
-        .add_service(WalletServer::new(wallet));
+    let mut server = Server::builder().add_service(MusigServer::new(musig));
 
     // The bisq2-facing wallet service is optional: without --wallet-dir there is no BMPWallet to
-    // serve, and musigd behaves exactly as before.
+    // serve, and musigd serves the trade protocol only.
     let bmp_wallet = if let Some(dir) = &cli.wallet_dir {
         let mut service = BMPWalletServiceImpl::new(dir.clone(), cli.wallet_network)
             .with_broadcaster(Arc::new(BitcoinCoreChainApi::new(Arc::clone(&rpc_client))));
