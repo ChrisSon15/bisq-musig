@@ -147,7 +147,9 @@ of the status describes the reason:
 | Refused: data of the caller is invalid (trade parameters, redirection receivers, a field that cannot be decoded) | `INVALID_ARGUMENT`; `OUT_OF_RANGE` for a number above its range; `NOT_FOUND` for a missing part of a request |
 | Terminated | `ABORTED`. The message starts with "trade was terminated" and contains the reason. |
 | Unknown trade | `NOT_FOUND` |
-| Known trade ID in `InitTrade` | `ALREADY_EXISTS` |
+| Known trade ID in `InitTrade`, also the ID of a closed or abandoned trade, and also after a restart | `ALREADY_EXISTS` |
+| The trades of the wallet could not be loaded ([persistence-and-recovery.md](persistence-and-recovery.md)); every request for a trade | `DATA_LOSS`. The message names the trade and the reason. |
+| The trade could not be stored | `INTERNAL`. Nothing that the request produced is handed out. The caller can repeat the request. |
 | Temporary: no wallet is open | `FAILED_PRECONDITION` |
 | Temporary: `musigd` was started without a peer, so the engine has no access to the chain, and the request needs it | `FAILED_PRECONDITION` |
 | Temporary: no peer is reachable, or no peer serves compact block filters, and the request must send a transaction (`PublishDepositTx`, `PublishWarningTx`) | `UNAVAILABLE`. The message names the problem. The trade is not changed, and the caller can repeat the request. |

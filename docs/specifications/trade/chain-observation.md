@@ -188,6 +188,15 @@ at which the trader signed the deposit. It then performs the reactions for the e
 if they had just happened. Deadlines are computed from block heights, so they are correct after a
 pause ([persistence-and-recovery.md](persistence-and-recovery.md)).
 
+The engine uses what it knows about the chain for a trade only when it has evaluated all blocks
+up to the chain tip for this trade. Before that, it changes no state from the chain and sends no
+transaction for the trade: a transaction that it does not know can still be in a block that it
+has not evaluated.
+
+A request waits a few seconds for the evaluation of the newest block. The header of a block is
+known a moment before the block is evaluated, and a caller that reacts at once to the
+confirmation of a transaction would otherwise meet an engine that does not know about it.
+
 The engine follows the chain from a block that the wallet knows, some blocks below the chain tip
 of the wallet. When a trade or a key of the wallet needs earlier blocks, the engine follows the
 chain from the earlier block.

@@ -93,6 +93,7 @@ confirmed. The text of the files contains the rule of the column "Rule in the sp
 | O12 | Sanity limits of the engine for the deposit fee rate and the prepared fee rate | Not specified. | [fees.md](fees.md) |
 | O13 | Which request carries the trade parameters (amounts, fee rates, trade fee receiver)? The first version of this specification named the request that creates the trade (step 1). | Step 2 (`GetNonceShares`), as in the existing messages. No message changes. Nothing in step 1 depends on the parameters. | [parameters.md](parameters.md), [setup-and-deposit.md](setup-and-deposit.md) |
 | O14 | Two unmodified clients with different lock times in their configuration (D19): the partial signatures do not fit, and the engine cannot tell this from a modified client. | The setup is terminated (D17). Nothing is signed, so no funds are at risk. The reason names the trader's own lock times. | [parameters.md](parameters.md), [trade-states.md](trade-states.md) |
+| O17 | A record of the trade store cannot be loaded. The engine then serves no trade ([persistence-and-recovery.md](persistence-and-recovery.md)). How does the user leave this condition? | Not specified. No request removes or repairs a record. Until the decision the user needs a copy of the wallet database from before the damage. | [persistence-and-recovery.md](persistence-and-recovery.md) |
 
 Points that were open and are decided:
 

@@ -28,13 +28,11 @@ One of the two transactions then never confirms. This was finding F13.
 
 ### Coins that stay reserved without a trade
 
-The trade store is in memory only. If `musigd` stops while a trade is in its setup, the trade is
-gone but its coins stay reserved in the wallet database. This is accepted until the trade store
-exists; then the engine releases such coins at the next start
+If `musigd` stops while a trade is in its setup, the engine abandons the trade at the next start
+and releases its coins. It also releases a reserved coin that no stored trade reserves
 ([../trade/persistence-and-recovery.md](../trade/persistence-and-recovery.md)).
 
-Until then, and for any other reservation without a trade, the wallet service offers a release by
-hand:
+For any other reservation without a trade, the wallet service offers a release by hand:
 
 1. **The reserved coins can be listed.** The list of the unspent coins of the wallet marks every
    reserved coin.
@@ -43,12 +41,11 @@ hand:
 3. **A coin that a trade known to the engine has reserved is refused.** Such a coin is released
    only through its trade, by abandoning the trade, and only while rule 5 above allows it.
 
-Limit that the user must know: the engine knows only the trades of the running program. If
-`musigd` stopped after the trader signed a deposit transaction, the engine has forgotten that
-trade, and a release by hand is not refused, although the peer can still publish the deposit.
-A payment with the released coin then competes with the deposit: one of the two transactions
-confirms. No funds are lost by this, but the trade can fail. This limit ends with the trade
-store.
+4. **No coin is released by hand while the trades of the wallet could not be loaded.** The
+   engine then does not know which coins belong to a trade.
+
+The engine knows the trades of the wallet after a restart, because they are stored in the wallet
+database. Rule 3 therefore also holds for a trade that was set up before the restart.
 
 ## Recording a transaction
 

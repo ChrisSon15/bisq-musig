@@ -660,8 +660,9 @@ Not done:
   trade, deadlines as block heights or actions that the user must take.
 - The swap, custom payout, claim and penalty transactions are not recorded in the wallet when
   they are sent. The wallet shows their outputs after they are confirmed.
-- The engine keeps no stored state "sent" (WP5), and a stored drain transaction is not sent again
-  at the next start (N5).
+- A stored drain transaction is not sent again at the next start (N5). The engine keeps no
+  stored state "sent" for the transactions of a trade; since WP5 this is the specified behaviour,
+  because the engine derives what it must send from the stored state and from the chain.
 - Validation of the caller's data (D5, D9, D14) was done in WP1 as far as it exists; no limit for
   the number of redirection receivers exists (open point O10).
 - bisq2 does not call the new requests yet (WP7). The Java sources of this repository were
@@ -688,6 +689,59 @@ Not done:
 
 Done when: stopping and starting `musigd` in every state leads to the same final result as an
 uninterrupted run.
+
+Status on 2026-11-18 (branch `wp5-persistence`, on top of `wp4-trade-flows`): the condition holds
+at the level of the engine for every state after the deposit signature, and for the setup in the
+specified way (the trade is abandoned). At the level of the service it is tested for the
+cooperative close, the setup, the forced close and the warning. With two real `musigd` processes
+it is tested for the forced close. The restore from the seed or from a backup is not part of
+this status: the project owner postponed it (section 12, row 9).
+
+Done:
+
+- Trade store: one record per trade in the encrypted database of the wallet (table
+  `bmp_trade_records`). One database holds the wallet and its trades, so both have the same
+  password and the same backup. A record is kept after its trade is closed or abandoned, so the
+  records are also the set of the used trade IDs (N6, K2).
+- A record holds what the trader received and the results of his own steps that cannot be
+  repeated. The trade is built again from it with the steps of the setup; a record that does not
+  fit these steps is refused. Own key shares are derived from the seed (D10). Secret nonces and
+  own secret key shares are not part of a record (H7, H13).
+- The rule "stored before anything leaves": the trade service stores a trade after `InitTrade`
+  and after every request, before the response is returned, and the watching task stores a
+  change that follows from the chain before it sends a transaction for it. A request whose
+  trade cannot be stored fails, and nothing of it is handed out (H4).
+- Start: the trades are loaded when the wallet is opened. A trade in `Init` is abandoned and its
+  coins are released (H1). The reservations of the wallet are made to agree with the trades
+  (H8; point W2 of the wallet specification is closed by this). The outputs of every loaded
+  trade are watched from the block of its deposit signature, so events that happened while
+  `musigd` did not run are found and answered (H5).
+- A record that cannot be loaded: no trade is loaded, every trade request is refused with
+  `DATA_LOSS`, the reserved coins stay reserved and cannot be released by hand, and the wallet
+  service keeps working (H6).
+- The engine uses facts of the chain only when the chain client has evaluated all blocks that it
+  knows. A request waits up to 3 seconds for the evaluation of the newest block.
+- Private key shares are replaced in the logged form of requests and responses (F7, K5).
+- Tests: H1, H2, H3, H5, H6, H7, H13 at the level of the engine
+  (`protocol/src/trade_record_tests.rs`); H1 to H6, H8 and K2 at the level of the service
+  (`rpc/tests/test_musig_service.rs`); H2, H3, H5 and K2 with two `musigd` processes that are
+  stopped and started (`rpc/tests/test_musigd.rs`); K5 for the logged messages. H9 and H10 exist
+  since WP2.
+
+Not done:
+
+- Restore from the seed, and from a backup of the wallet database (H11, H12), and the user
+  documentation of backup and restore: postponed by the project owner.
+- No way exists to leave the condition "a record cannot be loaded" except a copy of the wallet
+  database from before the damage (open point O17 of the specification).
+- A stored drain transaction is not sent again at the next start (N5).
+- Secrets in memory are not zeroised.
+- H3 and H4 are tested by restarting the service between requests and by a wallet that cannot
+  store. No test stops the process inside a request.
+- With two `musigd` processes only the forced close is tested with restarts. The dispute path
+  and the custom payout are tested with restarts at the level of the engine only.
+- The record format has version 1. No rule exists yet for reading a record of an older version
+  after a change of the format.
 
 ### WP6 Fees and mempool policy (estimate: 2 to 4 weeks; issue #26)
 

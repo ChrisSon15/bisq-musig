@@ -59,7 +59,17 @@ A transaction is sent again after every new block until it is confirmed. `Subscr
 one trade: its state, every transaction that was sent, a loss, and a problem with the peers. The requests that hand
 out a signature or a key share are refused until the deposit transaction has 3 confirmations.
 
-Not implemented: the deposit abort transaction after the deposit timeout, and fee increases of sent transactions.
+Every trade is stored in the database of the wallet, before a response or a transaction of the trade leaves `musigd`.
+When the wallet is opened after a start of `musigd`, the trades are loaded: a trade whose deposit transaction was not
+signed is abandoned, and every other trade continues. `musigd` evaluates the blocks since the deposit signature of
+each trade, so it finds and answers what happened while it did not run. Until this is done for a trade, a request that
+needs the chain is refused and can be repeated. If a stored trade cannot be loaded, every request of the `Musig`
+service fails with `DATA_LOSS`; the wallet service keeps working.
+
+Private key shares are not written to the log.
+
+Not implemented: the deposit abort transaction after the deposit timeout, fee increases of sent transactions, and the
+restore of trades from the seed or from a backup.
 
 See [MuSig trade protocol messages](musig-trade-protocol-messages.txt) for my current (incomplete) picture of what the
 trade messages between the peers would look like, and thus the necessary data to exchange in an RPC interface between
@@ -144,6 +154,9 @@ mvn exec:java -Pbmp-wallet
 The host and port can be overridden with `-Dwallet.host=...` / `-Dwallet.port=...`.
 
 ### Integration tests using testenv crate
+
+The Rust tests in `rpc/tests/test_musigd.rs` start real `musigd` processes. With the directory `MUSIGD_TEST_LOG_DIR` in
+the environment, every process writes its log at debug level to a file in that directory.
 
 The Java integration tests (`mvn verify`) are:
 

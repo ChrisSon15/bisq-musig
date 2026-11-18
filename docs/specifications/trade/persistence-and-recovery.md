@@ -5,27 +5,47 @@ a restart or a restore.
 
 ## The trade store
 
-The engine keeps all trades in one durable, encrypted store. The store is protected in the same
-way as the wallet database.
+The engine keeps all trades in one durable, encrypted store: the database of the wallet. One
+record per trade is stored there. The wallet and its trades are therefore protected by the same
+password, and one copy of the wallet database is a backup of both.
+
+Rationale: a trade and the wallet depend on each other. The coins that a trade has reserved, the
+keys of its payouts and the block at which its deposit was signed are data of the wallet. Two
+stores could be restored from backups of different times, and would then contradict each other.
 
 Stored for each trade:
 
-- trade ID, role, trade parameters, state, and the terminated mark with its reason;
+- trade ID, role, trade parameters, the lock times and margins of the configuration at the time
+  of the setup, state, and the terminated mark with its reason;
 - the peer's public key shares, script key, addresses and half of the deposit;
-- the deposit transaction; the trader's own fully signed warning and redirect transaction;
-- for the buyer, the adaptor signature of the swap transaction; for the seller, the swap
-  transaction and, once received, the buyer's partial signature for it;
-- the peer's secret key share, once received, and the penalty transaction;
+- what is needed to have the deposit transaction and the trader's own fully signed warning and
+  redirect transaction again;
+- for the buyer, the adaptor signature of the swap transaction; for the seller, what is needed
+  to have the swap transaction again and, once received, the buyer's partial signature for it;
+- the peer's secret key share, once received, and with it the penalty transaction;
 - the custom payout PSBTs of the trader and of the peer, and the final custom payout transaction;
 - the trader's reserved coins;
-- every transaction that the engine sent, with its status;
 - the height at which the trader signed the deposit.
+
+The record of a trade is kept after the trade is closed or abandoned. The records are therefore
+also the set of all trade IDs that were ever used.
+
+The state that follows from the chain ([trade-states.md](trade-states.md)) is not stored. It is
+derived from the chain again after a restart.
+
+The store keeps no list of sent transactions and no status "sent". Which transactions the trader
+must have on the network follows from the stored state of the trade and from the chain
+([chain-observation.md](chain-observation.md), "Reactions to chain events"). A decision of the
+trader that makes the engine send a transaction, for example the request to publish the warning
+transaction, is a change of the stored state.
 
 Stored once for the wallet:
 
-- the set of all trade IDs that were ever used, including closed and abandoned trades;
 - the drain transaction, while it is unconfirmed
   ([post-trade-protection.md](post-trade-protection.md)).
+
+A trade whose deposit transaction the trader has not signed is stored with its ID, role, state
+and reserved coins only. Its setup cannot continue after a restart (see "Restart").
 
 Never stored:
 
@@ -39,6 +59,16 @@ Never stored:
 engine.**
 
 This holds for every response to the caller and for every transaction that the engine sends.
+
+- The trade is stored from its first request on, so that its ID counts as used.
+- The trade is stored after every request, also after a request that was refused: a refusal can
+  have terminated the trade.
+- If the trade cannot be stored, the request fails, and nothing that the request produced is
+  handed out.
+- A change that follows from the chain, for example a key share that the engine read from the
+  swap transaction, or a forced close that the engine started on its own, is stored before the
+  engine sends a transaction for it. If it cannot be stored, the engine sends nothing for this
+  trade and tries again at its next look at the chain.
 
 Rationale: if the engine handed out a signature and then forgot that it did, it could sign other
 data in the same situation after a restart. And if it handed out its signatures for the deposit
@@ -55,17 +85,43 @@ The repeated request is then processed as a new request.
 
 ## Restart
 
-At start-up the engine:
+The trades are loaded when the wallet is opened, before the first request for a trade is
+processed. The engine then:
 
 1. loads all trades from the store;
 2. abandons every trade that is still in `Init`, and releases its coins. The nonces of such a
-   trade are lost, so its setup cannot continue;
-3. checks that the coins reserved in the wallet and the trades in the store agree: no coin stays
-   reserved without a trade, and no trade is without its reservation;
+   trade are lost, so its setup cannot continue. The trade stays in the store as abandoned;
+3. makes the coins reserved in the wallet and the trades in the store agree: a reserved coin that
+   no trade reserves is released, and a coin that a trade reserves is reserved again;
 4. watches the outputs of every trade that is not final, and evaluates the blocks since the
-   deposit of each trade ([chain-observation.md](chain-observation.md));
+   deposit of each trade was signed ([chain-observation.md](chain-observation.md));
 5. performs the reactions for the events it finds, and continues the deadlines;
-6. sends again every transaction with the status "sent".
+6. sends every transaction that the trader must have on the network and that is not confirmed.
+
+Until step 4 is done for a trade, the engine does not know what happened to the trade on the
+chain. In this time a request that needs a condition of the chain is refused as "condition of the
+chain does not hold yet", and the caller can repeat it. The engine sends no transaction of the
+trade in this time.
+
+Rationale for step 3: `musigd` can stop between the reservation of a coin and the storing of its
+trade. Only trades reserve coins, so a reserved coin without a trade belongs to a trade that was
+never stored, and nothing of that trade left the engine.
+
+### A record that cannot be loaded
+
+If one record of the store cannot be loaded, for example because it is damaged, because it has a
+format that the program does not know, or because it does not belong to the seed of the wallet:
+
+- no trade is loaded, and the engine serves no request for a trade, also not for a new trade.
+  The error names the trade and the reason;
+- the reserved coins of the wallet stay reserved, and none of them can be released by hand;
+- the other functions of the wallet keep working.
+
+Rationale: an engine that knows a part of its trades would accept the ID of a trade that it does
+not know for a new trade, would not watch the trade that it lost, and would release the coins of
+that trade. The funds of the wallet that are in no trade must stay reachable.
+
+How the user leaves this condition is open point O17 in [README.md](README.md).
 
 After the trader signed the deposit, no MuSig2 nonce is needed any more: the penalty transaction
 is signed with the full key, the claim with a single key, and the custom payout with wallet keys.
@@ -86,7 +142,12 @@ also after a restart. The set of used trade IDs is part of the backup.
 
 ## Backup and restore
 
-A backup of the trade store is needed in addition to the seed.
+The design of the restore, from the seed alone and from a backup, is postponed
+(`concept/CompletionPlan.md`, section 12, row 9; point W1 of the wallet specification). This
+section states what is known today. Nothing of it is implemented or tested.
+
+A backup of the trade store, which is a backup of the wallet database, is needed in addition to
+the seed.
 
 What the seed alone restores, for a trade whose ID is known:
 
