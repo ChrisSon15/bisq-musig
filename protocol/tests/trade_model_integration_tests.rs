@@ -1223,7 +1223,7 @@ const fn closed(closure_type: ClosureType) -> TradeState {
 }
 
 /// The trader who publishes the warning transaction in a test.
-fn publisher(trade: &mut Trade, buyer_warns: bool) -> &mut Trader {
+const fn publisher(trade: &mut Trade, buyer_warns: bool) -> &mut Trader {
     if buyer_warns {
         &mut trade.buyer
     } else {

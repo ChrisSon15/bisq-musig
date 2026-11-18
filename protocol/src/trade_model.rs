@@ -1175,6 +1175,27 @@ enum EscrowSpend {
     },
 }
 
+impl Situation {
+    /// The number of confirmations of the transaction after which no transaction of the trade
+    /// can confirm any more, or 0 if no such transaction is confirmed.
+    const fn closing_confirmations(&self) -> u32 {
+        match self {
+            Self::PayoutsUnspent => 0,
+            Self::Warning { escrow, .. } => match *escrow {
+                EscrowSpend::Unspent => 0,
+                EscrowSpend::Redirect { confirmations }
+                | EscrowSpend::Claim { confirmations }
+                | EscrowSpend::Penalty { confirmations } => confirmations,
+            },
+            Self::SellerPayoutSpent { spend } => spend.confirmations,
+            Self::DepositConflict { confirmations }
+            | Self::CustomPayout { confirmations }
+            | Self::BuyerPayoutSpent { confirmations }
+            | Self::Unknown { confirmations, .. } => *confirmations,
+        }
+    }
+}
+
 impl TradeModel {
     /// Takes the facts about the chain, lets the engine perform the steps that it takes on its
     /// own, and derives the state of the trade from the confirmed transactions. Returns what
@@ -1252,30 +1273,9 @@ impl TradeModel {
         if !matches!(self.state(), TradeState::TradeClosed(_)) {
             return false;
         }
-        let confirmations = match self.situation() {
-            Ok(
-                Situation::DepositConflict { confirmations }
-                | Situation::CustomPayout { confirmations }
-                | Situation::BuyerPayoutSpent { confirmations }
-                | Situation::Unknown { confirmations, .. },
-            ) => confirmations,
-            Ok(Situation::SellerPayoutSpent { spend }) => spend.confirmations,
-            Ok(Situation::Warning {
-                escrow:
-                    EscrowSpend::Redirect { confirmations }
-                    | EscrowSpend::Claim { confirmations }
-                    | EscrowSpend::Penalty { confirmations },
-                ..
-            }) => confirmations,
-            Ok(
-                Situation::Warning {
-                    escrow: EscrowSpend::Unspent,
-                    ..
-                }
-                | Situation::PayoutsUnspent,
-            )
-            | Err(_) => 0,
-        };
+        let confirmations = self
+            .situation()
+            .map_or(0, |situation| situation.closing_confirmations());
         confirmations >= u32::from(MIN_CONFIRMATIONS)
     }
 
