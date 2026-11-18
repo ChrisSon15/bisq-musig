@@ -12,7 +12,7 @@ section 8 under WP1 and WP2. The file and line references of
 the plan point to the code after WP1. The other text of the plan still describes the state of
 revision 3; sections 2 and 4.3 and the findings name what WP1 changed.
 
-The decisions D17, D18 and D19 and the tests G13 to G15 were added on 2026-11-18.
+The decisions D17, D18, D19 and D20 and the tests G13 to G15 were added on 2026-11-18.
 
 The specification of WP0 was written on 2026-11-18 to `docs/specifications/trade/`. Its README
 lists the open points that wait for a confirmation by the project owner. On the same day O2 was
@@ -298,6 +298,7 @@ The decisions D1 to D16 were taken by the project owner on 2026-11-17, D17 and D
 | D17 | When does a failed check terminate a trade? | Everything by which the engine detects that the other side tampered with the software or does not run our client terminates the trade. The reason is logged in detail. The trade is unusable afterwards; there is no recovery. Other conditions, which can also happen because of network issues for example, can be repeated. (First form of the decision on the same day: "anything which fails the validation terminates the trade".) | The specification lists the checks of each kind (`docs/specifications/trade/trade-states.md`). The engine marks the trade as terminated, logs the reason, accepts no corrected data and does not change the state. Implemented so far for the check of the peer's nonce shares only (G4). The other checks of peer data do not terminate the trade yet (WP1). Which actions a terminated trade keeps after the deposit is signed is postponed (section 12, row 8). Tests G13, G15. |
 | D18 | In which order does the engine process a request? | Validate before storing, and check the state before any change. | Every engine operation checks the state first, then validates all data of the request, and only then stores data or signs. A refused request leaves no data and no signature in the trade. The handlers in `rpc/src/server.rs` do not follow this order yet: several store request data before the validation, and `SignCustomPayoutTx` signs before the state check (WP1). Tests G14. |
 | D19 | Where do the lock times of a trade come from? | 2026-11-18: the warning lock time and the claim lock time are configuration parameters of bisq-musig, read from the environment. They are not part of the RPC protocol. | `EngineConfig` in `protocol::params` holds them, together with the deposit timeout and the release safety margin. `musigd` reads `BISQ_MUSIG_WARNING_LOCK_TIME`, `BISQ_MUSIG_CLAIM_LOCK_TIME`, `BISQ_MUSIG_DEPOSIT_TIMEOUT` and `BISQ_MUSIG_RELEASE_SAFETY_MARGIN` (or the options of the same meaning) and does not start with values outside the limits. Consequences: one pair of lock times for all trades and payment methods of a daemon; both traders must configure the same values, otherwise the setup is terminated before the deposit is signed (open point O14 of the specification). |
+| D20 | Which peers does the engine connect to? | 2026-11-18: only the peers that are configured for `musigd`. Reason given: the software operates only on regtest at present. | `ChainClient` restricts the library to the peers of `--wallet-peer`. The library would otherwise look for peers through DNS seeds when the configured peers fail. Without a reachable configured peer the engine waits, reports the condition and refuses the requests that need the chain. The decision must be looked at again before the software is used on another network than regtest. Tests J5, J10. |
 
 What D8 and answer 7 of section 12 mean together: `musigd` does not run while bisq2 is closed, so
 nothing is watched in that time. For closed trades the drain at `close` is then the only
@@ -532,7 +533,7 @@ Done:
 - The client keeps its connection: it connects again after it lost its peers, evaluates the
   blocks that it missed, and notices a reorganisation that happened in between. It reports
   "no peer reachable" and "no compact block filters" (#188). It uses only the configured peers
-  (open point O15 of the specification).
+  (decision D20).
 - The wallet sync and the trade service share this client (F28). `CBFScanner` is removed.
 - `musigd` has no Bitcoin Core options and no RPC connection to a node (F27). The trade service
   publishes the deposit over the peer-to-peer network, repeats the sending after every block and

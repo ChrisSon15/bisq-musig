@@ -48,7 +48,7 @@ A paragraph that starts with "Rationale" explains a requirement and is not one i
 
 ## Where the decisions are specified
 
-The decisions D1 to D18 of `concept/CompletionPlan.md`, section 7:
+The decisions D1 to D20 of `concept/CompletionPlan.md`, section 7:
 
 | Decision | Specified in |
 |---|---|
@@ -68,6 +68,7 @@ The decisions D1 to D18 of `concept/CompletionPlan.md`, section 7:
 | D17 Proof of a modified or foreign client of the peer terminates the trade; other failures can be repeated | [trade-states.md](trade-states.md) |
 | D18 Validate before storing, check the state before any change | [trade-states.md](trade-states.md) |
 | D19 Lock times are configuration values of the engine, read from the environment; they are not part of the service interface | [parameters.md](parameters.md) |
+| D20 The engine connects only to the configured peers | [chain-observation.md](chain-observation.md) |
 
 D1, D15 and D16 are decisions about the code and the documents. They need no rule here.
 
@@ -90,7 +91,6 @@ confirmed. The text of the files contains the rule of the column "Rule in the sp
 | O12 | Sanity limits of the engine for the deposit fee rate and the prepared fee rate | Not specified. | [fees.md](fees.md) |
 | O13 | Which request carries the trade parameters (amounts, fee rates, trade fee receiver)? The first version of this specification named the request that creates the trade (step 1). | Step 2 (`GetNonceShares`), as in the existing messages. No message changes. Nothing in step 1 depends on the parameters. | [parameters.md](parameters.md), [setup-and-deposit.md](setup-and-deposit.md) |
 | O14 | Two unmodified clients with different lock times in their configuration (D19): the partial signatures do not fit, and the engine cannot tell this from a modified client. | The setup is terminated (D17). Nothing is signed, so no funds are at risk. The reason names the trader's own lock times. | [parameters.md](parameters.md), [trade-states.md](trade-states.md) |
-| O15 | Does the engine use only the peers that the user configured? The library for compact block filters looks for other peers through DNS seeds when the configured peers fail. | Only the configured peers. Without a reachable configured peer the engine waits and reports the condition. | [chain-observation.md](chain-observation.md) |
 
 Points that were open and are decided:
 
@@ -98,6 +98,7 @@ Points that were open and are decided:
 |---|---|---|---|
 | O2 | Which failed checks terminate a trade (D17)? | 2026-11-18: everything by which the engine detects that the peer tampered with the software or does not run our client terminates the trade, and the reason is logged in detail. Conditions that can have another cause, for example a network problem, can be repeated. | [trade-states.md](trade-states.md) |
 | O6 | Path and tag of the key derivation (N6) | 2026-11-18: accepted as specified. Path `m/86'/coin_type'/0'/2'`, tag `BisqMuSig/key-share`. | [key-derivation.md](key-derivation.md) |
+| O15 | Does the engine use only the peers that the user configured? The library for compact block filters looks for other peers through DNS seeds when the configured peers fail. | 2026-11-18: yes, configured peers only (D20). The reason given: the software operates only on regtest at present. | [chain-observation.md](chain-observation.md) |
 
 ## Differences to the state model in the code
 

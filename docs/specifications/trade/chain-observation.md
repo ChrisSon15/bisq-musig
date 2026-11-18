@@ -31,7 +31,7 @@ The engine needs at least one reachable peer that serves compact block filters. 
 start option of `musigd`. The network of the peers must be the network of the wallet.
 
 - The engine connects only to these peers. It does not look for other peers, also not when none
-  of these peers is reachable. This is open point O15 in [README.md](README.md).
+  of these peers is reachable.
 - While no peer is reachable, the engine keeps trying to connect, with pauses that grow up to
   half a minute. It reports this condition. No step that needs the chain proceeds, and no state
   changes.
@@ -48,10 +48,15 @@ start option of `musigd`. The network of the peers must be the network of the wa
 - A peer of another network does not answer. The engine cannot tell it from a peer that is not
   reachable.
 
-Rationale for the first rule: the user chooses the peers, for example his own node. A peer learns
-the IP address of the user and the transactions that the user sends, and a client with a single
-peer depends on this peer for a complete view of the chain. The engine must not replace the
-user's choice by peers that it finds itself.
+The first rule is a decision of the project owner of 2026-11-18 (D20 in
+`concept/CompletionPlan.md`). The reason given for it: the software operates only on regtest at
+present, where no other peers exist. The rule must be looked at again before the software is used
+on another network.
+
+A further reason for the rule, which holds on every network: the user chooses the peers, for
+example his own node. A peer learns the IP address of the user and the transactions that the user
+sends, and a client with a single peer depends on this peer for a complete view of the chain.
+Peers that the engine finds itself would replace the user's choice.
 
 A peer sees the IP address of the user and the transactions that the user sends. Hiding the IP
 address is not part of this specification. This is open point O4 in [README.md](README.md).
