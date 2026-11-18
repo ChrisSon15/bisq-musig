@@ -355,11 +355,11 @@ impl<S: Send + Sync> BMPWalletServiceImpl<S> {
             let txid = tx.compute_txid();
             match task::block_in_place(|| broadcaster.transaction_broadcast(&tx)) {
                 Ok(_) => {
-                    info!(%txid, height, "Sent an unconfirmed transaction of the wallet again.")
+                    info!(%txid, height, "Sent an unconfirmed transaction of the wallet again.");
                 }
                 // For example: no peer asked for it, because the peer holds it already.
                 Err(error) => {
-                    debug!(%txid, height, %error, "Unconfirmed transaction not sent again.")
+                    debug!(%txid, height, %error, "Unconfirmed transaction not sent again.");
                 }
             }
         }
