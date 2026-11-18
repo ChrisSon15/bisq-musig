@@ -338,7 +338,8 @@ macro_rules! access {
 // ---- Creation and general properties ----
 
 impl TradeModel {
-    /// Creates the trade of one trader. The wallet supplies the network and the script key.
+    /// Creates the trade of one trader. The wallet supplies the network, the key shares and the
+    /// script key.
     pub fn new(
         trade_id: String,
         my_role: Role,
@@ -349,8 +350,13 @@ impl TradeModel {
             am_buyer,
             ..Keys::default()
         };
-        keys.buyer_payout_ctx.init_my_key_share();
-        keys.seller_payout_ctx.init_my_key_share();
+        // The key shares are derived from the seed of the wallet and the trade ID (D10). The
+        // engine keeps them in memory only.
+        let key_shares = wallet.trade_key_shares(&trade_id)?;
+        keys.buyer_payout_ctx
+            .set_my_key_share(key_shares.buyer_payout);
+        keys.seller_payout_ctx
+            .set_my_key_share(key_shares.seller_payout);
         keys.my_multisig_script_key = Some(wallet.new_internal_key()?);
 
         let mut trade_model = Self {
@@ -2079,6 +2085,13 @@ mod tests {
     }
 
     fn new_trader(role: Role) -> Trader {
+        new_trader_for_trade(role, "trade")
+    }
+
+    /// A trader for the trade `trade_id`. The key shares are derived from the seed of the mock
+    /// wallet and the trade ID, so two traders with the same role and trade ID have the same key
+    /// shares.
+    fn new_trader_for_trade(role: Role, trade_id: &str) -> Trader {
         let mut wallet: Box<dyn ProtocolWalletApi> =
             if matches!(role, Role::BuyerAsMaker | Role::BuyerAsTaker) {
                 Box::new(mock_buyer_trade_wallet())
@@ -2086,7 +2099,7 @@ mod tests {
                 Box::new(mock_seller_trade_wallet())
             };
         let model =
-            TradeModel::new("trade".to_owned(), role, &mut *wallet).expect("trade can be created");
+            TradeModel::new(trade_id.to_owned(), role, &mut *wallet).expect("trade can be created");
         Trader { model, wallet }
     }
 
@@ -2303,6 +2316,31 @@ mod tests {
             assert!(warning_tx.input.iter().all(|i| i.sequence.0 == 20));
             let claim_tx = me.model.my_signed_claim_tx().expect("signed");
             assert_eq!(claim_tx.input[0].sequence.0, 10);
+        }
+    }
+
+    /// H9: the key shares of a trade come from the wallet (D10). The same wallet seed and the same
+    /// trade ID give the same key shares again, for example after a restart. Another trade ID
+    /// or another wallet gives other key shares.
+    #[test]
+    fn h9_key_shares_are_derived_from_seed_and_trade_id() {
+        let public_key_shares = |role, trade_id| {
+            let trader = new_trader_for_trade(role, trade_id);
+            let key_shares = trader.model.my_key_shares().expect("key shares exist");
+            [*key_shares.buyer_payout, *key_shares.seller_payout]
+        };
+        let buyer = public_key_shares(Role::BuyerAsTaker, "trade-1");
+        assert_eq!(public_key_shares(Role::BuyerAsTaker, "trade-1"), buyer);
+        // The role label of the trader has no influence, only the payout has.
+        assert_eq!(public_key_shares(Role::BuyerAsMaker, "trade-1"), buyer);
+        assert_ne!(buyer[0], buyer[1]);
+
+        let other_trade = public_key_shares(Role::BuyerAsTaker, "trade-2");
+        let other_wallet = public_key_shares(Role::SellerAsMaker, "trade-1");
+        for other in [other_trade, other_wallet] {
+            for key_share in other {
+                assert!(!buyer.contains(&key_share));
+            }
         }
     }
 
@@ -2696,7 +2734,7 @@ mod tests {
     fn g12_second_version_of_peer_data() {
         for roles in ROLE_PAIRS {
             let (mut me, _peer) = traders_after_deposit_signature(roles);
-            let other_peer = new_trader(roles.1);
+            let other_peer = new_trader_for_trade(roles.1, "other trade");
             let result = receive_key_shares(&mut me, &sent_key_shares(&other_peer));
             assert_terminated(&result, &me, "differ from the ones that it sent before");
             assert_eq!(me.model.state(), TradeState::Deposit);

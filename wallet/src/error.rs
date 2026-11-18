@@ -37,6 +37,10 @@ pub enum WalletErrorKind {
     NotTaprootAddress,
     #[error("malformed PSBT")]
     MalformedPsbt,
+    #[error("the trade ID cannot be used: {0}")]
+    InvalidTradeId(&'static str),
+    #[error("this wallet does not support the operation: {0}")]
+    Unsupported(&'static str),
     Conversion(#[from] bdk_wallet::miniscript::descriptor::ConversionError),
     CreateTx(#[from] bdk_wallet::error::CreateTxError),
     #[error("imported key descriptor does not match its secret key")]

@@ -169,5 +169,5 @@ In this example the hash is smaller than the group order, so the reduction does 
 The vectors were computed with [key-derivation-vectors.py](key-derivation-vectors.py). The script
 has no dependencies and can be run with `python3 key-derivation-vectors.py`. It checks its own
 building blocks against published test vectors of BIP32, BIP39, BIP86 and BIP340 before it prints
-the values. The vectors are not yet checked against an implementation in the wallet, because that
-implementation does not exist yet. Its tests must contain these vectors.
+the values. The implementation in the wallet (`wallet/src/key_shares.rs`) reproduces these vectors in its
+tests.

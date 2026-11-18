@@ -3,8 +3,9 @@ pub mod utils;
 
 pub mod bmp_wallet;
 pub mod chain_data_source;
-pub mod password;
 pub mod error;
+pub mod key_shares;
+pub mod password;
 pub mod persisted;
 pub mod protocol_wallet_api;
 #[cfg(test)]
@@ -43,6 +44,7 @@ mod tests {
 
     use crate::bmp_wallet::{BMPWallet, ImportedKey, STOP_GAP, WalletApi as _};
     use crate::error::WalletErrorKind;
+    use crate::key_shares::derive_trade_key_shares;
     use crate::password::Password;
     use crate::persisted::{BMPWalletPersister as _, DBStorage};
     use crate::protocol_wallet_api::ProtocolWalletApi as _;
@@ -279,6 +281,70 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(!error.to_string().contains("abandon"));
+        Ok(())
+    }
+
+    /// H9: the wallet derives the key shares of a trade from its seed as the specification
+    /// defines. The same wallet gives the same key shares again after it was closed and loaded.
+    /// Another trade ID or another wallet gives other key shares.
+    #[test]
+    fn h9_trade_key_shares_come_from_the_seed() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let wallet = BMPWallet::new(
+            mem_storage.store.clone(),
+            &test_password(),
+            Network::Regtest,
+        )?;
+        let key_shares = wallet.trade_key_shares("trade-1")?;
+        assert!(key_shares == wallet.trade_key_shares("trade-1")?);
+        assert!(key_shares != wallet.trade_key_shares("trade-2")?);
+        assert_ne!(key_shares.buyer_payout, key_shares.seller_payout);
+
+        // The rule of the specification, applied to the seed words of the wallet.
+        let seed = wallet.get_seed_phrase(&test_password())?.to_seed("");
+        let master_key = Xpriv::new_master(Network::Regtest, &seed)?;
+        assert!(key_shares == derive_trade_key_shares(&master_key, "trade-1")?);
+        drop(wallet);
+
+        let loaded = BMPWallet::load_wallet(mem_storage.store, Network::Regtest, &test_password())?;
+        assert!(key_shares == loaded.trade_key_shares("trade-1")?);
+
+        let other_storage = MemDbHandle::new()?;
+        let other_wallet = BMPWallet::new(other_storage.store, &test_password(), Network::Regtest)?;
+        assert!(key_shares != other_wallet.trade_key_shares("trade-1")?);
+        Ok(())
+    }
+
+    /// H10: a key share is never a key of the BIP86 wallet. Checked for the first 1000 keys of
+    /// both keychains.
+    #[test]
+    fn h10_trade_key_shares_are_no_wallet_keys() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        let key_shares = wallet.trade_key_shares("trade-1")?;
+        let key_share_keys = [key_shares.buyer_payout, key_shares.seller_payout]
+            .map(|key_share| derive_public_key(&key_share));
+
+        let secp = Secp256k1::new();
+        for keychain in [KeychainKind::External, KeychainKind::Internal] {
+            let Descriptor::Tr(tr) = wallet.public_descriptor(keychain) else {
+                unreachable!("a BIP86 wallet has Taproot descriptors")
+            };
+            for index in 0..1000 {
+                let wallet_key = tr
+                    .internal_key()
+                    .clone()
+                    .at_derivation_index(index)?
+                    .derive_public_key(&secp)?
+                    .inner
+                    .x_only_public_key()
+                    .0;
+                assert!(!key_share_keys.contains(&wallet_key));
+                // The key share is also not the tweaked output key of an address.
+                let (output_key, _) = wallet_key.tap_tweak(&secp, None);
+                assert!(!key_share_keys.contains(&output_key.to_x_only_public_key()));
+            }
+        }
         Ok(())
     }
 

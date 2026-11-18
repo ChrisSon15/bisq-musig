@@ -31,10 +31,6 @@ impl KeyPair {
         Self { pub_key: prv_key.base_point_mul(), prv_key: Some(prv_key) }
     }
 
-    fn random<R: rand::RngCore + rand::CryptoRng>(rng: &mut R) -> Self {
-        Self::from_private(Scalar::random(rng))
-    }
-
     fn set_prv_key(&mut self, prv_key: Scalar) -> Result<&Scalar> {
         if self.pub_key != prv_key.base_point_mul() {
             return Err(MultisigErrorKind::MismatchedKeyPair);
@@ -67,10 +63,10 @@ pub struct KeyCtx {
 }
 
 impl KeyCtx {
-    pub fn init_my_key_share(&mut self) -> &KeyPair {
-        // TODO: Consider making the RNG configurable, to aid unit testing. (Also, we may not
-        //  necessarily want to use a nondeterministic random key share):
-        self.my_key_share.get_or_insert_with(|| KeyPair::random(&mut rand::rng()))
+    /// Sets the trader's own secret key share. The wallet derives it from its seed and the trade
+    /// ID, so that it can be derived again after a restart or a restore.
+    pub fn set_my_key_share(&mut self, prv_key: Scalar) -> &KeyPair {
+        self.my_key_share.insert(KeyPair::from_private(prv_key))
     }
 
     pub fn my_key_share(&self) -> Result<&KeyPair> {

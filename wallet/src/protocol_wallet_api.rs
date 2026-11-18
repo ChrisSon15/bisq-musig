@@ -21,6 +21,7 @@ use secp::Scalar;
 
 use crate::error::WalletErrorKind::MalformedPsbt;
 use crate::error::{Result, WalletErrorKind};
+use crate::key_shares::{TradeKeyShares, derive_trade_key_shares};
 
 /// The Protocol Wallet API is used by the protocol to create and sign transactions.
 /// It's the part of functionality being exposed only to the protocol.
@@ -64,6 +65,12 @@ pub trait ProtocolWalletApi {
         tap_tree: Option<TapTree<XOnlyPublicKey>>,
     ) -> Result<()>;
 
+    /// Returns the two secret key shares of the trade `trade_id`, derived from the seed of the
+    /// wallet as specified in `docs/specifications/trade/key-derivation.md`. The same seed and the
+    /// same trade ID always give the same key shares, so a trade ID must be used for one trade
+    /// only. The seed does not leave the wallet.
+    fn trade_key_shares(&self, trade_id: &str) -> Result<TradeKeyShares>;
+
     /// Lock one UTXO and exclude it from coin selection.
     fn lock_utxo(&mut self, utxo: OutPoint) -> Result<()>;
     /// List currently unspent UTXOs that are locked.
@@ -77,6 +84,8 @@ pub trait ProtocolWalletApi {
 pub struct MemWallet {
     wallet: Wallet,
     client: BdkElectrumClient<Client>,
+    /// The master key of the wallet, for the derivation of the key shares of trades.
+    master_key: Xpriv,
 }
 
 // TODO think about stop_gap and batch_size
@@ -109,7 +118,11 @@ impl MemWallet {
             .keymap(KeychainKind::Internal, internal_map)
             .create_wallet_no_persist()?;
 
-        Ok(Self { wallet, client })
+        Ok(Self {
+            wallet,
+            client,
+            master_key: xprv,
+        })
     }
 
     pub fn sync(&mut self) -> Result<()> {
@@ -220,6 +233,10 @@ impl ProtocolWalletApi for MemWallet {
         todo!("MemWallet does not yet support importing private keys")
     }
 
+    fn trade_key_shares(&self, trade_id: &str) -> Result<TradeKeyShares> {
+        derive_trade_key_shares(&self.master_key, trade_id)
+    }
+
     fn lock_utxo(&mut self, utxo: OutPoint) -> Result<()> {
         self.wallet.lock_outpoint(utxo);
         Ok(())
@@ -284,6 +301,12 @@ impl ProtocolWalletApi for Wallet {
             "bdk_wallet::Wallet does not support importing external private keys; \
             use BMPWallet for that"
         )
+    }
+
+    fn trade_key_shares(&self, _trade_id: &str) -> Result<TradeKeyShares> {
+        Err(WalletErrorKind::Unsupported(
+            "a plain BDK wallet gives no access to its seed, so it cannot derive key shares",
+        ))
     }
 
     fn lock_utxo(&mut self, utxo: OutPoint) -> Result<()> {

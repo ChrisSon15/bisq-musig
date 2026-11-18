@@ -30,6 +30,7 @@ use zeroize::Zeroizing;
 use crate::chain_data_source::ChainDataSource;
 use crate::coin_selection::{AlwaysSpendImportedFirst, SpendImportedOnly};
 use crate::error::{Result, WalletErrorKind};
+use crate::key_shares::{TradeKeyShares, derive_trade_key_shares};
 use crate::password::Password;
 use crate::persisted::{BMPDatabase, BMPWalletPersister as _, DBStorage, PersistenceError};
 use crate::protocol_wallet_api::{
@@ -825,6 +826,13 @@ impl ProtocolWalletApi for BMPWallet {
         tap_tree: Option<TapTree<XOnlyPublicKey>>,
     ) -> Result<()> {
         self.import_private_key(pk, tap_tree)
+    }
+
+    fn trade_key_shares(&self, trade_id: &str) -> Result<TradeKeyShares> {
+        let mnemonic = Self::load_mnemonic(&self.db)?;
+        let seed = Zeroizing::new(mnemonic.to_seed(""));
+        let master_key = Xpriv::new_master(self.network(), &seed[..])?;
+        derive_trade_key_shares(&master_key, trade_id)
     }
 
     fn list_locked_utxos(&self) -> Vec<OutPoint> {

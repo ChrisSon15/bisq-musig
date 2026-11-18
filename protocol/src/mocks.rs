@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use bdk_wallet::bitcoin::bip32::Xpriv;
 use bdk_wallet::bitcoin::taproot::Signature;
 use bdk_wallet::bitcoin::transaction::Version;
 use bdk_wallet::bitcoin::{
@@ -9,6 +10,7 @@ use bdk_wallet::bitcoin::{
 use bdk_wallet::miniscript::descriptor::TapTree;
 use musig2::secp::Scalar;
 use wallet::error::WalletErrorKind;
+use wallet::key_shares::{TradeKeyShares, derive_trade_key_shares};
 use wallet::protocol_wallet_api::ProtocolWalletApi;
 
 use crate::psbt::Redact as _;
@@ -24,6 +26,9 @@ struct MockTradeWallet<Cs: Iterator<Item = TxOutput>, As: Iterator<Item = Addres
     signature_map: BTreeMap<OutPoint, Signature>,
     internal_key: Option<XOnlyPublicKey>,
     script_sigs: BTreeMap<XOnlyPublicKey, Vec<Signature>>,
+    /// The seed for the key shares of trades. Each mock wallet has its own seed.
+    seed: [u8; 32],
+    locked_utxos: BTreeSet<OutPoint>,
 }
 
 impl<Cs: Iterator<Item = TxOutput>, As: Iterator<Item = Address>> ProtocolWalletApi
@@ -161,20 +166,27 @@ impl<Cs: Iterator<Item = TxOutput>, As: Iterator<Item = Address>> ProtocolWallet
         unimplemented!("MockTradeWallet does not support importing private keys")
     }
 
-    fn lock_utxo(&mut self, _utxo: OutPoint) -> wallet::error::Result<()> {
-        unimplemented!("To be determined")
+    fn trade_key_shares(&self, trade_id: &str) -> wallet::error::Result<TradeKeyShares> {
+        let master_key = Xpriv::new_master(Network::Regtest, &self.seed)?;
+        derive_trade_key_shares(&master_key, trade_id)
+    }
+
+    fn lock_utxo(&mut self, utxo: OutPoint) -> wallet::error::Result<()> {
+        self.locked_utxos.insert(utxo);
+        Ok(())
     }
 
     fn list_locked_utxos(&self) -> Vec<OutPoint> {
-        unimplemented!("To be determined")
+        self.locked_utxos.iter().copied().collect()
     }
 
-    fn unlock_utxo(&mut self, _utxo: OutPoint) -> wallet::error::Result<()> {
-        unimplemented!("To be determined")
+    fn unlock_utxo(&mut self, utxo: OutPoint) -> wallet::error::Result<()> {
+        self.locked_utxos.remove(&utxo);
+        Ok(())
     }
 
-    fn is_utxo_locked(&self, _utxo: OutPoint) -> bool {
-        unimplemented!("To be determined")
+    fn is_utxo_locked(&self, utxo: OutPoint) -> bool {
+        self.locked_utxos.contains(&utxo)
     }
 }
 
@@ -203,7 +215,15 @@ pub fn mock_buyer_trade_wallet() -> impl ProtocolWalletApi {
          eef114e89becb490a80cfdab946d2d91748ccea501ceb4f08655dcc2868c0463",
     ]);
 
-    MockTradeWallet { funding_coins, new_addresses, signature_map, internal_key, script_sigs }
+    MockTradeWallet {
+        funding_coins,
+        new_addresses,
+        signature_map,
+        internal_key,
+        script_sigs,
+        seed: [1; 32],
+        locked_utxos: BTreeSet::new(),
+    }
 }
 
 //noinspection SpellCheckingInspection
@@ -235,7 +255,15 @@ pub fn mock_seller_trade_wallet() -> impl ProtocolWalletApi {
          13d658a3334a4070ce585cb907a67604fc74578e84e714c38c6547377fac133e",
     ]);
 
-    MockTradeWallet { funding_coins, new_addresses, signature_map, internal_key, script_sigs }
+    MockTradeWallet {
+        funding_coins,
+        new_addresses,
+        signature_map,
+        internal_key,
+        script_sigs,
+        seed: [2; 32],
+        locked_utxos: BTreeSet::new(),
+    }
 }
 
 fn signature_vec(signatures: &[&'static str]) -> Vec<Signature> {
