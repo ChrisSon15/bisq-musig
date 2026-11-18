@@ -723,6 +723,157 @@ fn d1_custom_payout_on_chain() {
     }
 }
 
+/// A buyer and a seller who have signed the same custom payout, with a confirmed deposit.
+fn trade_with_signed_custom_payout() -> (Trader, Trader) {
+    let (mut buyer, mut seller) = trade(BUYER_SELLER_ROLES[0]);
+    observe_both(&mut buyer, &mut seller, &facts(3, &[]));
+    for trader in [&mut buyer, &mut seller] {
+        trader
+            .model
+            .sign_custom_payout(&mut *trader.wallet, Amount::from_sat(100_000), FEE_RATE)
+            .expect("signed");
+    }
+    (buyer, seller)
+}
+
+fn custom_payout_psbt(trader: &Trader) -> Psbt {
+    trader.model.custom_payout_psbt().expect("signed").clone()
+}
+
+fn finalize(trader: &mut Trader, peers_psbt: Psbt) -> Result<Transaction> {
+    trader
+        .model
+        .finalize_custom_payout(&mut *trader.wallet, Ok(peers_psbt))
+}
+
+/// D1, D4: each trader finishes the custom payout with the PSBT of the peer. Both get the same
+/// transaction, and a repeated request returns it again. The PSBT of a peer who has finished
+/// already is accepted as well: it holds the signatures in the witness.
+#[test]
+fn d1_d4_custom_payout_is_finished_with_the_signatures_of_the_peer() {
+    let (mut buyer, mut seller) = trade_with_signed_custom_payout();
+    let (buyers_psbt, sellers_psbt) = (custom_payout_psbt(&buyer), custom_payout_psbt(&seller));
+
+    let sellers_tx = finalize(&mut seller, buyers_psbt.clone()).expect("valid signatures");
+    assert_eq!(seller.model.state(), closed(ClosureType::Custom));
+    assert_eq!(kinds(&seller), vec![TxKind::CustomPayout]);
+    assert_eq!(
+        finalize(&mut seller, buyers_psbt).expect("repeated request"),
+        sellers_tx
+    );
+
+    // The buyer gets the PSBT that the seller has finished.
+    let finished_psbt = custom_payout_psbt(&seller);
+    assert!(finished_psbt.inputs[0].final_script_witness.is_some());
+    let buyers_tx = finalize(&mut buyer, finished_psbt).expect("valid signatures");
+    assert_eq!(buyers_tx, sellers_tx);
+    assert_eq!(
+        finalize(&mut buyer, sellers_psbt).expect("repeated request"),
+        buyers_tx
+    );
+    assert_eq!(buyer.model.state(), closed(ClosureType::Custom));
+}
+
+/// D3, G15: a PSBT of the peer without his signatures is refused. The trade continues, and the
+/// signed PSBT is accepted afterwards.
+#[test]
+fn d3_custom_payout_psbt_without_signatures_is_refused() {
+    let (mut buyer, mut seller) = trade_with_signed_custom_payout();
+    let mut unsigned_psbt = custom_payout_psbt(&buyer);
+    for input in &mut unsigned_psbt.inputs {
+        input.tap_script_sigs.clear();
+    }
+    let result = finalize(&mut seller, unsigned_psbt);
+    assert!(
+        matches!(result, Err(ProtocolErrorKind::MissingPeerSignature)),
+        "{result:?}"
+    );
+    // The seller's own PSBT holds only his own signatures.
+    let own_psbt = custom_payout_psbt(&seller);
+    let result = finalize(&mut seller, own_psbt);
+    assert!(
+        matches!(result, Err(ProtocolErrorKind::MissingPeerSignature)),
+        "{result:?}"
+    );
+    assert_eq!(seller.model.state(), TradeState::CustomPayoutSigned);
+    assert_eq!(seller.model.termination_reason(), None);
+    let (buyers_psbt, sellers_psbt) = (custom_payout_psbt(&buyer), custom_payout_psbt(&seller));
+    finalize(&mut seller, buyers_psbt).expect("valid signatures");
+    finalize(&mut buyer, sellers_psbt).expect("valid signatures");
+}
+
+/// G13 for the custom payout: a PSBT of the peer with an invalid signature, in the signatures
+/// for the script path or in a finished witness, terminates the trade. The trade is not closed,
+/// and no transaction is named for sending.
+#[test]
+fn g13_custom_payout_psbt_with_an_invalid_signature_terminates_the_trade() {
+    type Change = fn(&mut Psbt, &Psbt);
+    let changes: [(&str, Change); 4] = [
+        ("a changed signature", |psbt, _| {
+            let signature = psbt.inputs[1].tap_script_sigs.values_mut().next().unwrap();
+            let mut bytes = signature.signature.serialize();
+            bytes[40] ^= 1;
+            signature.signature =
+                bdk_wallet::bitcoin::secp256k1::schnorr::Signature::from_slice(&bytes).unwrap();
+        }),
+        ("the signature of the other input", |psbt, _| {
+            let other = *psbt.inputs[0].tap_script_sigs.values().next().unwrap();
+            *psbt.inputs[1].tap_script_sigs.values_mut().next().unwrap() = other;
+        }),
+        ("a signature for a part of the transaction", |psbt, _| {
+            let signature = psbt.inputs[0].tap_script_sigs.values_mut().next().unwrap();
+            signature.sighash_type = TapSighashType::SinglePlusAnyoneCanPay;
+        }),
+        // A witness of the right shape, with the signatures of the trader himself in both
+        // places. A combination of the two PSBTs would take this witness over.
+        (
+            "a finished witness without a signature of the peer",
+            |psbt, own| {
+                for (input, own_input) in psbt.inputs.iter_mut().zip(&own.inputs) {
+                    let ((_, leaf_hash), own_signature) =
+                        own_input.tap_script_sigs.first_key_value().unwrap();
+                    let (control_block, (script, _)) =
+                        own_input.tap_scripts.first_key_value().unwrap();
+                    assert_eq!(script.tapscript_leaf_hash(), *leaf_hash);
+                    let mut witness = bdk_wallet::bitcoin::Witness::new();
+                    witness.push(own_signature.serialize());
+                    witness.push(own_signature.serialize());
+                    witness.push(script.as_bytes());
+                    witness.push(control_block.serialize());
+                    input.tap_script_sigs.clear();
+                    input.final_script_witness = Some(witness);
+                }
+            },
+        ),
+    ];
+    for (what, change) in changes {
+        for buyer_finishes in [true, false] {
+            let (mut buyer, mut seller) = trade_with_signed_custom_payout();
+            let (me, peer) = pick(buyer_finishes, &mut buyer, &mut seller);
+            let mut peers_psbt = custom_payout_psbt(peer);
+            change(&mut peers_psbt, &custom_payout_psbt(me));
+
+            let result = finalize(me, peers_psbt);
+            match &result {
+                Err(ProtocolErrorKind::TradeTerminated(reason)) => {
+                    assert!(reason.contains("custom payout"), "{what}: {reason}");
+                    assert!(reason.contains("is invalid"), "{what}: {reason}");
+                }
+                other => panic!("{what}: expected a terminated trade, got {other:?}"),
+            }
+            assert_eq!(me.model.state(), TradeState::CustomPayoutSigned, "{what}");
+            assert!(me.model.termination_reason().is_some(), "{what}");
+            assert_eq!(kinds(me), vec![], "{what}");
+            // The valid PSBT comes too late (D17).
+            let result = finalize(me, custom_payout_psbt(peer));
+            assert!(
+                matches!(result, Err(ProtocolErrorKind::TradeTerminated(_))),
+                "{what}"
+            );
+        }
+    }
+}
+
 /// The facts when the deposit transaction is unconfirmed, `blocks_passed` blocks after the first
 /// observation of these tests.
 pub(super) fn unconfirmed(blocks_passed: u32) -> ChainFacts {

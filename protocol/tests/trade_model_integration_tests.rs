@@ -1180,6 +1180,62 @@ fn d1_custom_payout() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// G13 for the custom payout, with real wallets: the buyer sends a PSBT of the custom payout
+/// transaction whose inputs carry a finished witness without a signature of the buyer. A node
+/// rejects the transaction with this witness. The seller's engine takes only checked signatures
+/// from the PSBT of the peer, so it does not close the trade with this transaction: it
+/// terminates the trade, and the seller keeps the way out through his warning transaction.
+#[test]
+fn g13_forged_witness_in_the_custom_payout_psbt_of_the_peer() -> anyhow::Result<()> {
+    let mut trade = Trade::with_confirmed_deposit()?;
+    trade.confirm_deposit()?;
+    for trader in [&mut trade.buyer, &mut trade.seller] {
+        trader.model.sign_custom_payout(
+            &mut trader.wallet,
+            Amount::from_sat(3_000_000),
+            FEE_RATE,
+        )?;
+    }
+    let sellers_psbt = trade.seller.model.custom_payout_psbt()?.clone();
+    let mut forged_psbt = trade.buyer.model.custom_payout_psbt()?.clone();
+    for (input, sellers_input) in forged_psbt.inputs.iter_mut().zip(&sellers_psbt.inputs) {
+        let sellers_signature = sellers_input
+            .tap_script_sigs
+            .values()
+            .next()
+            .expect("the seller signed");
+        let (control_block, (script, _)) = sellers_input
+            .tap_scripts
+            .first_key_value()
+            .expect("the PSBT names the script leaf");
+        let mut witness = bdk_wallet::bitcoin::Witness::new();
+        witness.push(sellers_signature.serialize());
+        witness.push(sellers_signature.serialize());
+        witness.push(script.as_bytes());
+        witness.push(control_block.serialize());
+        input.tap_script_sigs.clear();
+        input.final_script_witness = Some(witness);
+    }
+    let forged_tx = forged_psbt.clone().extract_tx()?;
+    let rejected = trade.broadcast(&forged_tx).expect_err("invalid signature");
+    assert!(rejected.contains("Invalid Schnorr signature"), "{rejected}");
+
+    let result = trade
+        .seller
+        .model
+        .finalize_custom_payout(&mut trade.seller.wallet, Ok(forged_psbt));
+    let error = result.expect_err("the forged witness is not accepted");
+    assert!(error.to_string().contains("is invalid"), "{error}");
+    assert_eq!(trade.seller.model.state(), TradeState::CustomPayoutSigned);
+    assert!(trade.seller.model.termination_reason().is_some());
+    assert_eq!(trade.seller.model.transactions_to_send(FEE_RATE), vec![]);
+
+    trade.wait_for_warning_lock_time()?;
+    trade.seller.model.start_warning()?;
+    assert_eq!(trade.seller.react(&trade.env), vec![TxKind::Warning]);
+    Ok(())
+}
+
 /// The bridge the protocol needs at trade closure: import the aggregated payout secret
 /// together with `deposit_payout_tap_tree(..)` and the wallet ends up watching/signing exactly
 /// the deposit payout output's script pubkey.

@@ -1084,18 +1084,47 @@ impl TradeModel {
             if expected != actual {
                 return Err(ProtocolErrorKind::OtherCustomPayoutTx { expected, actual }.into());
             }
-            trade
-                .custom_payout_tx
-                .builder
-                .combine_psbts(peers_custom_payout_psbt)?;
+            // Only the signatures of the peer are taken from his PSBT, and only after they are
+            // checked. A PSBT for our transaction with an invalid signature proves a modified
+            // client. A PSBT without a signature does not: the caller can have passed on a PSBT
+            // from before the peer signed.
+            let [buyer_script_key, seller_script_key] =
+                trade.keys.multisig_script_keys()?.map(|key| *key);
+            let script = script_paths::deposit_payout_script(&buyer_script_key, &seller_script_key);
+            let peer_is_buyer = !trade.am_buyer();
+            let peers_script_key = if peer_is_buyer {
+                buyer_script_key
+            } else {
+                seller_script_key
+            };
+            match trade.custom_payout_tx.builder.add_checked_signatures(
+                &peers_custom_payout_psbt,
+                &script,
+                &peers_script_key,
+                peer_is_buyer,
+            ) {
+                Ok(_) => {}
+                Err(TransactionErrorKind::MissingSignature) => {
+                    return Err(ProtocolErrorKind::MissingPeerSignature.into());
+                }
+                Err(TransactionErrorKind::InvalidSignature(input)) => {
+                    return Err(peer_misbehaved(format!(
+                        "the signature of the peer for input {input} of the custom payout \
+                         transaction {expected} is invalid"
+                    )));
+                }
+                Err(error) => return Err(error.into()),
+            }
             // Sign the custom payout PSBT again to finalize it:
             trade.custom_payout_tx.builder.sign_partial(wallet)?;
-            // TODO: Check the signatures of the peer. A PSBT for our transaction with an invalid
-            //  signature proves a modified client. The mock wallets of the tests sign with fixed
-            //  signatures, so this check needs tests with real wallets.
-            let Ok(custom_payout_tx) = trade.custom_payout_tx.builder.signed_tx() else {
-                return Err(ProtocolErrorKind::MissingPeerSignature.into());
-            };
+            let custom_payout_tx = trade.custom_payout_tx.builder.signed_tx()?;
+            // The trade is closed only with a transaction that the engine has checked itself,
+            // whatever the wallet did to finish the inputs.
+            trade.custom_payout_tx.builder.check_signed_tx(
+                &custom_payout_tx,
+                &script,
+                [&buyer_script_key, &seller_script_key],
+            )?;
             trade.close_trade(ClosureType::Custom)?;
             Ok(custom_payout_tx)
         })

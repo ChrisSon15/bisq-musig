@@ -1,14 +1,18 @@
 use std::collections::BTreeSet;
 
 use bdk_wallet::bitcoin::amount::CheckedSum as _;
+use bdk_wallet::bitcoin::hashes::Hash as _;
+use bdk_wallet::bitcoin::key::Secp256k1;
 use bdk_wallet::bitcoin::policy::MAX_STANDARD_TX_WEIGHT;
 use bdk_wallet::bitcoin::psbt::ExtractTxError;
+use bdk_wallet::bitcoin::secp256k1::Message;
 use bdk_wallet::bitcoin::sighash::{Prevouts, SighashCache};
 use bdk_wallet::bitcoin::taproot::{ControlBlock, LeafVersion, Signature, TAPROOT_ANNEX_PREFIX};
 use bdk_wallet::bitcoin::transaction::Version;
 use bdk_wallet::bitcoin::{
     Address, Amount, FeeRate, OutPoint, Psbt, ScriptBuf, Sequence, TapLeafHash, TapSighash,
-    TapSighashType, Transaction, TxIn, TxOut, Txid, Weight, Witness, absolute, relative,
+    TapSighashType, Transaction, TxIn, TxOut, Txid, Weight, Witness, XOnlyPublicKey, absolute,
+    relative,
 };
 use bdk_wallet::miniscript::DefiniteDescriptorKey;
 use bdk_wallet::miniscript::psbt::PsbtInputExt as _;
@@ -782,9 +786,146 @@ impl CustomPayoutTxBuilder {
         Ok(self)
     }
 
-    pub fn combine_psbts(&mut self, other: Psbt) -> Result<&mut Self> {
-        self.psbt.as_mut().ok_or(TransactionErrorKind::MissingTransaction)?.combine(other)?;
+    /// The signature hash of an input for a spend through `script`, the script leaf of the
+    /// payouts.
+    fn script_spend_sighash(&self, input_index: usize, script: &ScriptBuf) -> Result<TapSighash> {
+        let prevouts = self.inputs()?.map(|input| &input.prevout);
+        Ok(
+            SighashCache::new(&self.psbt()?.unsigned_tx).taproot_script_spend_signature_hash(
+                input_index,
+                &Prevouts::All(&prevouts),
+                TapLeafHash::from_script(script, LeafVersion::TapScript),
+                TapSighashType::Default,
+            )?,
+        )
+    }
+
+    /// Checks the signature of the owner of `key` for an input. Only a signature for the whole
+    /// transaction counts: this is what the wallets of both traders create.
+    fn check_signature(
+        &self,
+        input_index: usize,
+        script: &ScriptBuf,
+        key: &XOnlyPublicKey,
+        signature: &Signature,
+    ) -> Result<()> {
+        let sighash = self.script_spend_sighash(input_index, script)?;
+        let message = Message::from_digest(sighash.to_byte_array());
+        let valid = signature.sighash_type == TapSighashType::Default
+            && Secp256k1::verification_only()
+                .verify_schnorr(&signature.signature, &message, key)
+                .is_ok();
+        if valid {
+            Ok(())
+        } else {
+            Err(TransactionErrorKind::InvalidSignature(input_index))
+        }
+    }
+
+    /// Takes the signatures of one trader for both inputs from `signed_psbt`, a PSBT of the
+    /// custom payout transaction that this trader signed, checks them, and adds them to the PSBT
+    /// of the builder. Nothing else of `signed_psbt` is used. It comes from the peer, and a PSBT
+    /// can carry a finished witness, which a combination of the two PSBTs would take over
+    /// without a check.
+    ///
+    /// `script` is the script leaf of the payouts, and `key` the script key of the signer: the
+    /// first key of the script if `signer_is_buyer`. A signature is found among the signatures
+    /// for the script path, or in the witness of an input that the signer has finished.
+    ///
+    /// # Errors
+    /// [`TransactionErrorKind::MissingSignature`] if the PSBT holds no signature of the signer
+    /// for an input, and [`TransactionErrorKind::InvalidSignature`] if a signature is not valid.
+    pub fn add_checked_signatures(
+        &mut self,
+        signed_psbt: &Psbt,
+        script: &ScriptBuf,
+        key: &XOnlyPublicKey,
+        signer_is_buyer: bool,
+    ) -> Result<&mut Self> {
+        let leaf_hash = TapLeafHash::from_script(script, LeafVersion::TapScript);
+        let mut signatures = Vec::with_capacity(2);
+        for input_index in 0..2 {
+            let input = signed_psbt
+                .inputs
+                .get(input_index)
+                .ok_or(TransactionErrorKind::MissingSignature)?;
+            let signature = if let Some(signature) = input.tap_script_sigs.get(&(*key, leaf_hash)) {
+                *signature
+            } else {
+                let witness = input
+                    .final_script_witness
+                    .as_ref()
+                    .filter(|witness| Self::has_script_spend_shape(witness, script))
+                    .ok_or(TransactionErrorKind::MissingSignature)?;
+                Signature::from_slice(&witness[Self::witness_position(signer_is_buyer)])
+                    .map_err(|_| TransactionErrorKind::InvalidSignature(input_index))?
+            };
+            self.check_signature(input_index, script, key, &signature)?;
+            signatures.push(signature);
+        }
+        let psbt = self
+            .psbt
+            .as_mut()
+            .ok_or(TransactionErrorKind::MissingTransaction)?;
+        for (input, signature) in psbt.inputs.iter_mut().zip(signatures) {
+            // An input that is finished holds its signatures in the witness.
+            if input.final_script_witness.is_none() {
+                input.tap_script_sigs.insert((*key, leaf_hash), signature);
+            }
+        }
         Ok(self)
+    }
+
+    /// The witness of a spend through the script leaf holds the signature of the seller, the
+    /// signature of the buyer, the script and the control block. The script checks the buyer's
+    /// signature first, so that signature is the upper one of the two.
+    fn has_script_spend_shape(witness: &Witness, script: &ScriptBuf) -> bool {
+        witness.len() == 4 && &witness[2] == script.as_bytes()
+    }
+
+    const fn witness_position(signer_is_buyer: bool) -> usize {
+        if signer_is_buyer { 1 } else { 0 }
+    }
+
+    /// Checks that `signed_tx` is the custom payout transaction, and that each of its inputs is
+    /// spent through `script`, the script leaf of the payouts, with a valid signature for each
+    /// of the two script keys, the buyer's key first.
+    pub fn check_signed_tx(
+        &self,
+        signed_tx: &Transaction,
+        script: &ScriptBuf,
+        keys: [&XOnlyPublicKey; 2],
+    ) -> Result<()> {
+        if signed_tx.compute_txid() != self.psbt()?.unsigned_tx.compute_txid() {
+            return Err(TransactionErrorKind::InvalidPsbt);
+        }
+        let secp = Secp256k1::verification_only();
+        for (input_index, input) in self.inputs()?.into_iter().enumerate() {
+            let witness = &signed_tx.tx_in(input_index)?.witness;
+            if !Self::has_script_spend_shape(witness, script) {
+                return Err(TransactionErrorKind::InvalidWitness);
+            }
+            let output_key = input
+                .prevout
+                .script_pubkey
+                .as_bytes()
+                .get(2..)
+                .filter(|_| input.prevout.script_pubkey.is_p2tr())
+                .and_then(|key| XOnlyPublicKey::from_slice(key).ok())
+                .ok_or(TransactionErrorKind::InvalidWitness)?;
+            let committed = ControlBlock::decode(&witness[3])
+                .is_ok_and(|block| block.verify_taproot_commitment(&secp, output_key, script));
+            if !committed {
+                return Err(TransactionErrorKind::InvalidWitness);
+            }
+            for (key, signer_is_buyer) in keys.into_iter().zip([true, false]) {
+                let signature =
+                    Signature::from_slice(&witness[Self::witness_position(signer_is_buyer)])
+                        .map_err(|_| TransactionErrorKind::InvalidSignature(input_index))?;
+                self.check_signature(input_index, script, key, &signature)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn signed_tx(&self) -> Result<Transaction> { psbt::extract_signed_tx(self.psbt()?) }
@@ -824,6 +965,8 @@ pub enum TransactionErrorKind {
     Overflow,
     #[error("invalid witness")]
     InvalidWitness,
+    #[error("invalid signature for input {0}")]
+    InvalidSignature(usize),
     #[error("invalid PSBT")]
     InvalidPsbt,
     #[error("dust output of {0} at index {1}")]

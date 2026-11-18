@@ -3,11 +3,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bdk_wallet::bitcoin::bip32::Xpriv;
+use bdk_wallet::bitcoin::hashes::Hash as _;
+use bdk_wallet::bitcoin::key::{Keypair, Secp256k1};
+use bdk_wallet::bitcoin::secp256k1::Message;
+use bdk_wallet::bitcoin::sighash::{Prevouts, SighashCache};
 use bdk_wallet::bitcoin::taproot::Signature;
 use bdk_wallet::bitcoin::transaction::Version;
 use bdk_wallet::bitcoin::{
-    Address, Amount, FeeRate, Network, OutPoint, Psbt, ScriptBuf, Sequence, TapSighashType,
-    Transaction, TxIn, TxOut, Txid, VarInt, Weight, Witness, XOnlyPublicKey, absolute, psbt,
+    Address, Amount, FeeRate, Network, OutPoint, PrivateKey, Psbt, ScriptBuf, Sequence,
+    TapSighashType, Transaction, TxIn, TxOut, Txid, VarInt, Weight, Witness, XOnlyPublicKey,
+    absolute, psbt,
 };
 use bdk_wallet::miniscript::descriptor::TapTree;
 use musig2::secp::Scalar;
@@ -27,7 +32,9 @@ struct MockTradeWallet<Cs: Iterator<Item = TxOutput>, As: Iterator<Item = Addres
     new_addresses: As,
     signature_map: BTreeMap<OutPoint, Signature>,
     internal_key: Option<XOnlyPublicKey>,
-    script_sigs: BTreeMap<XOnlyPublicKey, Vec<Signature>>,
+    /// The secret key of `internal_key`, the script key of the trader. The wallet signs a spend
+    /// through the script path with it, so these signatures are valid.
+    script_key: Keypair,
     /// The seed for the key shares of trades. Each mock wallet has its own seed.
     seed: [u8; 32],
     locked_utxos: BTreeSet<OutPoint>,
@@ -125,18 +132,43 @@ impl<Cs: Iterator<Item = TxOutput>, As: Iterator<Item = Address>> ProtocolWallet
         psbt: &mut Psbt,
         is_selected: &dyn Fn(&OutPoint) -> bool,
     ) -> Result<(), WalletErrorKind> {
-        let mut script_sigs = self.script_sigs.clone();
+        let secp = Secp256k1::new();
+        let (script_key, _) = self.script_key.x_only_public_key();
+        let unsigned_tx = psbt.unsigned_tx.clone();
+        let prevouts = psbt
+            .inputs
+            .iter()
+            .map(|input| input.witness_utxo.clone())
+            .collect::<Option<Vec<_>>>();
 
-        for (input, TxIn { previous_output, .. })
-        in psbt.inputs.iter_mut().zip(&psbt.unsigned_tx.input)
+        for (
+            index,
+            (
+                input,
+                TxIn {
+                    previous_output, ..
+                },
+            ),
+        ) in psbt.inputs.iter_mut().zip(&unsigned_tx.input).enumerate()
         {
             if is_selected(previous_output) {
-                for (key, (leaf_hashes, _)) in &input.tap_key_origins {
-                    if let Some(sig) = script_sigs.get_mut(key).and_then(Vec::pop) {
-                        for leaf_hash in leaf_hashes {
-                            input.tap_script_sigs.insert((*key, *leaf_hash), sig);
-                        }
-                    }
+                // Script spend with the script key of the trader. The signature has no random
+                // part, like the signatures of the wallet library.
+                let leaf_hashes = input.tap_key_origins.get(&script_key)
+                    .map(|(leaf_hashes, _)| leaf_hashes.clone()).unwrap_or_default();
+                for leaf_hash in leaf_hashes {
+                    let prevouts = prevouts.as_ref()
+                        .ok_or_else(|| mock_error(TransactionErrorKind::InvalidPsbt))?;
+                    let sighash = SighashCache::new(&unsigned_tx)
+                        .taproot_script_spend_signature_hash(
+                            index, &Prevouts::All(prevouts), leaf_hash, TapSighashType::Default)
+                        .map_err(|e| mock_error(e.into()))?;
+                    let message = Message::from_digest(sighash.to_byte_array());
+                    let signature = Signature {
+                        signature: secp.sign_schnorr_no_aux_rand(&message, &self.script_key),
+                        sighash_type: TapSighashType::Default,
+                    };
+                    input.tap_script_sigs.insert((script_key, leaf_hash), signature);
                 }
                 if let Some(signature) = self.signature_map.get(previous_output) {
                     // Mock keyspend:
@@ -249,21 +281,16 @@ pub fn mock_buyer_trade_wallet_with_store_switch(
         "bcrt1pzvynlely05x82u40cts3znctmvyskue74xa5zwy0t5ueuv92726szpgpaa",
     ].map(|a| a.parse::<Address<_>>()
         .expect("hardcoded addresses should be valid").assume_checked()).into_iter();
-    let internal_key =
-        "51494dc22e24a32fe9dcfbd7e85faf345fa1df296fb49d156e859ef345201295".parse().ok();
-    let script_sigs = script_sigs(internal_key.as_slice(), &[
-        "5564448d3c5f024eaf2c65024a0c6e7a9066eb0390f8ffaeee2feacde310fabf\
-         87f3a8d8ad7fb125d7a6f68a282cfab8cd3178262a1fd0c2d06a598c8c454af8",
-        "652d0abaa3b4f8c7dd85ac9d523d44f768c8e1541aded79165c3cdfb3ba35d62\
-         eef114e89becb490a80cfdab946d2d91748ccea501ceb4f08655dcc2868c0463",
-    ]);
+    // The key of `tr(cPZzKuNmpuUjD1e8jUU4PVzy2b5LngbSip8mBsxf4e7rSFZVb4Uh)`.
+    let script_key = script_key("cPZzKuNmpuUjD1e8jUU4PVzy2b5LngbSip8mBsxf4e7rSFZVb4Uh");
+    let internal_key = Some(script_key.x_only_public_key().0);
 
     MockTradeWallet {
         funding_coins,
         new_addresses,
         signature_map,
         internal_key,
-        script_sigs,
+        script_key,
         seed: [1; 32],
         locked_utxos: BTreeSet::new(),
         trade_records: BTreeMap::new(),
@@ -295,21 +322,16 @@ pub fn mock_seller_trade_wallet_with_store_switch(
         "bcrt1pe3kcs085e8qej9aqqx6qryv2qsfxzywy9xd8pryzwemv2dghdqgscylr69",
     ].map(|a| a.parse::<Address<_>>()
         .expect("hardcoded addresses should be valid").assume_checked()).into_iter();
-    let internal_key =
-        "fcba7ecf41bc7e1be4ee122d9d22e3333671eb0a3a87b5cdf099d59874e1940f".parse().ok();
-    let script_sigs = script_sigs(internal_key.as_slice(), &[
-        "87790f7eb3e98eb1b4dadc55ff5762275c4e3c02c6491abb26c8eabfada55b4b\
-         3f2627f627919d667be8f191a1b275b01549ab24e5eeda0019f83c658840500e",
-        "52fe2e44a4789a0f9bc406da144dcacca2621d2c1286e2d8f9913425c9927288\
-         13d658a3334a4070ce585cb907a67604fc74578e84e714c38c6547377fac133e",
-    ]);
+    // The key of `tr(cNaQCDwmmh4dS9LzCgVtyy1e1xjCJ21GUDHe9K98nzb689JvinGV)`.
+    let script_key = script_key("cNaQCDwmmh4dS9LzCgVtyy1e1xjCJ21GUDHe9K98nzb689JvinGV");
+    let internal_key = Some(script_key.x_only_public_key().0);
 
     MockTradeWallet {
         funding_coins,
         new_addresses,
         signature_map,
         internal_key,
-        script_sigs,
+        script_key,
         seed: [2; 32],
         locked_utxos: BTreeSet::new(),
         trade_records: BTreeMap::new(),
@@ -328,6 +350,8 @@ fn signature_map(funding_coins: &[TxOutput], signatures: &[&'static str]) -> BTr
     funding_coins.iter().map(|o| o.outpoint).zip(signature_vec(signatures)).collect()
 }
 
-fn script_sigs(iks: &[XOnlyPublicKey], signatures: &[&'static str]) -> BTreeMap<XOnlyPublicKey, Vec<Signature>> {
-    iks.iter().map(|k| (*k, signature_vec(signatures))).collect()
+/// The key pair of a private key in wallet import format.
+fn script_key(wif: &str) -> Keypair {
+    let private_key: PrivateKey = wif.parse().expect("hardcoded keys should be valid");
+    Keypair::from_secret_key(&Secp256k1::new(), &private_key.inner)
 }

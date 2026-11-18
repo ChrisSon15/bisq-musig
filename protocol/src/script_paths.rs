@@ -91,6 +91,15 @@ fn single_path_merkle_root(script: ScriptBuf) -> Result<TapNodeHash> {
         .root_hash())
 }
 
+/// The script leaf of a deposit payout output. A spend through it needs the signatures of both
+/// script keys: the custom payout transaction.
+pub fn deposit_payout_script(
+    buyer_pub_key: &XOnlyPublicKey,
+    seller_pub_key: &XOnlyPublicKey,
+) -> ScriptBuf {
+    multisig_script(buyer_pub_key, seller_pub_key)
+}
+
 fn multisig_script(buyer_pub_key: &XOnlyPublicKey, seller_pub_key: &XOnlyPublicKey) -> ScriptBuf {
     // Comes from miniscript policy: format!("and(pk({buyer_pub_key}),pk({seller_pub_key}))")
     // which compiles to miniscript: format!("and_v(v:pk({buyer_pub_key}),pk({seller_pub_key}))")
