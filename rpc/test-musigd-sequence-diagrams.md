@@ -1,8 +1,10 @@
 # Sequence diagrams of the tests in `rpc/tests/test_musigd.rs`
 
 This file shows what every test of `rpc/tests/test_musigd.rs` does, as one UML sequence diagram
-per test. The diagrams follow the test code of 2026-11-19. When a test changes, its diagram must
-be changed as well.
+per test. The diagrams follow the test code of 2026-11-19.
+
+This file is generated. Do not edit it by hand: when a test changes, change its description in
+`rpc/test-musigd-sequence-diagrams.py` and run that script again.
 
 The tests start real `musigd` processes and use only their gRPC interface. In the tests of a
 whole trade, the test plays the role of bisq2 for both traders: it calls the services of each
