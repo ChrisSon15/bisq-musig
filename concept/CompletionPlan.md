@@ -116,7 +116,8 @@ be trusted.
 
 | Document | Status | Comment |
 |---|---|---|
-| `STx8.drawio` (+ `.svg`) | Current, will change | Best description of the transaction graph. Its own note says it was synced with the code on 2025-09-28. It matches `TradeModel`, not `BMPProtocol`. D3 and D4 change the claim and redirect parts. |
+| `STx9.drawio` (+ `.svg`) | Current | Best description of the transaction graph. Synced with the code on 2026-11-19. It shows the claim by script (D3), the redirect lock time of 1 block (D4) and the deposit abort transaction (D13). The authoritative text is `docs/specifications/trade/transactions.md`. |
+| `STx8.drawio` (+ `.svg`) | Outdated | Replaced by `STx9.drawio`. Its own note says it was synced with the code on 2025-09-28. It shows a pre-signed claim transaction and a redirect transaction without a lock time, which D3 and D4 changed, and it has no deposit abort transaction. |
 | `pinningattack.md` | Current | Matches the code. None of its countermeasures is implemented. D4 adopts its redirect lock time. |
 | `MuSig2adaptor-rust.md`, `MuSig2adaptor.md` | Current (mathematics) | Describes key aggregation and adaptor signatures. The code follows it (`protocol/src/multisig.rs`). |
 | `bisq-musig-modules.drawio`, `bisq2-overview.drawio` | Current (target picture) | Shows the intended modules. "Protocol persistence" and "chain access for the protocol" in the picture do not exist yet. |
