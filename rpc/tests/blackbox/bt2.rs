@@ -15,16 +15,6 @@ const TERMS: Terms = Terms {
     buyers_security_deposit: Amount::from_sat(1_000_000),
     sellers_security_deposit: Amount::from_sat(1_500_000),
 };
-/// A fee of the trade is small compared to the trade amount. The apps choose the fees, so the
-/// test knows only a limit for them.
-const FEE_LIMIT: Amount = Amount::from_sat(10_000);
-
-fn assert_small_fee(fee: Amount, what: &str) {
-    assert!(
-        Amount::ZERO < fee && fee <= FEE_LIMIT,
-        "{what} of {fee} is positive and small"
-    );
-}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn bt2_alice_sells_bitcoin_to_bob() -> anyhow::Result<()> {
@@ -34,14 +24,7 @@ async fn bt2_alice_sells_bitcoin_to_bob() -> anyhow::Result<()> {
     // UC2: the trade. Alice is the seller and Bob is the buyer. They set up the trade, Bob
     // publishes the deposit transaction, and after its confirmation they close the trade
     // cooperatively.
-    let deposit = trade::set_up(&mut setup.alice, &mut setup.bob, TRADE_ID, &TERMS).await?;
-    let deposit_txid = deposit.txid;
-    let confirmations =
-        trade::publish_deposit(&mut setup.alice, &mut setup.bob, TRADE_ID, deposit).await?;
-    let deposit_tx = setup.mine(&[deposit_txid]).await?.remove(0);
-    setup.mine_block().await?;
-    setup.mine_block().await?;
-    confirmations.wait_until_confirmed().await?;
+    let deposit_tx = trade::set_up_and_confirm_deposit(&mut setup, TRADE_ID, &TERMS).await?;
     trade::close_cooperatively(&mut setup.alice, &mut setup.bob, TRADE_ID).await?;
     for user in [&mut setup.alice, &mut setup.bob] {
         let closure = trade::closure(user, TRADE_ID).await?;
@@ -49,32 +32,23 @@ async fn bt2_alice_sells_bitcoin_to_bob() -> anyhow::Result<()> {
     }
 
     // Each trader paid his part of the deposit and a part of the fee of the deposit
-    // transaction. The parts are calculated from the chain.
-    let sellers_part = TERMS.trade_amount + TERMS.sellers_security_deposit;
-    let alices_deposit_fee = setup.alice.paid_into(&deposit_tx).await? - sellers_part;
-    let bobs_deposit_fee = setup.bob.paid_into(&deposit_tx).await? - TERMS.buyers_security_deposit;
-    assert_small_fee(alices_deposit_fee, "the deposit fee of Alice");
-    assert_small_fee(bobs_deposit_fee, "the deposit fee of Bob");
-    assert_eq!(
-        alices_deposit_fee + bobs_deposit_fee,
-        setup::fee(&setup.bob.node, &deposit_tx)?,
-        "the two traders pay the fee of the deposit transaction"
-    );
+    // transaction. The parts of the fee are calculated from the chain.
+    let deposit_fees =
+        trade::deposit_fees(&mut setup.alice, &mut setup.bob, &deposit_tx, &TERMS).await?;
+    setup::assert_small_fee(deposit_fees.sellers, "the deposit fee of Alice");
+    setup::assert_small_fee(deposit_fees.buyers, "the deposit fee of Bob");
 
     // After the trade each trader owns his payout in an output of the deposit transaction. Its
     // key is an imported key of his wallet, not a key of the seed.
-    let alice_after_trade = FUNDING - TERMS.trade_amount - alices_deposit_fee;
-    let bob_after_trade = FUNDING + TERMS.trade_amount - bobs_deposit_fee;
+    let alice_after_trade = FUNDING - TERMS.trade_amount - deposit_fees.sellers;
+    let bob_after_trade = FUNDING + TERMS.trade_amount - deposit_fees.buyers;
     setup.alice.wait_for_balance(alice_after_trade).await?;
     setup.bob.wait_for_balance(bob_after_trade).await?;
     assert_eq!(
         setup.alice.coins().await?.imported,
-        [TERMS.sellers_security_deposit]
+        [TERMS.sellers_payout()]
     );
-    assert_eq!(
-        setup.bob.coins().await?.imported,
-        [TERMS.trade_amount + TERMS.buyers_security_deposit]
-    );
+    assert_eq!(setup.bob.coins().await?.imported, [TERMS.buyers_payout()]);
 
     // UC2: both close the app. Each app sends a drain transaction, which moves the payout to the
     // seed wallet. The network confirms the two transactions while the apps are closed.
@@ -85,8 +59,8 @@ async fn bt2_alice_sells_bitcoin_to_bob() -> anyhow::Result<()> {
     let drain_txs = setup.mine(&[alices_drain, bobs_drain]).await?;
     let alices_drain_fee = setup::fee(&setup.bob.node, &drain_txs[0])?;
     let bobs_drain_fee = setup::fee(&setup.bob.node, &drain_txs[1])?;
-    assert_small_fee(alices_drain_fee, "the drain fee of Alice");
-    assert_small_fee(bobs_drain_fee, "the drain fee of Bob");
+    setup::assert_small_fee(alices_drain_fee, "the drain fee of Alice");
+    setup::assert_small_fee(bobs_drain_fee, "the drain fee of Bob");
 
     // The postconditions are checked in the apps, so both users start the app again.
     setup.alice.open_app().await?;

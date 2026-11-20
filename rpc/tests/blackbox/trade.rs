@@ -6,7 +6,7 @@
 //! starts the setup and publishes the deposit transaction.
 
 use anyhow::Context as _;
-use bdk_wallet::bitcoin::{Amount, FeeRate, Txid};
+use bdk_wallet::bitcoin::{Amount, FeeRate, Transaction, Txid};
 use futures_util::StreamExt as _;
 use protocol::params::MIN_CONFIRMATIONS;
 use protocol::receiver::Receiver;
@@ -19,7 +19,7 @@ use rpc::pb::musigrpc::{
 };
 use tonic::Streaming;
 
-use crate::setup::{User, WAIT};
+use crate::setup::{self, Setup, User, WAIT};
 
 /// The fee rate of the deposit transaction and of the prepared transactions of a trade: 10 sat
 /// per vbyte.
@@ -31,6 +31,31 @@ pub struct Terms {
     pub trade_amount: Amount,
     pub buyers_security_deposit: Amount,
     pub sellers_security_deposit: Amount,
+}
+
+impl Terms {
+    /// The amount that the seller pays into the deposit transaction.
+    pub fn sellers_part(&self) -> Amount {
+        self.trade_amount + self.sellers_security_deposit
+    }
+
+    /// The amount of the output of the deposit transaction that the buyer owns after a
+    /// cooperative close.
+    pub fn buyers_payout(&self) -> Amount {
+        self.trade_amount + self.buyers_security_deposit
+    }
+
+    /// The amount of the output of the deposit transaction that the seller owns after a
+    /// cooperative close.
+    pub const fn sellers_payout(&self) -> Amount {
+        self.sellers_security_deposit
+    }
+}
+
+/// The parts of the fee of the deposit transaction that the two traders paid.
+pub struct DepositFees {
+    pub sellers: Amount,
+    pub buyers: Amount,
 }
 
 /// The deposit transaction of a trade that both traders have signed and that is not published.
@@ -183,6 +208,55 @@ pub async fn publish_deposit(
         .await?
         .into_inner();
     Ok(DepositConfirmations { sellers, buyers })
+}
+
+/// Alice and Bob set up a trade in which Alice is the seller and Bob is the buyer. Bob publishes
+/// the deposit transaction, and blocks are mined until it counts as confirmed. Returns the
+/// deposit transaction as the chain contains it.
+pub async fn set_up_and_confirm_deposit(
+    setup: &mut Setup,
+    trade_id: &str,
+    terms: &Terms,
+) -> anyhow::Result<Transaction> {
+    let deposit = set_up(&mut setup.alice, &mut setup.bob, trade_id, terms).await?;
+    let txid = deposit.txid;
+    let confirmations =
+        publish_deposit(&mut setup.alice, &mut setup.bob, trade_id, deposit).await?;
+    let deposit_tx = setup.mine(&[txid]).await?.remove(0);
+    for _ in 1..MIN_CONFIRMATIONS {
+        setup.mine_block().await?;
+    }
+    confirmations.wait_until_confirmed().await?;
+    Ok(deposit_tx)
+}
+
+/// Calculates from the chain which part of the fee of the deposit transaction each trader paid:
+/// what his seed wallet paid into the transaction, less his part of the deposit. Fails if the
+/// two parts are not the fee of the transaction.
+pub async fn deposit_fees(
+    seller: &mut User,
+    buyer: &mut User,
+    deposit_tx: &Transaction,
+    terms: &Terms,
+) -> anyhow::Result<DepositFees> {
+    let sellers = seller.paid_into(deposit_tx).await?;
+    let buyers = buyer.paid_into(deposit_tx).await?;
+    let fees = DepositFees {
+        sellers: sellers
+            .checked_sub(terms.sellers_part())
+            .context("the seller paid less than his part of the deposit")?,
+        buyers: buyers
+            .checked_sub(terms.buyers_security_deposit)
+            .context("the buyer paid less than his security deposit")?,
+    };
+    let fee = setup::fee(&buyer.node, deposit_tx)?;
+    anyhow::ensure!(
+        fees.sellers + fees.buyers == fee,
+        "the traders paid {} and {} for a deposit transaction with a fee of {fee}",
+        fees.sellers,
+        fees.buyers
+    );
+    Ok(fees)
 }
 
 impl DepositConfirmations {

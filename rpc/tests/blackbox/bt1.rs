@@ -6,9 +6,6 @@ use crate::setup::{self, FUNDING, Setup};
 
 /// The amount that Alice sends to Bob: 0.1 BTC.
 const AMOUNT: Amount = Amount::from_sat(10_000_000);
-/// The fee of the payment is small compared to the amount. The wallet chooses the fee, so the
-/// test knows only a limit for it.
-const FEE_LIMIT: Amount = Amount::from_sat(10_000);
 
 #[tokio::test(flavor = "multi_thread")]
 async fn bt1_alice_sends_bitcoin_to_bob() -> anyhow::Result<()> {
@@ -34,10 +31,7 @@ async fn bt1_alice_sends_bitcoin_to_bob() -> anyhow::Result<()> {
     // Postcondition: Alice has 0.1 BTC less. She also paid the fee of the transaction, which the
     // test calculates from the chain.
     let fee = setup::fee(&setup.bob.node, tx)?;
-    assert!(
-        Amount::ZERO < fee && fee <= FEE_LIMIT,
-        "the fee of {fee} is positive and small"
-    );
+    setup::assert_small_fee(fee, "the fee of the payment");
     setup.alice.wait_for_balance(FUNDING - AMOUNT - fee).await?;
 
     // Postcondition: Bob has 0.1 BTC more.

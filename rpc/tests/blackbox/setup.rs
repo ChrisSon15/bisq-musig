@@ -33,6 +33,9 @@ const PASSWORD: &str = "S3cret!!";
 pub const FUNDING: Amount = Amount::ONE_BTC;
 /// The longest time that a test waits for a process or for the network.
 pub const WAIT: Duration = Duration::from_secs(90);
+/// The upper limit of a fee that a test accepts: small compared to the amounts of the use cases.
+/// The apps choose the fees, so a test knows only a limit for them.
+const FEE_LIMIT: Amount = Amount::from_sat(10_000);
 /// The time between two checks of a state that is waited for.
 const CHECK_PERIOD: Duration = Duration::from_millis(250);
 
@@ -448,6 +451,14 @@ async fn wait_for_tip(node: &TestEnv, tip: BlockHash) -> anyhow::Result<()> {
         Ok((node.best_block_hash()? == tip).then_some(()))
     })
     .await
+}
+
+/// Checks that `fee`, which the test names with `what`, is positive and not above [`FEE_LIMIT`].
+pub fn assert_small_fee(fee: Amount, what: &str) {
+    assert!(
+        Amount::ZERO < fee && fee <= FEE_LIMIT,
+        "{what} of {fee} is positive and small"
+    );
 }
 
 /// The coins that a transaction of the chain spends, in the order of its inputs. They are read
