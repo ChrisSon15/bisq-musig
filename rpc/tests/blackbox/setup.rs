@@ -261,16 +261,36 @@ impl Setup {
     }
 
     /// Mines one block on the node of Alice, with the transactions that this node holds, and
-    /// waits until the node of Bob has the block too. Returns the block.
+    /// waits until the node of Bob has the block too. Returns the block as the node of Bob holds
+    /// it.
     pub async fn mine_block(&mut self) -> anyhow::Result<Block> {
         let hash = self.alice.node.mine_block()?;
         wait_for_tip(&self.bob.node, hash).await?;
-        Ok(self.alice.node.bitcoind_client().get_block(hash)?)
+        Ok(self.bob.node.bitcoind_client().get_block(hash)?)
+    }
+
+    /// Waits until both nodes hold the unconfirmed transactions `txids`, and mines one block.
+    /// Returns the transactions as the block contains them, in the order of `txids`. Fails if
+    /// the block does not contain all of them.
+    pub async fn mine(&mut self, txids: &[Txid]) -> anyhow::Result<Vec<Transaction>> {
+        for txid in txids {
+            self.wait_for_unconfirmed(*txid).await?;
+        }
+        let block = self.mine_block().await?;
+        txids
+            .iter()
+            .map(|txid| {
+                let mined = block.txdata.iter().find(|tx| tx.compute_txid() == *txid);
+                mined
+                    .cloned()
+                    .with_context(|| format!("the block does not contain the transaction {txid}"))
+            })
+            .collect()
     }
 
     /// Waits until both nodes hold the unconfirmed transaction `txid`: the node that received it
     /// has passed it on to its peer.
-    pub async fn wait_for_unconfirmed(&self, txid: Txid) -> anyhow::Result<()> {
+    async fn wait_for_unconfirmed(&self, txid: Txid) -> anyhow::Result<()> {
         for user in [&self.alice, &self.bob] {
             let what = format!("the node of {} holds the transaction {txid}", user.name);
             wait_for(&what, async || {

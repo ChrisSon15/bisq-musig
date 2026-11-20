@@ -19,18 +19,10 @@ async fn bt1_alice_sends_bitcoin_to_bob() -> anyhow::Result<()> {
     let bobs_address = setup.bob.new_address().await?;
     let txid = setup.alice.send(&bobs_address, AMOUNT).await?;
 
-    // Postcondition: the transaction was mined. The block is read from the node of Bob, which
-    // got the transaction and the block only from its peer.
-    setup.wait_for_unconfirmed(txid).await?;
-    let block_hash = setup.mine_block().await?.block_hash();
+    // Postcondition: the transaction was mined. It is read from the block as the node of Bob
+    // holds it. This node got the transaction and the block only from its peer.
+    let tx = &setup.mine(&[txid]).await?[0];
     let height = setup.bob.node.block_count()?;
-    assert_eq!(setup.bob.node.best_block_hash()?, block_hash);
-    let block = setup.bob.node.bitcoind_client().get_block(block_hash)?;
-    let tx = block
-        .txdata
-        .iter()
-        .find(|tx| tx.compute_txid() == txid)
-        .expect("the block contains the transaction of Alice");
     let payments: Vec<Amount> = tx
         .output
         .iter()
