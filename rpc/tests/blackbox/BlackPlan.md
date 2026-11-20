@@ -38,10 +38,15 @@ Alice gets 0.15 BTC, Bob gets 0.05 BTC, both minus their fees.
 Alice and Bob are doing a trade. Alice as Maker sells Bitcoin worth 0.2 BTC to Bob.
 After successfully making the DepositTx, Alice stops responding.
 
-### UC6: trade redirect
+### UC7: trade redirect
 
 Alice and Bob are doing a trade. Alice as Maker sells Bitcoin worth 0.2 BTC to Bob.
 After successfully making the DepositTx, Bob issues the warning transaction. Then Alice issues the Redirect transaction.
+
+### UC8: trade penalty
+
+Alice and Bob are doing a trade. Alice as Maker sells Bitcoin worth 0.2 BTC to Bob.
+Alice and Bob finish the trade successfully. But now Bob issues the warning transaction.
 
 ## Tests
 
@@ -174,4 +179,20 @@ Postconditions:
 
 - check that Bob sent the WarningTx and Alice has sent the RedirectTx.
 - check that Bob has 0.99 BTC in his wallet minus fees.
-- check that Alice has 0.78 BTC in his wallet minus fees.
+- check that Alice has 0.785 BTC in his wallet minus fees.
+
+### BT8: trade penalty
+
+Preconditions
+
+- setup
+- Alice as maker and Bob as taker, and security deposits of 0.01 BTC (Bob) and 0.015 BTC (Alice).
+- fee shall be 10sats/vbyte
+
+Test UC8.
+
+Postconditions:
+
+- check that Bob sent the WarningTx and Alice has sent the PenaltyTx.
+- check that Bob has 0.99 BTC in his wallet minus fees.
+- check that Alice has 1.01 BTC in her wallet minus fees.
