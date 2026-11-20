@@ -8,4 +8,6 @@
 //! log to a file there, for the search for an error.
 
 mod bt1;
+mod bt2;
 mod setup;
+mod trade;

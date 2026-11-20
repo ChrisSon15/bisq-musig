@@ -5,18 +5,24 @@
 //! through the peer-to-peer port of the node of its user, with compact block filters. The RPC
 //! interface of the nodes is for the test code: mining, funding, and reading the chain.
 
+use std::collections::HashSet;
+use std::fs::OpenOptions;
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use bdk_wallet::bitcoin::{Address, Amount, Block, BlockHash, Network, Transaction, Txid};
+use bdk_wallet::bitcoin::{
+    Address, Amount, Block, BlockHash, Network, Transaction, TxIn, TxOut, Txid,
+};
 use rpc::pb::bmp_wallet::wallet_client::WalletClient;
 use rpc::pb::bmp_wallet::{
-    self, GetBalanceRequest, GetBalanceResponse, GetUnusedAddressRequest, IsWalletReadyRequest,
-    ListTransactionsRequest, OpenOrCreateWalletRequest, PubAddressInfo, SendToAddressRequest,
+    self, CloseRequest, GetBalanceRequest, GetBalanceResponse, GetUnusedAddressRequest,
+    GetWalletAddressesRequest, IsWalletReadyRequest, ListTransactionsRequest, ListUtxosRequest,
+    OpenOrCreateWalletRequest, PubAddressInfo, SendToAddressRequest,
 };
+use rpc::pb::musigrpc::musig_client::MusigClient;
 use testenv::{Config, TestEnv};
 use tokio::time::Instant;
 use tonic::transport::Channel;
@@ -25,8 +31,8 @@ use tonic::transport::Channel;
 const PASSWORD: &str = "S3cret!!";
 /// The amount that each wallet holds after the setup.
 pub const FUNDING: Amount = Amount::ONE_BTC;
-/// The longest time that the setup waits for a process or for the network.
-const WAIT: Duration = Duration::from_secs(90);
+/// The longest time that a test waits for a process or for the network.
+pub const WAIT: Duration = Duration::from_secs(90);
 /// The time between two checks of a state that is waited for.
 const CHECK_PERIOD: Duration = Duration::from_millis(250);
 
@@ -64,12 +70,15 @@ fn free_port() -> anyhow::Result<u16> {
 
 /// Where a `musigd` process writes one of its output streams. With the directory
 /// `MUSIGD_TEST_LOG_DIR` in the environment it is a file there, named after the user. Without it
-/// the output is discarded.
-fn log_output(user: &str, stream: &str) -> anyhow::Result<Stdio> {
+/// the output is discarded. The first process of a user in a test starts the file again, and a
+/// later process of the same user adds to it (`append`).
+fn log_output(user: &str, stream: &str, append: bool) -> anyhow::Result<Stdio> {
     Ok(match std::env::var_os("MUSIGD_TEST_LOG_DIR") {
         Some(dir) => {
             let path = Path::new(&dir).join(format!("musigd-{user}.{stream}"));
-            std::fs::File::create(path)?.into()
+            let mut options = OpenOptions::new();
+            options.create(true).append(append).write(true);
+            options.truncate(!append).open(path)?.into()
         }
         None => Stdio::null(),
     })
@@ -88,24 +97,32 @@ fn settled_balance(amount: Amount) -> GetBalanceResponse {
     }
 }
 
-/// One user: a Bitcoin node, and a `musigd` process that uses this node and holds the wallet of
-/// the user.
-pub struct User {
-    name: &'static str,
-    wallet: WalletClient<Channel>,
-    // The order of the next three fields is the order in which they are dropped: the process
-    // ends before its wallet directory is deleted and before its node stops.
-    _musigd: MusigdProcess,
-    _wallet_dir: tempfile::TempDir,
-    /// The Bitcoin node of the user.
-    pub node: TestEnv,
+/// The coins of a wallet, by the kind of key that owns them.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Coins {
+    /// The amounts of the coins at addresses of the seed of the wallet.
+    pub seed: Vec<Amount>,
+    /// The amounts of the coins of imported keys. They are the payouts of closed trades.
+    pub imported: Vec<Amount>,
 }
 
-impl User {
-    /// Starts `musigd` for the user `name` with a new wallet in a new directory, and waits until
-    /// the wallet has synced with `node`.
-    async fn start(name: &'static str, node: TestEnv) -> anyhow::Result<Self> {
-        let wallet_dir = tempfile::tempdir()?;
+/// A running `musigd` process and the clients of its two services.
+struct App {
+    musigd: MusigdProcess,
+    wallet: WalletClient<Channel>,
+    musig: MusigClient<Channel>,
+}
+
+impl App {
+    /// Starts `musigd` for the user `name` on a wallet directory, opens the wallet, which creates
+    /// it if the directory is empty, and waits until the wallet has synced with `node`.
+    /// `first` tells whether this is the first process of the user in the test.
+    async fn start(
+        name: &str,
+        wallet_dir: &Path,
+        node: &TestEnv,
+        first: bool,
+    ) -> anyhow::Result<Self> {
         let port = free_port()?;
         let peer = node
             .p2p_socket_addr()
@@ -119,15 +136,15 @@ impl User {
             .arg("--port")
             .arg(port.to_string())
             .arg("--wallet-dir")
-            .arg(wallet_dir.path())
+            .arg(wallet_dir)
             .arg("--wallet-peer")
             .arg(peer.to_string())
             // The wallet looks for new blocks once per second, so that a test does not wait long.
             .arg("--wallet-poll-secs")
             .arg("1")
             .env("RUST_LOG", log_level)
-            .stdout(log_output(name, "out")?)
-            .stderr(log_output(name, "err")?)
+            .stdout(log_output(name, "out", !first)?)
+            .stderr(log_output(name, "err", !first)?)
             .spawn()
             .context("musigd does not start")?;
         let musigd = MusigdProcess(musigd);
@@ -138,7 +155,7 @@ impl User {
             async || Ok(endpoint.connect().await.ok()),
         )
         .await?;
-        let mut wallet = WalletClient::new(channel);
+        let mut wallet = WalletClient::new(channel.clone());
         wallet
             .open_or_create_wallet(OpenOrCreateWalletRequest {
                 password: PASSWORD.to_owned(),
@@ -151,12 +168,63 @@ impl User {
         .await?;
 
         Ok(Self {
-            name,
+            musigd,
             wallet,
-            _musigd: musigd,
-            _wallet_dir: wallet_dir,
+            musig: MusigClient::new(channel),
+        })
+    }
+}
+
+/// One user: a Bitcoin node, and the app of the user. The app is a `musigd` process that uses
+/// this node and holds the wallet of the user.
+pub struct User {
+    name: &'static str,
+    wallet: WalletClient<Channel>,
+    /// The trade service of the app.
+    pub musig: MusigClient<Channel>,
+    // The order of the next three fields is the order in which they are dropped: the process
+    // ends before its wallet directory is deleted and before its node stops.
+    /// `None` while the app is closed. The two clients do not work then.
+    musigd: Option<MusigdProcess>,
+    wallet_dir: tempfile::TempDir,
+    /// The Bitcoin node of the user.
+    pub node: TestEnv,
+}
+
+impl User {
+    /// Starts the app of the user `name` with a new wallet in a new directory.
+    async fn start(name: &'static str, node: TestEnv) -> anyhow::Result<Self> {
+        let wallet_dir = tempfile::tempdir()?;
+        let app = App::start(name, wallet_dir.path(), &node, true).await?;
+        Ok(Self {
+            name,
+            wallet: app.wallet,
+            musig: app.musig,
+            musigd: Some(app.musigd),
+            wallet_dir,
             node,
         })
+    }
+
+    /// The user ends the app in the regular way. The app asks the wallet service to close, which
+    /// moves the payouts of closed trades to the seed wallet with a drain transaction. Then the
+    /// `musigd` process ends. Returns the ID of the drain transaction, or `None` if there was
+    /// nothing to move.
+    pub async fn close_app(&mut self) -> anyhow::Result<Option<Txid>> {
+        let response = self.wallet.close(CloseRequest {}).await?.into_inner();
+        self.musigd = None;
+        Ok(response.drain_tx_id.map(|txid| txid.parse()).transpose()?)
+    }
+
+    /// The user starts the app again: a new `musigd` process on the wallet directory of the
+    /// user.
+    pub async fn open_app(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.musigd.is_none(), "the app of {} runs", self.name);
+        let app = App::start(self.name, self.wallet_dir.path(), &self.node, false).await?;
+        self.wallet = app.wallet;
+        self.musig = app.musig;
+        self.musigd = Some(app.musigd);
+        Ok(())
     }
 
     /// An address of the wallet that has received no coins yet.
@@ -209,6 +277,63 @@ impl User {
                 self.name
             )
         })
+    }
+
+    /// The addresses that the wallet has derived from its seed.
+    async fn seed_addresses(&mut self) -> anyhow::Result<HashSet<String>> {
+        let addresses = self
+            .wallet
+            .get_wallet_addresses(GetWalletAddressesRequest {})
+            .await?
+            .into_inner()
+            .addresses;
+        Ok(addresses.into_iter().map(|info| info.address).collect())
+    }
+
+    /// The unspent coins of the wallet. A coin whose address is not an address of the seed of
+    /// the wallet belongs to an imported key.
+    pub async fn coins(&mut self) -> anyhow::Result<Coins> {
+        let seed_addresses = self.seed_addresses().await?;
+        let utxos = self
+            .wallet
+            .list_utxos(ListUtxosRequest {})
+            .await?
+            .into_inner()
+            .utxos;
+        let mut coins = Coins::default();
+        for utxo in utxos {
+            let at_seed_address = utxo
+                .address
+                .is_some_and(|info| seed_addresses.contains(&info.address));
+            let amounts = if at_seed_address {
+                &mut coins.seed
+            } else {
+                &mut coins.imported
+            };
+            amounts.push(Amount::from_sat(utxo.amount));
+        }
+        Ok(coins)
+    }
+
+    /// What the seed wallet of the user paid into the transaction `tx` of the chain: the amount
+    /// of the coins at seed addresses that `tx` spends, less the amount of the outputs of `tx`
+    /// to seed addresses. It is calculated from the chain; the wallet only names its addresses.
+    pub async fn paid_into(&mut self, tx: &Transaction) -> anyhow::Result<Amount> {
+        let mut seed_scripts = HashSet::new();
+        for address in self.seed_addresses().await? {
+            let address = address.parse::<Address<_>>()?;
+            seed_scripts.insert(address.require_network(Network::Regtest)?.script_pubkey());
+        }
+        let own_amount = |coins: &[TxOut]| -> Amount {
+            let own = coins
+                .iter()
+                .filter(|coin| seed_scripts.contains(&coin.script_pubkey));
+            own.map(|coin| coin.value).sum()
+        };
+        let spent = own_amount(&spent_coins(&self.node, tx)?);
+        spent
+            .checked_sub(own_amount(&tx.output))
+            .with_context(|| format!("{} gets more from the transaction than {spent}", self.name))
     }
 
     /// The transaction `txid` as the wallet lists it, or `None` if the wallet does not list it.
@@ -325,21 +450,27 @@ async fn wait_for_tip(node: &TestEnv, tip: BlockHash) -> anyhow::Result<()> {
     .await
 }
 
-/// The fee of a transaction that is in the chain: the amount of the coins that it spends, less
-/// the amount of its outputs. The spent coins are read from `node`.
-pub fn fee(node: &TestEnv, tx: &Transaction) -> anyhow::Result<Amount> {
-    let mut spent = Amount::ZERO;
-    for input in &tx.input {
+/// The coins that a transaction of the chain spends, in the order of its inputs. They are read
+/// from `node`.
+fn spent_coins(node: &TestEnv, tx: &Transaction) -> anyhow::Result<Vec<TxOut>> {
+    let spent_coin = |input: &TxIn| {
         let coin = input.previous_output;
         let funding_tx = node
             .bitcoind_client()
             .get_raw_transaction(coin.txid)?
             .transaction()?;
-        spent += funding_tx
-            .tx_out(usize::try_from(coin.vout)?)
+        let spent = funding_tx.tx_out(usize::try_from(coin.vout)?);
+        Ok(spent
             .with_context(|| format!("the coin {coin} does not exist"))?
-            .value;
-    }
+            .clone())
+    };
+    tx.input.iter().map(spent_coin).collect()
+}
+
+/// The fee of a transaction that is in the chain: the amount of the coins that it spends, less
+/// the amount of its outputs. The spent coins are read from `node`.
+pub fn fee(node: &TestEnv, tx: &Transaction) -> anyhow::Result<Amount> {
+    let spent: Amount = spent_coins(node, tx)?.iter().map(|coin| coin.value).sum();
     let paid: Amount = tx.output.iter().map(|output| output.value).sum();
     spent
         .checked_sub(paid)
