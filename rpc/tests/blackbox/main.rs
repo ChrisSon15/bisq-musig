@@ -9,5 +9,6 @@
 
 mod bt1;
 mod bt2;
+mod bt3;
 mod setup;
 mod trade;

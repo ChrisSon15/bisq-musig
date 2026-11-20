@@ -6,7 +6,9 @@
 //! starts the setup and publishes the deposit transaction.
 
 use anyhow::Context as _;
-use bdk_wallet::bitcoin::{Amount, FeeRate, Transaction, Txid};
+use bdk_wallet::bitcoin::key::{Keypair, Secp256k1, TapTweak as _};
+use bdk_wallet::bitcoin::secp256k1::Message;
+use bdk_wallet::bitcoin::{Amount, FeeRate, Transaction, TxOut, Txid, XOnlyPublicKey};
 use futures_util::StreamExt as _;
 use protocol::params::MIN_CONFIRMATIONS;
 use protocol::receiver::Receiver;
@@ -18,6 +20,7 @@ use rpc::pb::musigrpc::{
     TradeStateKind, TxConfirmationStatus,
 };
 use tonic::Streaming;
+use wallet::bmp_wallet::ImportedKey;
 
 use crate::setup::{self, Setup, User, WAIT};
 
@@ -350,4 +353,40 @@ pub async fn closure(user: &mut User, trade_id: &str) -> anyhow::Result<Option<C
         .await?
         .context("the app reports no state of the trade")??;
     Ok((state.state() == TradeStateKind::TradeClosed).then(|| state.closure_type()))
+}
+
+/// The output of the deposit transaction that pays `amount`, which is the amount of a payout.
+/// Fails unless exactly one output pays this amount.
+pub fn payout_output(deposit_tx: &Transaction, amount: Amount) -> anyhow::Result<&TxOut> {
+    let mut outputs = deposit_tx
+        .output
+        .iter()
+        .filter(|output| output.value == amount);
+    let output = outputs.next();
+    anyhow::ensure!(
+        outputs.next().is_none(),
+        "more than one output of the deposit transaction pays {amount}"
+    );
+    output.with_context(|| format!("no output of the deposit transaction pays {amount}"))
+}
+
+/// Proves that `key` can spend the Taproot output `output` of the chain. A message of 32 random
+/// bytes is signed with the key, and the signature is verified with the public key that the
+/// script of the output contains. Fails if the signature is not valid for this public key.
+pub fn prove_key_of_output(key: &ImportedKey, output: &TxOut) -> anyhow::Result<()> {
+    let secp = Secp256k1::new();
+    // The public key from the chain. The script of a Taproot output is the version number 1 and
+    // the 32 bytes of the public key of the output.
+    let script = &output.script_pubkey;
+    anyhow::ensure!(script.is_p2tr(), "the output is not a Taproot output");
+    let output_key = XOnlyPublicKey::from_slice(&script.as_bytes()[2..])?;
+
+    // The secret key of the output is the imported key, tweaked with the scripts of the output
+    // (BIP341).
+    let keypair = Keypair::from_seckey_slice(&secp, &key.secret().to_bytes()[..])?;
+    let signing_key = keypair.tap_tweak(&secp, key.merkle_root()).to_keypair();
+    let message = Message::from_digest(rand::random());
+    let signature = secp.sign_schnorr_no_aux_rand(&message, &signing_key);
+    secp.verify_schnorr(&signature, &message, &output_key)
+        .context("the signature of the key is not valid for the public key of the output")
 }

@@ -26,6 +26,8 @@ use rpc::pb::musigrpc::musig_client::MusigClient;
 use testenv::{Config, TestEnv};
 use tokio::time::Instant;
 use tonic::transport::Channel;
+use wallet::bmp_wallet::{BMPWallet, ImportedKey, WalletApi as _};
+use wallet::password::Password;
 
 /// The password of both wallets.
 const PASSWORD: &str = "S3cret!!";
@@ -215,8 +217,28 @@ impl User {
     /// nothing to move.
     pub async fn close_app(&mut self) -> anyhow::Result<Option<Txid>> {
         let response = self.wallet.close(CloseRequest {}).await?.into_inner();
-        self.musigd = None;
+        self.stop_app();
         Ok(response.drain_tx_id.map(|txid| txid.parse()).transpose()?)
+    }
+
+    /// Ends the `musigd` process of the user at once, as a crash does. The wallet service is not
+    /// asked to close, so no payout is moved. The wallet directory stays.
+    pub fn stop_app(&mut self) {
+        self.musigd = None;
+    }
+
+    /// The keys that the wallet of the user has imported: the keys of the payouts of closed
+    /// trades. No request of the wallet service hands out a key, so the keys are read from the
+    /// wallet directory with the `wallet` crate. The app must be stopped for that, so that only
+    /// one process has the database of the wallet open.
+    pub fn imported_keys(&self) -> anyhow::Result<Vec<ImportedKey>> {
+        anyhow::ensure!(self.musigd.is_none(), "the app of {} runs", self.name);
+        let wallet = BMPWallet::load_wallet(
+            self.wallet_dir.path().into(),
+            Network::Regtest,
+            &Password::check(PASSWORD)?,
+        )?;
+        Ok(wallet.imported_keys())
     }
 
     /// The user starts the app again: a new `musigd` process on the wallet directory of the
