@@ -647,14 +647,15 @@ def musigd_without_peer(d):
 
 
 def test_11():
-    d = Diagram([("C", "bisq2 (test)"), ("D", "musigd"), ("T", "Test")])
+    d = Diagram([("C", "bisq2 (test)"), ("D", "musigd")])
     musigd_without_peer(d)
     d.call("C", "D", "Wallet.OpenOrCreateWallet(password)")
     d.note("D", "The request runs: musigd derives the key of the<br/>wallet database from the password")
-    d.message("T", "D", "signal SIGTERM, 200 ms after the request")
+    d.call("C", "D", "Daemon.Shutdown(), 200 ms after the request,<br/>on a second connection")
+    d.answer("D", "C", "ok")
     d.note("D", "musigd accepts no new request and<br/>completes the running request")
     d.answer("D", "C", "ok: the wallet is created")
-    d.answer("D", "T", "the process ends with the exit status 0,<br/>less than 10 s after the signal")
+    d.note("D", "The process ends with the exit status 0,<br/>less than 10 s after Daemon.Shutdown")
     d.call("C", "D", "new connection to the port")
     d.refused("D", "C", "no connection: the port is closed")
     d.note("D", "The test starts musigd again<br/>on the same wallet directory")
@@ -664,25 +665,40 @@ def test_11():
 
 
 def test_12():
-    d = Diagram([("C", "bisq2 (test)"), ("D", "musigd"), ("T", "Test")])
+    d = Diagram([("C", "bisq2 (test)"), ("D", "musigd")])
     musigd_without_peer(d)
     d.call("C", "D", "Wallet.SubscribeWalletEvents()")
     d.note("D", "The stream is open. No wallet is open,<br/>so it has no event")
-    d.message("T", "D", "signal SIGTERM")
-    d.answer("D", "C", "the stream ends without an error")
-    d.answer("D", "T", "the process ends with the exit status 0,<br/>less than 10 s after the signal")
+    d.call("C", "D", "Daemon.Shutdown(), on a second connection")
+    d.answer("D", "C", "ok")
+    d.answer("D", "C", "the stream of the events ends without an error")
+    d.note("D", "The process ends with the exit status 0,<br/>less than 10 s after Daemon.Shutdown")
     return d
 
 
 def test_13():
-    d = Diagram([("C", "bisq2 (test)"), ("D", "musigd"), ("T", "Test")])
+    d = Diagram([("C", "bisq2 (test)"), ("D", "musigd")])
     musigd_without_peer(d)
     d.call("C", "D", "Wallet.IsWalletReady: the request is started,<br/>its message is never sent")
     d.note("D", "The request is open: musigd waits for its message")
-    d.message("T", "D", "signal SIGTERM, 500 ms after the start of the request")
+    d.call("C", "D", "Daemon.Shutdown(), 500 ms later,<br/>on a second connection")
+    d.answer("D", "C", "ok")
     d.note("D", "musigd waits for the open request,<br/>up to the limit of 10 s")
-    d.refused("D", "C", "the request ends without a response")
-    d.answer("D", "T", "the process ends with the exit status 0,<br/>between 10 s and 20 s after the signal")
+    d.refused("D", "C", "the open request ends without a response")
+    d.note("D", "The process ends with the exit status 0,<br/>between 10 s and 20 s after Daemon.Shutdown")
+    return d
+
+
+def test_14():
+    d = Diagram([("C", "bisq2 (test)"), ("D", "musigd"), ("T", "Test")])
+    d.loop("for the signals SIGTERM and SIGINT")
+    musigd_without_peer(d)
+    d.call("C", "D", "Wallet.SubscribeWalletEvents()")
+    d.note("D", "The stream is open. No wallet is open,<br/>so it has no event")
+    d.message("T", "D", "the signal")
+    d.answer("D", "C", "the stream of the events ends without an error")
+    d.answer("D", "T", "the process ends with the exit status 0,<br/>less than 10 s after the signal")
+    d.end()
     return d
 
 
@@ -763,16 +779,18 @@ TESTS = [
         test_10,
     ),
     (
-        "musigd_shuts_down_on_sigterm_and_completes_the_running_request",
-        "The regular shutdown (`docs/specifications/trade/shutdown.md`). The signal SIGTERM "
-        "arrives while `musigd` creates a wallet. The process completes the request, accepts no "
-        "new connection, and ends with the exit status 0. The created wallet is stored.",
+        "musigd_shuts_down_on_request_and_completes_the_running_request",
+        "The regular shutdown (`docs/specifications/trade/shutdown.md`). The request `Shutdown` "
+        "of the internal service arrives while `musigd` creates a wallet. The process answers "
+        "it, completes the running request, accepts no new connection, and ends with the exit "
+        "status 0. The created wallet is stored.",
         test_11,
     ),
     (
         "musigd_ends_an_open_subscription_when_it_shuts_down",
         "The regular shutdown with a client that keeps a subscription open. The process ends "
-        "the stream of the subscription at the signal and does not wait for the client.",
+        "the stream of the subscription when it is asked to shut down, and does not wait for "
+        "the client.",
         test_12,
     ),
     (
@@ -781,6 +799,13 @@ TESTS = [
         "for the request up to the limit of 10 seconds, then ends it, and still ends with the "
         "exit status 0.",
         test_13,
+    ),
+    (
+        "musigd_shuts_down_on_a_termination_signal",
+        "The signals SIGTERM and SIGINT are the second way to ask for the regular shutdown. The "
+        "process ends an open subscription and ends with the exit status 0, as after the "
+        "request `Shutdown`.",
+        test_14,
     ),
 ]
 
@@ -826,7 +851,7 @@ Arrows:
 
 | Arrow | Meaning |
 |---|---|
-| bisq2 to musigd, solid | A gRPC request. `Trade.` is the trade service `musigrpc.Musig`, `Wallet.` is the wallet service `wallet.Wallet`. |
+| bisq2 to musigd, solid | A gRPC request. `Trade.` is the trade service `musigrpc.Musig`, `Wallet.` is the wallet service `wallet.Wallet`, `Daemon.` is the internal service `musigd.internal.Daemon`. |
 | musigd to bisq2, dashed | The response, or an event of a stream |
 | musigd to bisq2, dashed with a cross | The request is refused with this gRPC status |
 | bisq2 to bisq2, solid | A message between the traders (A to G, see `rpc/musig-trade-protocol-messages.txt`). In the test no network carries it: the test passes the data of one response into the next request. |
@@ -882,9 +907,10 @@ SUMMARY = [
     "Custom payout, with restarts",
     "Deposit abort after the deposit timeout",
     "End of `musigd` during a request",
-    "Regular shutdown during a request",
+    "Regular shutdown by request, during another request",
     "Regular shutdown with an open subscription",
     "Regular shutdown with a request that is never completed",
+    "Regular shutdown by a signal",
 ]
 
 

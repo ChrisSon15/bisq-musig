@@ -40,7 +40,7 @@ Arrows:
 
 | Arrow | Meaning |
 |---|---|
-| bisq2 to musigd, solid | A gRPC request. `Trade.` is the trade service `musigrpc.Musig`, `Wallet.` is the wallet service `wallet.Wallet`. |
+| bisq2 to musigd, solid | A gRPC request. `Trade.` is the trade service `musigrpc.Musig`, `Wallet.` is the wallet service `wallet.Wallet`, `Daemon.` is the internal service `musigd.internal.Daemon`. |
 | musigd to bisq2, dashed | The response, or an event of a stream |
 | musigd to bisq2, dashed with a cross | The request is refused with this gRPC status |
 | bisq2 to bisq2, solid | A message between the traders (A to G, see `rpc/musig-trade-protocol-messages.txt`). In the test no network carries it: the test passes the data of one response into the next request. |
@@ -93,9 +93,10 @@ The buyer is the taker and the seller is the maker in every trade.
 | 8 | [`h2_h5_restart_of_two_daemons_during_a_custom_payout`](#8-h2_h5_restart_of_two_daemons_during_a_custom_payout) | Custom payout, with restarts |
 | 9 | [`a3_h2_deposit_abort_of_two_daemons_after_a_restart`](#9-a3_h2_deposit_abort_of_two_daemons_after_a_restart) | Deposit abort after the deposit timeout |
 | 10 | [`h3_h4_h8_daemon_is_ended_while_it_processes_a_request`](#10-h3_h4_h8_daemon_is_ended_while_it_processes_a_request) | End of `musigd` during a request |
-| 11 | [`musigd_shuts_down_on_sigterm_and_completes_the_running_request`](#11-musigd_shuts_down_on_sigterm_and_completes_the_running_request) | Regular shutdown during a request |
+| 11 | [`musigd_shuts_down_on_request_and_completes_the_running_request`](#11-musigd_shuts_down_on_request_and_completes_the_running_request) | Regular shutdown by request, during another request |
 | 12 | [`musigd_ends_an_open_subscription_when_it_shuts_down`](#12-musigd_ends_an_open_subscription_when_it_shuts_down) | Regular shutdown with an open subscription |
 | 13 | [`musigd_shuts_down_at_the_limit_while_a_request_is_open`](#13-musigd_shuts_down_at_the_limit_while_a_request_is_open) | Regular shutdown with a request that is never completed |
+| 14 | [`musigd_shuts_down_on_a_termination_signal`](#14-musigd_shuts_down_on_a_termination_signal) | Regular shutdown by a signal |
 
 ## 1. `musigd_serves_trade_service_and_wallet_service`
 
@@ -1260,25 +1261,26 @@ sequenceDiagram
     end
 ```
 
-## 11. `musigd_shuts_down_on_sigterm_and_completes_the_running_request`
+## 11. `musigd_shuts_down_on_request_and_completes_the_running_request`
 
-The regular shutdown (`docs/specifications/trade/shutdown.md`). The signal SIGTERM arrives while
-`musigd` creates a wallet. The process completes the request, accepts no new connection, and ends
-with the exit status 0. The created wallet is stored.
+The regular shutdown (`docs/specifications/trade/shutdown.md`). The request `Shutdown` of the
+internal service arrives while `musigd` creates a wallet. The process answers it, completes the
+running request, accepts no new connection, and ends with the exit status 0. The created wallet is
+stored.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant C as bisq2 (test)
     participant D as musigd
-    participant T as Test
     Note over D: The test starts musigd: new<br/>wallet directory, no peer
     C->>D: Wallet.OpenOrCreateWallet(password)
     Note over D: The request runs: musigd<br/>derives the key of the wallet<br/>database from the password
-    T->>D: signal SIGTERM, 200 ms after the<br/>request
+    C->>D: Daemon.Shutdown(), 200 ms after the<br/>request, on a second connection
+    D-->>C: ok
     Note over D: musigd accepts no new request<br/>and completes the running<br/>request
     D-->>C: ok: the wallet is created
-    D-->>T: the process ends with the exit<br/>status 0, less than 10 s after the<br/>signal
+    Note over D: The process ends with the exit<br/>status 0, less than 10 s after<br/>Daemon.Shutdown
     C->>D: new connection to the port
     D--xC: no connection: the port is closed
     Note over D: The test starts musigd again<br/>on the same wallet directory
@@ -1289,20 +1291,20 @@ sequenceDiagram
 ## 12. `musigd_ends_an_open_subscription_when_it_shuts_down`
 
 The regular shutdown with a client that keeps a subscription open. The process ends the stream of
-the subscription at the signal and does not wait for the client.
+the subscription when it is asked to shut down, and does not wait for the client.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant C as bisq2 (test)
     participant D as musigd
-    participant T as Test
     Note over D: The test starts musigd: new<br/>wallet directory, no peer
     C->>D: Wallet.SubscribeWalletEvents()
     Note over D: The stream is open. No wallet<br/>is open, so it has no event
-    T->>D: signal SIGTERM
-    D-->>C: the stream ends without an error
-    D-->>T: the process ends with the exit<br/>status 0, less than 10 s after the<br/>signal
+    C->>D: Daemon.Shutdown(), on a second<br/>connection
+    D-->>C: ok
+    D-->>C: the stream of the events ends<br/>without an error
+    Note over D: The process ends with the exit<br/>status 0, less than 10 s after<br/>Daemon.Shutdown
 ```
 
 ## 13. `musigd_shuts_down_at_the_limit_while_a_request_is_open`
@@ -1315,12 +1317,33 @@ sequenceDiagram
     autonumber
     participant C as bisq2 (test)
     participant D as musigd
-    participant T as Test
     Note over D: The test starts musigd: new<br/>wallet directory, no peer
     C->>D: Wallet.IsWalletReady: the request is<br/>started, its message is never sent
     Note over D: The request is open: musigd<br/>waits for its message
-    T->>D: signal SIGTERM, 500 ms after the<br/>start of the request
+    C->>D: Daemon.Shutdown(), 500 ms later, on<br/>a second connection
+    D-->>C: ok
     Note over D: musigd waits for the open<br/>request, up to the limit of 10<br/>s
-    D--xC: the request ends without a response
-    D-->>T: the process ends with the exit<br/>status 0, between 10 s and 20 s<br/>after the signal
+    D--xC: the open request ends without a<br/>response
+    Note over D: The process ends with the exit<br/>status 0, between 10 s and 20<br/>s after Daemon.Shutdown
+```
+
+## 14. `musigd_shuts_down_on_a_termination_signal`
+
+The signals SIGTERM and SIGINT are the second way to ask for the regular shutdown. The process ends
+an open subscription and ends with the exit status 0, as after the request `Shutdown`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as bisq2 (test)
+    participant D as musigd
+    participant T as Test
+    loop for the signals SIGTERM and SIGINT
+        Note over D: The test starts musigd: new<br/>wallet directory, no peer
+        C->>D: Wallet.SubscribeWalletEvents()
+        Note over D: The stream is open. No wallet<br/>is open, so it has no event
+        T->>D: the signal
+        D-->>C: the stream of the events ends<br/>without an error
+        D-->>T: the process ends with the exit<br/>status 0, less than 10 s after the<br/>signal
+    end
 ```

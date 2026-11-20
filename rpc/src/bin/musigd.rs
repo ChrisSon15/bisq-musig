@@ -12,6 +12,7 @@ use clap::Parser;
 use protocol::params::{EngineConfig, EngineConfigError};
 use protocol::trade_model::{MemoryTradeStore, TradeModelStore};
 use rpc::bmp_wallet_service::{BMPWalletServiceImpl, BmpWalletImpl, BmpWalletServer};
+use rpc::daemon_service::{DaemonImpl, DaemonServer};
 use rpc::server::{MusigImpl, MusigServer, NoTradeWallet, TradeWalletProvider};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
@@ -201,8 +202,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Arc::new(NoTradeWallet)
     };
     // The request to end the process in the regular way
-    // (docs/specifications/trade/shutdown.md). The services end the streams of their
-    // subscriptions with it, and the server stops to accept requests.
+    // (docs/specifications/trade/shutdown.md). The request `Shutdown` of the internal service
+    // or a signal cancels it. Then the services end the streams of their subscriptions, and the
+    // server stops to accept requests.
     let shutdown = CancellationToken::new();
     let mut musig =
         MusigImpl::new(trades, trade_wallet, engine_config).with_shutdown(shutdown.clone());
@@ -212,7 +214,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         warn!("The trade service has no access to the chain and cannot publish a deposit.");
     }
 
-    let mut server = Server::builder().add_service(MusigServer::new(musig));
+    let mut server = Server::builder()
+        .add_service(MusigServer::new(musig))
+        .add_service(DaemonServer::new(DaemonImpl {
+            shutdown: shutdown.clone(),
+        }));
     if let Some(service) = bmp_wallet {
         server = server.add_service(BmpWalletServer::new(BmpWalletImpl {
             wallet_service: service,
@@ -222,14 +228,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // The listener for the signals exists before the first request is served.
     let terminated = termination_signal()?;
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            let signal = terminated.await;
+            info!(signal, "Got a signal to shut down.");
+            shutdown.cancel();
+        }
+    });
     info!(port = cli.port, "Starting gRPC server.");
     let mut serving = pin!(server.serve_with_shutdown(addr, shutdown.clone().cancelled_owned()));
     tokio::select! {
-        // Without a signal the server ends only with an error, for example a used port.
+        // The request to end is looked at first, because the server ends after it too.
+        biased;
+        () = shutdown.cancelled() => info!("Shutting down: no new request is accepted."),
+        // Without a request to end, the server ends only with an error, for example a used port.
         result = &mut serving => return Ok(result?),
-        signal = terminated => info!(signal, "Shutting down: no new request is accepted."),
     }
-    shutdown.cancel();
     // From here on the server accepts no connection and no request, and the subscriptions have
     // ended. The server ends when the running requests have their responses. A request that is
     // still open at the limit is ended. Every change of a trade or of the wallet is stored when
@@ -237,7 +252,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let completed = tokio::time::timeout(SHUTDOWN_GRACE, serving).await.ok();
     if completed.transpose()?.is_none() {
         warn!(
-            "Requests were still open {} seconds after the signal. They are ended now.",
+            "Requests were still open {} seconds after the request to shut down. They are ended \
+             now.",
             SHUTDOWN_GRACE.as_secs()
         );
     }

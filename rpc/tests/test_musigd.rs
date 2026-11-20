@@ -41,7 +41,7 @@ mod common;
 
 /// The longest time in which `musigd` ends when it cannot start.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-/// The longest time that `musigd` waits for the running requests after a termination signal
+/// The longest time that `musigd` waits for the running requests after it was asked to shut down
 /// (`docs/specifications/trade/shutdown.md`).
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
@@ -62,7 +62,10 @@ async fn musigd_serves_trade_service_and_wallet_service() {
         .stderr(Stdio::null())
         .spawn()
         .expect("musigd starts");
-    let _musigd = MusigdProcess(musigd);
+    let _musigd = MusigdProcess {
+        child: musigd,
+        port,
+    };
     let channel = connect(port).await.expect("musigd accepts a connection");
 
     let mut wallet_client = WalletClient::new(channel.clone());
@@ -120,20 +123,24 @@ fn musigd_does_not_start_with_a_lock_time_outside_the_limits() {
         ),
         ("BISQ_MUSIG_WARNING_LOCK_TIME", "soon", "invalid value"),
     ] {
+        let port = free_port().expect("free loopback port");
         let musigd = Command::new(env!("CARGO_BIN_EXE_musigd"))
             .arg("--port")
-            .arg(free_port().expect("free loopback port").to_string())
+            .arg(port.to_string())
             .env(variable, value)
             .env("RUST_LOG", "off")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .expect("musigd starts");
-        let mut musigd = MusigdProcess(musigd);
+        let mut musigd = MusigdProcess {
+            child: musigd,
+            port,
+        };
 
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         let status = loop {
-            if let Some(status) = musigd.0.try_wait().expect("process state") {
+            if let Some(status) = musigd.child.try_wait().expect("process state") {
                 break status;
             }
             assert!(
@@ -145,7 +152,7 @@ fn musigd_does_not_start_with_a_lock_time_outside_the_limits() {
         assert!(!status.success(), "{variable}={value}: {status}");
         let mut error_output = String::new();
         musigd
-            .0
+            .child
             .stderr
             .take()
             .expect("stderr is piped")
@@ -159,10 +166,10 @@ fn musigd_does_not_start_with_a_lock_time_outside_the_limits() {
 }
 
 /// Starts `musigd` without a peer on a new wallet directory, and connects to it. Returns the
-/// process, the connection and the port.
+/// process and the connection.
 async fn musigd_without_a_peer(
     wallet_dir: &std::path::Path,
-) -> anyhow::Result<(MusigdProcess, Channel, u16)> {
+) -> anyhow::Result<(MusigdProcess, Channel)> {
     let port = free_port()?;
     let musigd = Command::new(env!("CARGO_BIN_EXE_musigd"))
         .arg("--port")
@@ -173,22 +180,27 @@ async fn musigd_without_a_peer(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    let musigd = MusigdProcess(musigd);
+    let musigd = MusigdProcess {
+        child: musigd,
+        port,
+    };
     let channel = connect(port).await?;
-    Ok((musigd, channel, port))
+    Ok((musigd, channel))
 }
 
-/// The regular shutdown (`docs/specifications/trade/shutdown.md`): SIGTERM arrives while
-/// `musigd` creates a wallet. The process completes the request, so its caller gets the
-/// response. It accepts no new connection, ends with the exit status 0, and does so at once,
-/// because nothing else is open. The wallet that the request created is stored.
+/// The regular shutdown (`docs/specifications/trade/shutdown.md`): the request `Shutdown`
+/// arrives while `musigd` creates a wallet. The process answers the request `Shutdown` and
+/// completes the running request, so its caller gets the response. It accepts no new
+/// connection, ends with the exit status 0, and does so at once, because nothing else is open.
+/// The wallet that the request created is stored.
 #[tokio::test]
-async fn musigd_shuts_down_on_sigterm_and_completes_the_running_request() -> anyhow::Result<()> {
+async fn musigd_shuts_down_on_request_and_completes_the_running_request() -> anyhow::Result<()> {
     let wallet_dir = tempfile::tempdir()?;
-    let (musigd, channel, port) = musigd_without_a_peer(wallet_dir.path()).await?;
+    let (musigd, channel) = musigd_without_a_peer(wallet_dir.path()).await?;
+    let port = musigd.port;
 
     // The creation of a wallet takes a moment, because the key of the database is derived from
-    // the password. The signal is sent while the request runs.
+    // the password. The request to shut down is sent while the creation runs.
     let mut wallet_client = WalletClient::new(channel);
     let creation = tokio::spawn(async move {
         let request = OpenOrCreateWalletRequest {
@@ -197,11 +209,11 @@ async fn musigd_shuts_down_on_sigterm_and_completes_the_running_request() -> any
         wallet_client.open_or_create_wallet(request).await
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(!creation.is_finished(), "the request runs at the signal");
-    let signal_sent = Instant::now();
+    assert!(!creation.is_finished(), "the creation runs");
+    let shutdown_requested = Instant::now();
     musigd.shut_down().await?;
     assert!(
-        signal_sent.elapsed() < SHUTDOWN_GRACE,
+        shutdown_requested.elapsed() < SHUTDOWN_GRACE,
         "the process does not wait for the limit of the shutdown"
     );
     creation.await?.expect("the running request is completed");
@@ -210,7 +222,7 @@ async fn musigd_shuts_down_on_sigterm_and_completes_the_running_request() -> any
     assert!(endpoint.connect().await.is_err(), "the port is closed");
 
     // A new process on the directory finds the wallet.
-    let (_musigd, channel, _) = musigd_without_a_peer(wallet_dir.path()).await?;
+    let (_musigd, channel) = musigd_without_a_peer(wallet_dir.path()).await?;
     let state = WalletClient::new(channel)
         .is_wallet_ready(IsWalletReadyRequest {})
         .await?
@@ -224,21 +236,21 @@ async fn musigd_shuts_down_on_sigterm_and_completes_the_running_request() -> any
 }
 
 /// The regular shutdown with a client that keeps a subscription open: the process ends the
-/// subscription at the signal and does not wait for the client. The stream ends without an
-/// error.
+/// subscription when it is asked to shut down, and does not wait for the client. The stream
+/// ends without an error.
 #[tokio::test]
 async fn musigd_ends_an_open_subscription_when_it_shuts_down() -> anyhow::Result<()> {
     let wallet_dir = tempfile::tempdir()?;
-    let (musigd, channel, _) = musigd_without_a_peer(wallet_dir.path()).await?;
+    let (musigd, channel) = musigd_without_a_peer(wallet_dir.path()).await?;
     let mut events = WalletClient::new(channel)
         .subscribe_wallet_events(SubscribeWalletEventsRequest {})
         .await?
         .into_inner();
 
-    let signal_sent = Instant::now();
+    let shutdown_requested = Instant::now();
     musigd.shut_down().await?;
     assert!(
-        signal_sent.elapsed() < SHUTDOWN_GRACE,
+        shutdown_requested.elapsed() < SHUTDOWN_GRACE,
         "the process does not wait for the subscriber"
     );
     // No wallet is open, so the stream had no event.
@@ -253,7 +265,7 @@ async fn musigd_ends_an_open_subscription_when_it_shuts_down() -> anyhow::Result
 #[tokio::test]
 async fn musigd_shuts_down_at_the_limit_while_a_request_is_open() -> anyhow::Result<()> {
     let wallet_dir = tempfile::tempdir()?;
-    let (musigd, channel, _) = musigd_without_a_peer(wallet_dir.path()).await?;
+    let (musigd, channel) = musigd_without_a_peer(wallet_dir.path()).await?;
     // The generated client sends a request at once, so the request is made with the functions
     // below it: the message of the request is a stream that never has an item.
     let mut client = tonic::client::Grpc::new(channel);
@@ -268,15 +280,48 @@ async fn musigd_shuts_down_at_the_limit_while_a_request_is_open() -> anyhow::Res
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(!open_request.is_finished(), "the request is open");
 
-    let signal_sent = Instant::now();
+    let shutdown_requested = Instant::now();
     musigd.shut_down().await?;
-    let waited = signal_sent.elapsed();
+    let waited = shutdown_requested.elapsed();
     assert!(
         SHUTDOWN_GRACE <= waited && waited < SHUTDOWN_GRACE * 2,
-        "the process ended {waited:?} after the signal"
+        "the process ended {waited:?} after the request to shut down"
     );
     let response = tokio::time::timeout(WAIT, open_request).await??;
     assert!(response.is_err(), "the open request has no response");
+    Ok(())
+}
+
+/// The signals SIGTERM and SIGINT are the second way to ask for the regular shutdown: the
+/// process ends an open subscription without an error and ends with the exit status 0, as after
+/// the request `Shutdown`.
+#[cfg(unix)]
+#[tokio::test]
+async fn musigd_shuts_down_on_a_termination_signal() -> anyhow::Result<()> {
+    for signal in ["TERM", "INT"] {
+        let wallet_dir = tempfile::tempdir()?;
+        let (musigd, channel) = musigd_without_a_peer(wallet_dir.path()).await?;
+        let mut events = WalletClient::new(channel)
+            .subscribe_wallet_events(SubscribeWalletEventsRequest {})
+            .await?
+            .into_inner();
+
+        // The standard library can only end a process at once, so the `kill` program of the
+        // system sends the signal.
+        let signal_sent = Instant::now();
+        let sent = Command::new("kill")
+            .arg(format!("-{signal}"))
+            .arg(musigd.child.id().to_string())
+            .status()?;
+        anyhow::ensure!(sent.success(), "SIG{signal} was not sent to musigd: {sent}");
+        musigd.ended().await?;
+        assert!(
+            signal_sent.elapsed() < SHUTDOWN_GRACE,
+            "SIG{signal}: the process does not wait for the subscriber"
+        );
+        let end = tokio::time::timeout(WAIT, events.next()).await?;
+        assert!(end.is_none(), "SIG{signal}: {end:?}");
+    }
     Ok(())
 }
 

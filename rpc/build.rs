@@ -75,8 +75,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[
                 "src/main/proto/rpc.proto",
                 "src/main/proto/bmp_wallet.proto",
+                // The internal service. It is not in the directory of the official APIs.
+                "src/internal/proto/musigd.proto",
             ],
-            &["src/main/proto"],
+            &["src/main/proto", "src/internal/proto"],
         )?;
     Ok(())
 }

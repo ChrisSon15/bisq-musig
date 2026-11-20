@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+// The internal service of `musigd`. It is NOT part of the official APIs of `musigd`, which are
+// the trade service `musigrpc.Musig` (rpc.proto) and the wallet service `wallet.Wallet`
+// (bmp_wallet.proto) in `src/main/proto`. It serves the program that starts `musigd` and the
+// tests, and it can change without notice. `musigd` serves it on the same port.
+package musigd.internal;
+
+service Daemon {
+    // Asks `musigd` to end in the regular way (docs/specifications/trade/shutdown.md). The
+    // response is sent before the process ends. The request does not drain the imported coins;
+    // that is the `Close` request of the wallet service.
+    rpc Shutdown (ShutdownRequest) returns (ShutdownResponse);
+}
+
+message ShutdownRequest {
+}
+
+message ShutdownResponse {
+}

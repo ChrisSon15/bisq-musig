@@ -10,6 +10,8 @@ use anyhow::Context as _;
 use bdk_wallet::bitcoin::{Address, Network};
 use rpc::pb::bmp_wallet::wallet_client::WalletClient;
 use rpc::pb::bmp_wallet::{GetUnusedAddressRequest, OpenOrCreateWalletRequest};
+use rpc::pb::musigd_internal::ShutdownRequest;
+use rpc::pb::musigd_internal::daemon_client::DaemonClient;
 use rpc::pb::musigrpc::musig_client::MusigClient;
 use tokio::time::Instant;
 use tonic::transport::Channel;
@@ -39,33 +41,37 @@ pub async fn wait_for<T>(
 
 /// A `musigd` process. It is ended at once when the value is dropped, as a crash does, so no
 /// process is left when a test ends or fails. [`Self::shut_down`] ends it in the regular way.
-pub struct MusigdProcess(pub Child);
+pub struct MusigdProcess {
+    pub child: Child,
+    /// The loopback port on which the process serves.
+    pub port: u16,
+}
 
 impl Drop for MusigdProcess {
     fn drop(&mut self) {
         // Errors are ignored, because the process may have ended already.
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
 impl MusigdProcess {
     /// Ends the process in the regular way, as `docs/specifications/trade/shutdown.md` defines
-    /// it: sends the signal SIGTERM and waits until the process has ended. Fails if the process
-    /// does not end, or if its exit status is not 0.
-    pub async fn shut_down(mut self) -> anyhow::Result<()> {
-        // The standard library can only end a process at once, so the `kill` program of the
-        // system sends the signal.
-        let sent = Command::new("kill")
-            .arg("-TERM")
-            .arg(self.0.id().to_string())
-            .status()
-            .context("the kill program does not start")?;
-        anyhow::ensure!(sent.success(), "SIGTERM was not sent to musigd: {sent}");
-        let status = wait_for("musigd ends after SIGTERM", async || {
-            Ok(self.0.try_wait()?)
-        })
-        .await?;
+    /// it: sends the request `Shutdown` of the internal service and waits until the process has
+    /// ended. Fails if the process does not end, or if its exit status is not 0.
+    pub async fn shut_down(self) -> anyhow::Result<()> {
+        let channel = connect(self.port).await?;
+        DaemonClient::new(channel)
+            .shutdown(ShutdownRequest {})
+            .await
+            .context("musigd does not accept the request to shut down")?;
+        self.ended().await
+    }
+
+    /// Waits until the process has ended after it was asked to. Fails if it does not end, or if
+    /// its exit status is not 0.
+    pub async fn ended(mut self) -> anyhow::Result<()> {
+        let status = wait_for("musigd ends", async || Ok(self.child.try_wait()?)).await?;
         anyhow::ensure!(status.success(), "musigd ended with {status}");
         Ok(())
     }
@@ -154,7 +160,10 @@ impl App {
             .stderr(log_output(launch.trader, "err", !launch.first)?)
             .spawn()
             .context("musigd does not start")?;
-        let process = MusigdProcess(process);
+        let process = MusigdProcess {
+            child: process,
+            port,
+        };
 
         let channel = connect(port).await?;
         let mut wallet = WalletClient::new(channel.clone());
