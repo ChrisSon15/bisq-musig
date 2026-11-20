@@ -56,6 +56,7 @@ use rpc::server::{
 };
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Channel, Server};
 use tonic::{Code, Response, Status, Streaming};
@@ -383,6 +384,8 @@ struct RunningService {
     trades: Arc<MemoryTradeStore>,
     /// The task of the server. When it is aborted, the service and its watcher end.
     server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    /// The request to end the process, as `musigd` hands it to the service.
+    shutdown: CancellationToken,
 }
 
 fn mock_wallet(is_buyer: bool) -> Arc<MockWalletProvider> {
@@ -430,11 +433,13 @@ async fn start_service_with_wallet(
 ) -> RunningService {
     let trades = Arc::new(MemoryTradeStore::default());
     restore_trades(&mut **wallet.0.lock().await, &*trades);
+    let shutdown = CancellationToken::new();
     let mut service = MusigImpl::new(
         Arc::clone(&trades) as _,
         wallet,
         EngineConfig::new(WARNING_LOCK_TIME, CLAIM_LOCK_TIME, 144, 6).expect("valid configuration"),
-    );
+    )
+    .with_shutdown(shutdown.clone());
     if let Some(chain) = chain {
         service = service.with_chain(chain as _);
     }
@@ -455,6 +460,7 @@ async fn start_service_with_wallet(
         client,
         trades,
         server,
+        shutdown,
     }
 }
 
@@ -493,6 +499,8 @@ struct Party {
     /// While this is set, the wallet of the trader cannot store a trade record.
     store_fails: Arc<AtomicBool>,
     server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    /// The request to end the process of the trader.
+    shutdown: CancellationToken,
     trade_id: String,
     role: Role,
     key_shares: Option<PubKeySharesResponse>,
@@ -518,6 +526,7 @@ impl Party {
             wallet,
             store_fails,
             server: service.server,
+            shutdown: service.shutdown,
             trade_id,
             role,
             key_shares: None,
@@ -550,6 +559,7 @@ impl Party {
         self.client = service.client;
         self.trades = service.trades;
         self.server = service.server;
+        self.shutdown = service.shutdown;
     }
 
     async fn restart(&mut self) {
@@ -2120,6 +2130,52 @@ async fn trade_event_of_type(
             return event;
         }
     }
+}
+
+/// The regular shutdown (`docs/specifications/trade/shutdown.md`): when the process of a trader
+/// is asked to end, the streams of his subscriptions end without an error, so that no subscriber
+/// keeps the server from ending. The subscriptions of the other trader stay open.
+#[tokio::test]
+async fn subscriptions_end_when_the_process_is_asked_to_end() {
+    async fn stream_end<T: std::fmt::Debug>(
+        events: &mut Streaming<T>,
+    ) -> Option<Result<T, Status>> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), events.next())
+            .await
+            .expect("the stream ends in time")
+    }
+
+    let mut trade = trade_with_signed_deposit().await;
+    let (maker_side, taker_side) = (trade.maker_side(), trade.taker_side());
+    // The taker holds the stream of `PublishDepositTx` and a stream of the events of the trade.
+    // The maker holds the stream of `SubscribeTxConfirmationStatus`. No block arrives, so no
+    // stream has an event about the deposit.
+    let mut takers_confirmations = trade.publish_deposit_tx().await;
+    let taker = trade.party_mut(taker_side);
+    let mut takers_events = taker.subscribe_trade_events().await.unwrap();
+    let first = next_trade_event(&mut takers_events).await;
+    assert_eq!(first.r#type(), TradeEventType::State);
+    let maker = trade.party_mut(maker_side);
+    let mut makers_confirmations = maker.subscribe_tx_confirmation_status().await.unwrap();
+
+    trade.party(taker_side).shutdown.cancel();
+    let end = stream_end(&mut takers_confirmations).await;
+    assert!(end.is_none(), "{end:?}");
+    let end = stream_end(&mut takers_events).await;
+    assert!(end.is_none(), "{end:?}");
+    // A subscription that starts after the request to end has no event.
+    let taker = trade.party_mut(taker_side);
+    let mut late_events = taker.subscribe_trade_events().await.unwrap();
+    let end = stream_end(&mut late_events).await;
+    assert!(end.is_none(), "{end:?}");
+
+    // The process of the maker was not asked to end, so its stream is open.
+    let waited = std::time::Duration::from_millis(300);
+    let open = tokio::time::timeout(waited, makers_confirmations.next()).await;
+    assert!(open.is_err(), "{open:?}");
+    trade.party(maker_side).shutdown.cancel();
+    let end = stream_end(&mut makers_confirmations).await;
+    assert!(end.is_none(), "{end:?}");
 }
 
 /// The event stream of a trade reports what the caller shows to the user: the confirmations of

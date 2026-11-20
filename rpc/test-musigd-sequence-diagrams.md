@@ -1,7 +1,7 @@
 # Sequence diagrams of the tests in `rpc/tests/test_musigd.rs`
 
 This file shows what every test of `rpc/tests/test_musigd.rs` does, as one UML sequence diagram
-per test. The diagrams follow the test code of 2026-11-19.
+per test. The diagrams follow the test code of 2026-11-20.
 
 This file is generated. Do not edit it by hand: when a test changes, change its description in
 `rpc/test-musigd-sequence-diagrams.py` and run that script again.
@@ -93,6 +93,9 @@ The buyer is the taker and the seller is the maker in every trade.
 | 8 | [`h2_h5_restart_of_two_daemons_during_a_custom_payout`](#8-h2_h5_restart_of_two_daemons_during_a_custom_payout) | Custom payout, with restarts |
 | 9 | [`a3_h2_deposit_abort_of_two_daemons_after_a_restart`](#9-a3_h2_deposit_abort_of_two_daemons_after_a_restart) | Deposit abort after the deposit timeout |
 | 10 | [`h3_h4_h8_daemon_is_ended_while_it_processes_a_request`](#10-h3_h4_h8_daemon_is_ended_while_it_processes_a_request) | End of `musigd` during a request |
+| 11 | [`musigd_shuts_down_on_sigterm_and_completes_the_running_request`](#11-musigd_shuts_down_on_sigterm_and_completes_the_running_request) | Regular shutdown during a request |
+| 12 | [`musigd_ends_an_open_subscription_when_it_shuts_down`](#12-musigd_ends_an_open_subscription_when_it_shuts_down) | Regular shutdown with an open subscription |
+| 13 | [`musigd_shuts_down_at_the_limit_while_a_request_is_open`](#13-musigd_shuts_down_at_the_limit_while_a_request_is_open) | Regular shutdown with a request that is never completed |
 
 ## 1. `musigd_serves_trade_service_and_wallet_service`
 
@@ -1255,4 +1258,69 @@ sequenceDiagram
         S->>SD: Wallet.GetBalance()
         SD-->>S: balance
     end
+```
+
+## 11. `musigd_shuts_down_on_sigterm_and_completes_the_running_request`
+
+The regular shutdown (`docs/specifications/trade/shutdown.md`). The signal SIGTERM arrives while
+`musigd` creates a wallet. The process completes the request, accepts no new connection, and ends
+with the exit status 0. The created wallet is stored.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as bisq2 (test)
+    participant D as musigd
+    participant T as Test
+    Note over D: The test starts musigd: new<br/>wallet directory, no peer
+    C->>D: Wallet.OpenOrCreateWallet(password)
+    Note over D: The request runs: musigd<br/>derives the key of the wallet<br/>database from the password
+    T->>D: signal SIGTERM, 200 ms after the<br/>request
+    Note over D: musigd accepts no new request<br/>and completes the running<br/>request
+    D-->>C: ok: the wallet is created
+    D-->>T: the process ends with the exit<br/>status 0, less than 10 s after the<br/>signal
+    C->>D: new connection to the port
+    D--xC: no connection: the port is closed
+    Note over D: The test starts musigd again<br/>on the same wallet directory
+    C->>D: Wallet.IsWalletReady()
+    D-->>C: exists = true
+```
+
+## 12. `musigd_ends_an_open_subscription_when_it_shuts_down`
+
+The regular shutdown with a client that keeps a subscription open. The process ends the stream of
+the subscription at the signal and does not wait for the client.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as bisq2 (test)
+    participant D as musigd
+    participant T as Test
+    Note over D: The test starts musigd: new<br/>wallet directory, no peer
+    C->>D: Wallet.SubscribeWalletEvents()
+    Note over D: The stream is open. No wallet<br/>is open, so it has no event
+    T->>D: signal SIGTERM
+    D-->>C: the stream ends without an error
+    D-->>T: the process ends with the exit<br/>status 0, less than 10 s after the<br/>signal
+```
+
+## 13. `musigd_shuts_down_at_the_limit_while_a_request_is_open`
+
+The regular shutdown with a client that does not complete a request. The process waits for the
+request up to the limit of 10 seconds, then ends it, and still ends with the exit status 0.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as bisq2 (test)
+    participant D as musigd
+    participant T as Test
+    Note over D: The test starts musigd: new<br/>wallet directory, no peer
+    C->>D: Wallet.IsWalletReady: the request is<br/>started, its message is never sent
+    Note over D: The request is open: musigd<br/>waits for its message
+    T->>D: signal SIGTERM, 500 ms after the<br/>start of the request
+    Note over D: musigd waits for the open<br/>request, up to the limit of 10<br/>s
+    D--xC: the request ends without a response
+    D-->>T: the process ends with the exit<br/>status 0, between 10 s and 20 s<br/>after the signal
 ```

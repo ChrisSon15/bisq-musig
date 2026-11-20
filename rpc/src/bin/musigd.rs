@@ -1,5 +1,7 @@
 use std::error::Error;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +13,11 @@ use protocol::params::{EngineConfig, EngineConfigError};
 use protocol::trade_model::{MemoryTradeStore, TradeModelStore};
 use rpc::bmp_wallet_service::{BMPWalletServiceImpl, BmpWalletImpl, BmpWalletServer};
 use rpc::server::{MusigImpl, MusigServer, NoTradeWallet, TradeWalletProvider};
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
+
+/// The longest time that `musigd` waits for the running requests after it was asked to end.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
@@ -107,6 +113,35 @@ impl Cli {
     }
 }
 
+/// Starts to listen for the signals that ask the process to end. The returned future resolves
+/// with the name of the first signal that arrives: SIGTERM or SIGINT, which is Ctrl-C in a
+/// terminal.
+#[cfg(unix)]
+fn termination_signal() -> std::io::Result<impl Future<Output = &'static str>> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => "SIGTERM",
+            _ = interrupt.recv() => "SIGINT",
+        }
+    })
+}
+
+/// Starts to listen for Ctrl-C, the only request to end that this platform delivers.
+#[cfg(not(unix))]
+fn termination_signal() -> std::io::Result<impl Future<Output = &'static str>> {
+    Ok(async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            // Without a listener no request to end can arrive.
+            std::future::pending::<()>().await;
+        }
+        "Ctrl-C"
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let cli: Cli = Cli::parse();
@@ -165,9 +200,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         warn!("No --wallet-dir given: the trade service has no wallet and cannot start a trade.");
         Arc::new(NoTradeWallet)
     };
-    let mut musig = MusigImpl::new(trades, trade_wallet, engine_config);
-    if let Some(chain_client) = chain_client {
-        musig = musig.with_chain(Arc::new(chain_client));
+    // The request to end the process in the regular way
+    // (docs/specifications/trade/shutdown.md). The services end the streams of their
+    // subscriptions with it, and the server stops to accept requests.
+    let shutdown = CancellationToken::new();
+    let mut musig =
+        MusigImpl::new(trades, trade_wallet, engine_config).with_shutdown(shutdown.clone());
+    if let Some(chain_client) = &chain_client {
+        musig = musig.with_chain(Arc::new(chain_client.clone()));
     } else {
         warn!("The trade service has no access to the chain and cannot publish a deposit.");
     }
@@ -176,11 +216,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Some(service) = bmp_wallet {
         server = server.add_service(BmpWalletServer::new(BmpWalletImpl {
             wallet_service: service,
+            shutdown: shutdown.clone(),
         }));
     }
 
+    // The listener for the signals exists before the first request is served.
+    let terminated = termination_signal()?;
     info!(port = cli.port, "Starting gRPC server.");
-    server.serve(addr).await?;
+    let mut serving = pin!(server.serve_with_shutdown(addr, shutdown.clone().cancelled_owned()));
+    tokio::select! {
+        // Without a signal the server ends only with an error, for example a used port.
+        result = &mut serving => return Ok(result?),
+        signal = terminated => info!(signal, "Shutting down: no new request is accepted."),
+    }
+    shutdown.cancel();
+    // From here on the server accepts no connection and no request, and the subscriptions have
+    // ended. The server ends when the running requests have their responses. A request that is
+    // still open at the limit is ended. Every change of a trade or of the wallet is stored when
+    // it is made, so this loses nothing.
+    let completed = tokio::time::timeout(SHUTDOWN_GRACE, serving).await.ok();
+    if completed.transpose()?.is_none() {
+        warn!(
+            "Requests were still open {} seconds after the signal. They are ended now.",
+            SHUTDOWN_GRACE.as_secs()
+        );
+    }
+    if let Some(chain_client) = chain_client {
+        // An error means that the client was never started, so there is nothing to end.
+        let _ = chain_client.shutdown();
+    }
+    info!("Shut down.");
 
     Ok(())
 }

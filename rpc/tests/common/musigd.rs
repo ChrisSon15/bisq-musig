@@ -37,8 +37,8 @@ pub async fn wait_for<T>(
     }
 }
 
-/// A `musigd` process. It is ended at once when the value is dropped, so no process is left when
-/// a test ends or fails.
+/// A `musigd` process. It is ended at once when the value is dropped, as a crash does, so no
+/// process is left when a test ends or fails. [`Self::shut_down`] ends it in the regular way.
 pub struct MusigdProcess(pub Child);
 
 impl Drop for MusigdProcess {
@@ -46,6 +46,28 @@ impl Drop for MusigdProcess {
         // Errors are ignored, because the process may have ended already.
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+impl MusigdProcess {
+    /// Ends the process in the regular way, as `docs/specifications/trade/shutdown.md` defines
+    /// it: sends the signal SIGTERM and waits until the process has ended. Fails if the process
+    /// does not end, or if its exit status is not 0.
+    pub async fn shut_down(mut self) -> anyhow::Result<()> {
+        // The standard library can only end a process at once, so the `kill` program of the
+        // system sends the signal.
+        let sent = Command::new("kill")
+            .arg("-TERM")
+            .arg(self.0.id().to_string())
+            .status()
+            .context("the kill program does not start")?;
+        anyhow::ensure!(sent.success(), "SIGTERM was not sent to musigd: {sent}");
+        let status = wait_for("musigd ends after SIGTERM", async || {
+            Ok(self.0.try_wait()?)
+        })
+        .await?;
+        anyhow::ensure!(status.success(), "musigd ended with {status}");
+        Ok(())
     }
 }
 

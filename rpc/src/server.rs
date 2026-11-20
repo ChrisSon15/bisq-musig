@@ -26,6 +26,7 @@ use protocol::trade_model::{
 use serde::Serialize;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{Notify, broadcast};
+use tokio_util::sync::CancellationToken;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Result, Status};
 use tracing::{Span, debug, error, info, instrument, trace, warn};
@@ -178,6 +179,8 @@ pub struct MusigImpl {
     watched: Arc<Mutex<HashSet<String>>>,
     /// The task that watches the trades. It ends with the service.
     watcher: Option<tokio::task::AbortHandle>,
+    /// Cancelled when the process was asked to end. The streams of the subscriptions end then.
+    shutdown: CancellationToken,
 }
 
 impl Drop for MusigImpl {
@@ -206,7 +209,18 @@ impl MusigImpl {
             wake_watcher: Arc::new(Notify::new()),
             watched: Arc::new(Mutex::new(HashSet::new())),
             watcher: None,
+            shutdown: CancellationToken::new(),
         }
+    }
+
+    /// Supplies the request to end the process. When `shutdown` is cancelled, the streams of all
+    /// subscriptions end, so that no subscriber keeps the server from ending
+    /// (`docs/specifications/trade/shutdown.md`). Without it the streams end only as their
+    /// requests define it.
+    #[must_use]
+    pub fn with_shutdown(mut self, shutdown: CancellationToken) -> Self {
+        self.shutdown = shutdown;
+        self
     }
 
     /// Supplies the access to the chain, and starts the task that watches the trades on the
@@ -531,6 +545,7 @@ impl musig_server::Musig for MusigImpl {
                 deposit_tx.compute_txid(),
                 Some(consensus::serialize(&deposit_tx)),
             )
+            .take_until(self.shutdown.clone().cancelled_owned())
             .box_traced())
         })
         .await
@@ -553,6 +568,7 @@ impl musig_server::Musig for MusigImpl {
 
             Ok(
                 tx_confirmation_status_stream(chain, request.trade_id, deposit_txid, None)
+                    .take_until(self.shutdown.clone().cancelled_owned())
                     .box_traced(),
             )
         })
@@ -726,7 +742,9 @@ impl musig_server::Musig for MusigImpl {
         let events = self.events.subscribe();
         self.handle_trade_request(request, move |request, trade_model, _wallet| {
             let first = trade_event(trade_model, self.chain.as_deref(), TradeEventType::State);
-            Ok(trade_event_stream(request.trade_id, first, events).box_traced())
+            Ok(trade_event_stream(request.trade_id, first, events)
+                .take_until(self.shutdown.clone().cancelled_owned())
+                .box_traced())
         })
         .await
     }

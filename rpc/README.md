@@ -107,6 +107,11 @@ bitcoind -regtest -prune=0 -txindex=1 -blockfilterindex=1 -peerblockfilters=1 -s
 The `-blockfilterindex` and `-peerblockfilters` (compact filters) options are needed for the wallet to sync from this
 node.
 
+`musigd` ends in the regular way on the signals SIGTERM and SIGINT (Ctrl-C): it accepts no new request, ends the
+subscriptions, completes the running requests within 10 seconds, and ends with the exit status 0. It does not drain the
+payouts of closed trades; a client sends the `Close` request of the wallet service before the signal. The rules are in
+[shutdown.md](../docs/specifications/trade/shutdown.md).
+
 [bmp_wallet.proto](src/main/proto/bmp_wallet.proto) is derived from bisq2's own `wallet/src/main/proto/wallet.proto`
 (same package, service name and field numbers), but it is not a drop-in replacement yet. The wallet is always
 password-protected, so `EncryptWallet` / `DecryptWallet` / `IsWalletEncrypted` are gone, replaced by the authenticated

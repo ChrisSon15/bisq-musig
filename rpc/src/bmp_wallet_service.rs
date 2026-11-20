@@ -37,6 +37,7 @@ use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::{self, JoinHandle};
 use tokio::time::{self, Duration, MissedTickBehavior};
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Result, Status};
 use tracing::{debug, error, info, instrument, warn};
 use zeroize::Zeroizing;
@@ -727,6 +728,11 @@ impl<S: Send + Sync> crate::server::TradeWalletProvider for BMPWalletServiceImpl
 /// like the [`Password`] the service builds from it, instead of lingering in freed heap memory.
 pub struct BmpWalletImpl {
     pub wallet_service: Arc<dyn BmpWalletService + Send + Sync>,
+    /// Cancelled when the process was asked to end. The streams of the subscriptions end then,
+    /// so that no subscriber keeps the server from ending
+    /// (`docs/specifications/trade/shutdown.md`). A token that is never cancelled leaves the
+    /// streams open.
+    pub shutdown: CancellationToken,
 }
 
 #[tonic::async_trait]
@@ -742,6 +748,7 @@ impl wallet_server::Wallet for BmpWalletImpl {
             let events = self.wallet_service.wallet_events();
             Ok(events
                 .map(|change| Ok(WalletEvent::from(change)))
+                .take_until(self.shutdown.clone().cancelled_owned())
                 .box_traced())
         })
         .await

@@ -23,6 +23,7 @@ The specification describes the target. Parts of it are not implemented yet.
 | [fees.md](fees.md) | Fee rates, who pays, raising a fee |
 | [persistence-and-recovery.md](persistence-and-recovery.md) | Trade store, restart, backup and restore |
 | [service-interface.md](service-interface.md) | Meaning of the requests of bisq2, errors, security assumptions |
+| [shutdown.md](shutdown.md) | Regular shutdown of `musigd`: the request to end, subscriptions, running requests, exit status |
 
 [key-derivation-vectors.py](key-derivation-vectors.py) computes the test vectors of
 `key-derivation.md`.
@@ -97,6 +98,7 @@ confirmed. The text of the files contains the rule of the column "Rule in the sp
 | O19 | Details of the deposit abort (D13): (a) the engine aborts on its own only in the state `Deposit`, and in a later state it sends the deposit again; (b) the deposit timeout is counted again after a reorganisation removed the deposit; (c) the abort pays more than the fee of the whole deposit transaction, so that it replaces the deposit in a node; (d) the abort pays to the trader's payout address; (e) the abort is not stored. | As listed in the question. | [setup-and-deposit.md](setup-and-deposit.md), [transactions.md](transactions.md) |
 | O20 | Which stored transactions are sent again after a start (N5)? The plan names the drain transaction. | Every unconfirmed transaction that spends coins of the wallet: the drain, wallet payments and recorded transactions of trades. They are sent after the first sync of a run and after every new block, until they are confirmed or can no longer confirm. | [post-trade-protection.md](post-trade-protection.md), [../wallet/coin-reservation.md](../wallet/coin-reservation.md) |
 | O17 | A record of the trade store cannot be loaded. The engine then serves no trade ([persistence-and-recovery.md](persistence-and-recovery.md)). How does the user leave this condition? | Not specified. No request removes or repairs a record. Until the decision the user needs a copy of the wallet database from before the damage. | [persistence-and-recovery.md](persistence-and-recovery.md) |
+| O21 | How does `musigd` end in the regular way? The project owner asked for a regular shutdown on 2026-11-20; the mechanism is not decided. | The process ends on the signals SIGTERM and SIGINT: it accepts no new request, ends the subscriptions, completes the running requests within 10 seconds, and ends with the exit status 0. It does not drain the imported coins. A platform without SIGTERM (Windows) has no request to end. | [shutdown.md](shutdown.md) |
 
 Points that were open and are decided:
 

@@ -116,11 +116,14 @@ impl User {
 
     /// The user ends the app in the regular way. The app asks the wallet service to close, which
     /// moves the payouts of closed trades to the seed wallet with a drain transaction. Then the
-    /// `musigd` process ends. Returns the ID of the drain transaction, or `None` if there was
-    /// nothing to move.
+    /// app ends the `musigd` process with the signal SIGTERM, and the process must end with the
+    /// exit status 0. Returns the ID of the drain transaction, or `None` if there was nothing to
+    /// move.
     pub async fn close_app(&mut self) -> anyhow::Result<Option<Txid>> {
         let response = self.wallet.close(CloseRequest {}).await?.into_inner();
-        self.stop_app();
+        let musigd = self.musigd.take();
+        let musigd = musigd.with_context(|| format!("the app of {} does not run", self.name))?;
+        musigd.shut_down().await?;
         Ok(response.drain_tx_id.map(|txid| txid.parse()).transpose()?)
     }
 

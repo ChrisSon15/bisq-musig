@@ -41,6 +41,8 @@ in that time. A payout that is moved to the seed wallet cannot be taken by a war
 - A second call while a drain transaction is stored and unconfirmed creates no second drain
   transaction.
 - If no wallet is open, it returns a result that says so.
+- It does not end the program. The caller ends `musigd` after the response
+  ([shutdown.md](shutdown.md)).
 - Imported coins that are reserved for an open trade are not drained. The open trade continues at
   the next start.
 

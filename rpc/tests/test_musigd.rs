@@ -16,10 +16,11 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use bdk_wallet::bitcoin::{Address, Amount, Transaction, consensus};
-use futures_util::StreamExt as _;
+use futures_util::{StreamExt as _, stream};
 use rpc::pb::bmp_wallet::wallet_client::WalletClient;
 use rpc::pb::bmp_wallet::{
-    CloseRequest, GetBalanceRequest, IsWalletReadyRequest, OpenOrCreateWalletRequest,
+    CloseRequest, GetBalanceRequest, IsWalletReadyRequest, IsWalletReadyResponse,
+    OpenOrCreateWalletRequest, SubscribeWalletEventsRequest,
 };
 use rpc::pb::musigrpc::musig_client::MusigClient;
 use rpc::pb::musigrpc::{
@@ -27,8 +28,10 @@ use rpc::pb::musigrpc::{
     TradeEvent, TradeEventType, TradeStateKind, TradeTxKind, TxConfirmationStatus,
 };
 use testenv::TestEnv;
+use tonic::codegen::http::uri::PathAndQuery;
 use tonic::transport::Channel;
-use tonic::{Code, Streaming};
+use tonic::{Code, Request, Streaming};
+use tonic_prost::ProstCodec;
 
 use crate::common::musigd::{self, App, Launch, MusigdProcess, PASSWORD, WAIT, connect, free_port};
 use crate::common::trade::{self, DepositConfirmations, FEE_RATE, SignedDeposit, Terms};
@@ -38,6 +41,9 @@ mod common;
 
 /// The longest time in which `musigd` ends when it cannot start.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest time that `musigd` waits for the running requests after a termination signal
+/// (`docs/specifications/trade/shutdown.md`).
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 #[tokio::test]
 async fn musigd_serves_trade_service_and_wallet_service() {
@@ -150,6 +156,128 @@ fn musigd_does_not_start_with_a_lock_time_outside_the_limits() {
             "{variable}={value}: {error_output}"
         );
     }
+}
+
+/// Starts `musigd` without a peer on a new wallet directory, and connects to it. Returns the
+/// process, the connection and the port.
+async fn musigd_without_a_peer(
+    wallet_dir: &std::path::Path,
+) -> anyhow::Result<(MusigdProcess, Channel, u16)> {
+    let port = free_port()?;
+    let musigd = Command::new(env!("CARGO_BIN_EXE_musigd"))
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--wallet-dir")
+        .arg(wallet_dir)
+        .env("RUST_LOG", "off")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let musigd = MusigdProcess(musigd);
+    let channel = connect(port).await?;
+    Ok((musigd, channel, port))
+}
+
+/// The regular shutdown (`docs/specifications/trade/shutdown.md`): SIGTERM arrives while
+/// `musigd` creates a wallet. The process completes the request, so its caller gets the
+/// response. It accepts no new connection, ends with the exit status 0, and does so at once,
+/// because nothing else is open. The wallet that the request created is stored.
+#[tokio::test]
+async fn musigd_shuts_down_on_sigterm_and_completes_the_running_request() -> anyhow::Result<()> {
+    let wallet_dir = tempfile::tempdir()?;
+    let (musigd, channel, port) = musigd_without_a_peer(wallet_dir.path()).await?;
+
+    // The creation of a wallet takes a moment, because the key of the database is derived from
+    // the password. The signal is sent while the request runs.
+    let mut wallet_client = WalletClient::new(channel);
+    let creation = tokio::spawn(async move {
+        let request = OpenOrCreateWalletRequest {
+            password: PASSWORD.to_owned(),
+        };
+        wallet_client.open_or_create_wallet(request).await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!creation.is_finished(), "the request runs at the signal");
+    let signal_sent = Instant::now();
+    musigd.shut_down().await?;
+    assert!(
+        signal_sent.elapsed() < SHUTDOWN_GRACE,
+        "the process does not wait for the limit of the shutdown"
+    );
+    creation.await?.expect("the running request is completed");
+
+    let endpoint = Channel::from_shared(format!("http://127.0.0.1:{port}"))?;
+    assert!(endpoint.connect().await.is_err(), "the port is closed");
+
+    // A new process on the directory finds the wallet.
+    let (_musigd, channel, _) = musigd_without_a_peer(wallet_dir.path()).await?;
+    let state = WalletClient::new(channel)
+        .is_wallet_ready(IsWalletReadyRequest {})
+        .await?
+        .into_inner();
+    assert_eq!(
+        state.exists,
+        Some(true),
+        "the wallet of the completed request is stored"
+    );
+    Ok(())
+}
+
+/// The regular shutdown with a client that keeps a subscription open: the process ends the
+/// subscription at the signal and does not wait for the client. The stream ends without an
+/// error.
+#[tokio::test]
+async fn musigd_ends_an_open_subscription_when_it_shuts_down() -> anyhow::Result<()> {
+    let wallet_dir = tempfile::tempdir()?;
+    let (musigd, channel, _) = musigd_without_a_peer(wallet_dir.path()).await?;
+    let mut events = WalletClient::new(channel)
+        .subscribe_wallet_events(SubscribeWalletEventsRequest {})
+        .await?
+        .into_inner();
+
+    let signal_sent = Instant::now();
+    musigd.shut_down().await?;
+    assert!(
+        signal_sent.elapsed() < SHUTDOWN_GRACE,
+        "the process does not wait for the subscriber"
+    );
+    // No wallet is open, so the stream had no event.
+    let end = tokio::time::timeout(WAIT, events.next()).await?;
+    assert!(end.is_none(), "{end:?}");
+    Ok(())
+}
+
+/// The regular shutdown with a client that does not complete a request: the client has started
+/// the request `IsWalletReady` and never sends its message. The process waits for the request up
+/// to the limit of 10 seconds, then ends it, and still ends with the exit status 0.
+#[tokio::test]
+async fn musigd_shuts_down_at_the_limit_while_a_request_is_open() -> anyhow::Result<()> {
+    let wallet_dir = tempfile::tempdir()?;
+    let (musigd, channel, _) = musigd_without_a_peer(wallet_dir.path()).await?;
+    // The generated client sends a request at once, so the request is made with the functions
+    // below it: the message of the request is a stream that never has an item.
+    let mut client = tonic::client::Grpc::new(channel);
+    client.ready().await?;
+    let open_request = tokio::spawn(async move {
+        let message = Request::new(stream::pending::<IsWalletReadyRequest>());
+        let path = PathAndQuery::from_static("/wallet.Wallet/IsWalletReady");
+        let codec = ProstCodec::<_, IsWalletReadyResponse>::default();
+        client.streaming(message, path, codec).await.map(drop)
+    });
+    // The time in which the request reaches the process.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!open_request.is_finished(), "the request is open");
+
+    let signal_sent = Instant::now();
+    musigd.shut_down().await?;
+    let waited = signal_sent.elapsed();
+    assert!(
+        SHUTDOWN_GRACE <= waited && waited < SHUTDOWN_GRACE * 2,
+        "the process ended {waited:?} after the signal"
+    );
+    let response = tokio::time::timeout(WAIT, open_request).await??;
+    assert!(response.is_err(), "the open request has no response");
+    Ok(())
 }
 
 // ---- A trade of two daemons on a regtest chain ----

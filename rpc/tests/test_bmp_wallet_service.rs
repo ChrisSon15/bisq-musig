@@ -28,6 +28,7 @@ use rpc::pb::bmp_wallet::{
 };
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tonic::Code;
 use tonic::transport::Channel;
 use tonic::transport::server::TcpIncoming;
@@ -60,6 +61,7 @@ impl WalletServiceFixture {
             tonic::transport::Server::builder()
                 .add_service(BmpWalletServer::new(BmpWalletImpl {
                     wallet_service: service,
+                    shutdown: CancellationToken::new(),
                 }))
                 .serve_with_incoming(TcpIncoming::from(listener)),
         );

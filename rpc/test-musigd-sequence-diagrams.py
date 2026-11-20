@@ -642,6 +642,50 @@ def test_10():
     return d
 
 
+def musigd_without_peer(d):
+    d.note("D", "The test starts musigd: new wallet directory, no peer")
+
+
+def test_11():
+    d = Diagram([("C", "bisq2 (test)"), ("D", "musigd"), ("T", "Test")])
+    musigd_without_peer(d)
+    d.call("C", "D", "Wallet.OpenOrCreateWallet(password)")
+    d.note("D", "The request runs: musigd derives the key of the<br/>wallet database from the password")
+    d.message("T", "D", "signal SIGTERM, 200 ms after the request")
+    d.note("D", "musigd accepts no new request and<br/>completes the running request")
+    d.answer("D", "C", "ok: the wallet is created")
+    d.answer("D", "T", "the process ends with the exit status 0,<br/>less than 10 s after the signal")
+    d.call("C", "D", "new connection to the port")
+    d.refused("D", "C", "no connection: the port is closed")
+    d.note("D", "The test starts musigd again<br/>on the same wallet directory")
+    d.call("C", "D", "Wallet.IsWalletReady()")
+    d.answer("D", "C", "exists = true")
+    return d
+
+
+def test_12():
+    d = Diagram([("C", "bisq2 (test)"), ("D", "musigd"), ("T", "Test")])
+    musigd_without_peer(d)
+    d.call("C", "D", "Wallet.SubscribeWalletEvents()")
+    d.note("D", "The stream is open. No wallet is open,<br/>so it has no event")
+    d.message("T", "D", "signal SIGTERM")
+    d.answer("D", "C", "the stream ends without an error")
+    d.answer("D", "T", "the process ends with the exit status 0,<br/>less than 10 s after the signal")
+    return d
+
+
+def test_13():
+    d = Diagram([("C", "bisq2 (test)"), ("D", "musigd"), ("T", "Test")])
+    musigd_without_peer(d)
+    d.call("C", "D", "Wallet.IsWalletReady: the request is started,<br/>its message is never sent")
+    d.note("D", "The request is open: musigd waits for its message")
+    d.message("T", "D", "signal SIGTERM, 500 ms after the start of the request")
+    d.note("D", "musigd waits for the open request,<br/>up to the limit of 10 s")
+    d.refused("D", "C", "the request ends without a response")
+    d.answer("D", "T", "the process ends with the exit status 0,<br/>between 10 s and 20 s after the signal")
+    return d
+
+
 TESTS = [
     (
         "musigd_serves_trade_service_and_wallet_service",
@@ -718,12 +762,32 @@ TESTS = [
         "after the start and is accepted.",
         test_10,
     ),
+    (
+        "musigd_shuts_down_on_sigterm_and_completes_the_running_request",
+        "The regular shutdown (`docs/specifications/trade/shutdown.md`). The signal SIGTERM "
+        "arrives while `musigd` creates a wallet. The process completes the request, accepts no "
+        "new connection, and ends with the exit status 0. The created wallet is stored.",
+        test_11,
+    ),
+    (
+        "musigd_ends_an_open_subscription_when_it_shuts_down",
+        "The regular shutdown with a client that keeps a subscription open. The process ends "
+        "the stream of the subscription at the signal and does not wait for the client.",
+        test_12,
+    ),
+    (
+        "musigd_shuts_down_at_the_limit_while_a_request_is_open",
+        "The regular shutdown with a client that does not complete a request. The process waits "
+        "for the request up to the limit of 10 seconds, then ends it, and still ends with the "
+        "exit status 0.",
+        test_13,
+    ),
 ]
 
 HEADER = """# Sequence diagrams of the tests in `rpc/tests/test_musigd.rs`
 
 This file shows what every test of `rpc/tests/test_musigd.rs` does, as one UML sequence diagram
-per test. The diagrams follow the test code of 2026-11-19.
+per test. The diagrams follow the test code of 2026-11-20.
 
 This file is generated. Do not edit it by hand: when a test changes, change its description in
 `rpc/test-musigd-sequence-diagrams.py` and run that script again.
@@ -818,6 +882,9 @@ SUMMARY = [
     "Custom payout, with restarts",
     "Deposit abort after the deposit timeout",
     "End of `musigd` during a request",
+    "Regular shutdown during a request",
+    "Regular shutdown with an open subscription",
+    "Regular shutdown with a request that is never completed",
 ]
 
 

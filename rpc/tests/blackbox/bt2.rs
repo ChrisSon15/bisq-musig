@@ -48,7 +48,8 @@ async fn bt2_alice_sells_bitcoin_to_bob() -> anyhow::Result<()> {
     setup.bob.wait_for_balance(bob_after_trade).await?;
 
     // UC2: both close the app. Each app sends a drain transaction, which moves the payout to the
-    // seed wallet. The network confirms the two transactions while the apps are closed.
+    // seed wallet, and then its `musigd` process ends in the regular way. The network confirms
+    // the two transactions while the apps are closed.
     let alices_drain = setup.alice.close_app().await?;
     let bobs_drain = setup.bob.close_app().await?;
     let alices_drain = alices_drain.context("the app of Alice sent no drain transaction")?;
@@ -71,12 +72,14 @@ async fn bt2_alice_sells_bitcoin_to_bob() -> anyhow::Result<()> {
 
     // Postcondition: all coins of Alice and of Bob are coins of the seed wallet. No coin is left
     // in the wallet of an imported key. The wallet service does not show in which part of a
-    // wallet a coin is, so the test stops the apps and reads the wallets themselves.
+    // wallet a coin is, so both close the app again, and the test reads the wallets themselves.
+    // This close has nothing to move.
     for (user, balance) in [
         (&mut setup.alice, alices_balance),
         (&mut setup.bob, bobs_balance),
     ] {
-        user.stop_app();
+        let drain = user.close_app().await?;
+        assert_eq!(drain, None, "the second close moves nothing");
         let Coins { seed, imported } = user.coins()?;
         assert_eq!(imported, [], "no coin of an imported key is left");
         assert_eq!(seed.into_iter().sum::<Amount>(), balance);
