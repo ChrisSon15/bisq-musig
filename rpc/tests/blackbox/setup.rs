@@ -58,6 +58,25 @@ pub struct Coins {
     pub imported: Vec<Amount>,
 }
 
+/// A copy of the wallet directory of a user: the wallet and the trades, as the app had stored
+/// them when the copy was made.
+pub struct WalletBackup(tempfile::TempDir);
+
+/// Copies the content of the directory `from` into the existing directory `to`.
+fn copy_dir(from: &Path, to: &Path) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            std::fs::create_dir(&target)?;
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
 /// One user: a Bitcoin node, and the app of the user. The app is a `musigd` process that uses
 /// this node and holds the wallet of the user.
 pub struct User {
@@ -145,6 +164,25 @@ impl User {
     /// asked to close, so no payout is moved. The wallet directory stays.
     pub fn stop_app(&mut self) {
         self.musigd = None;
+    }
+
+    /// The user makes a backup: a copy of his wallet directory. The app must be stopped, so that
+    /// the files are complete.
+    pub fn back_up_wallet(&self) -> anyhow::Result<WalletBackup> {
+        anyhow::ensure!(self.musigd.is_none(), "the app of {} runs", self.name);
+        let backup = tempfile::tempdir()?;
+        copy_dir(self.wallet_dir.path(), backup.path())?;
+        Ok(WalletBackup(backup))
+    }
+
+    /// The user replaces his wallet directory with a backup. The next start of the app finds the
+    /// wallet and the trades as they were when the backup was made. The app must be stopped.
+    pub fn restore_wallet(&mut self, backup: &WalletBackup) -> anyhow::Result<()> {
+        anyhow::ensure!(self.musigd.is_none(), "the app of {} runs", self.name);
+        let wallet_dir = self.wallet_dir.path();
+        std::fs::remove_dir_all(wallet_dir)?;
+        std::fs::create_dir(wallet_dir)?;
+        copy_dir(backup.0.path(), wallet_dir)
     }
 
     /// Opens the wallet of the user with the `wallet` crate, to look at its internal structure.

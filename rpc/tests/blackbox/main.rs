@@ -14,6 +14,7 @@ mod bt4;
 mod bt5;
 mod bt6;
 mod bt7;
+mod bt8;
 /// The code that these tests share with the tests of `test_musigd.rs`.
 #[path = "../common/mod.rs"]
 mod common;
