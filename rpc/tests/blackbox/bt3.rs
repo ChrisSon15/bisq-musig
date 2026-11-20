@@ -26,7 +26,8 @@ async fn bt3_alice_sells_bitcoin_to_bob_and_the_payouts_stay() -> anyhow::Result
     // publishes the deposit transaction, and after its confirmation they close the trade
     // cooperatively.
     let deposit_tx = trade::set_up_and_confirm_deposit(&mut setup, TRADE_ID, &TERMS).await?;
-    trade::close_cooperatively(&mut setup.alice, &mut setup.bob, TRADE_ID).await?;
+    let (seller, buyer) = (&mut setup.alice.musig, &mut setup.bob.musig);
+    trade::close_cooperatively(seller, buyer, TRADE_ID).await?;
     for user in [&mut setup.alice, &mut setup.bob] {
         let closure = trade::closure(user, TRADE_ID).await?;
         assert_eq!(closure, Some(ClosureKind::Cooperative));

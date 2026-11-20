@@ -12,75 +12,37 @@
 //! its peer-to-peer port.
 
 use std::io::Read as _;
-use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use bdk_wallet::bitcoin::{Address, Amount, FeeRate, Network, Transaction, consensus};
+use bdk_wallet::bitcoin::{Address, Amount, Transaction, consensus};
 use futures_util::StreamExt as _;
-use protocol::receiver::Receiver;
 use rpc::pb::bmp_wallet::wallet_client::WalletClient;
 use rpc::pb::bmp_wallet::{
-    CloseRequest, GetBalanceRequest, GetUnusedAddressRequest, IsWalletReadyRequest,
-    OpenOrCreateWalletRequest,
+    CloseRequest, GetBalanceRequest, IsWalletReadyRequest, OpenOrCreateWalletRequest,
 };
 use rpc::pb::musigrpc::musig_client::MusigClient;
 use rpc::pb::musigrpc::{
-    CloseTradeRequest, ClosureKind, CustomCloseTradeRequest, CustomPayoutPsbtRequest, DepositPsbt,
-    DepositTxSignatureRequest, NonceSharesMessage, NonceSharesRequest, PartialSignaturesMessage,
-    PartialSignaturesRequest, PubKeySharesRequest, PubKeySharesResponse, PublishDepositTxRequest,
-    PublishWarningTxRequest, ReceiverAddressAndAmount, Role, SubscribeTradeEventsRequest,
-    SubscribeTxConfirmationStatusRequest, SwapTxSignatureRequest, TradeEvent, TradeEventType,
-    TradeStateKind, TradeTxKind, TxConfirmationStatus,
+    ClosureKind, CustomCloseTradeRequest, CustomPayoutPsbtRequest, PublishWarningTxRequest, Role,
+    TradeEvent, TradeEventType, TradeStateKind, TradeTxKind, TxConfirmationStatus,
 };
 use testenv::TestEnv;
 use tonic::transport::Channel;
 use tonic::{Code, Streaming};
 
+use crate::common::musigd::{self, App, Launch, MusigdProcess, PASSWORD, WAIT, connect, free_port};
+use crate::common::trade::{self, DepositConfirmations, FEE_RATE, SignedDeposit, Terms};
+
+/// The code that these tests share with the blackbox tests.
+mod common;
+
+/// The longest time in which `musigd` ends when it cannot start.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Stops the `musigd` process when the test ends, also if the test fails.
-struct MusigdProcess(Child);
-
-impl Drop for MusigdProcess {
-    fn drop(&mut self) {
-        // Errors are ignored, because the process may have ended already.
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Returns a loopback port that was free a moment ago.
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("free loopback port");
-    listener
-        .local_addr()
-        .expect("listener has a local address")
-        .port()
-}
-
-/// Connects to `musigd` on the loopback address, and retries while the process starts.
-async fn connect(port: u16) -> Channel {
-    let endpoint = Channel::from_shared(format!("http://127.0.0.1:{port}")).expect("valid URI");
-    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match endpoint.connect().await {
-            Ok(channel) => return channel,
-            Err(error) => {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "musigd did not accept a connection: {error}"
-                );
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-    }
-}
 
 #[tokio::test]
 async fn musigd_serves_trade_service_and_wallet_service() {
     let wallet_dir = tempfile::tempdir().expect("temporary directory");
-    let port = free_port();
+    let port = free_port().expect("free loopback port");
     let musigd = Command::new(env!("CARGO_BIN_EXE_musigd"))
         .arg("--port")
         .arg(port.to_string())
@@ -95,14 +57,11 @@ async fn musigd_serves_trade_service_and_wallet_service() {
         .spawn()
         .expect("musigd starts");
     let _musigd = MusigdProcess(musigd);
-    let channel = connect(port).await;
+    let channel = connect(port).await.expect("musigd accepts a connection");
 
     let mut wallet_client = WalletClient::new(channel.clone());
     let mut musig_client = MusigClient::new(channel);
-    let init_trade_request = PubKeySharesRequest {
-        trade_id: "musigd-smoke-test".to_owned(),
-        my_role: Role::BuyerAsTaker.into(),
-    };
+    let init_trade_request = trade::init_request("musigd-smoke-test", Role::BuyerAsTaker);
 
     let wallet_state = wallet_client
         .is_wallet_ready(IsWalletReadyRequest {})
@@ -125,7 +84,7 @@ async fn musigd_serves_trade_service_and_wallet_service() {
 
     wallet_client
         .open_or_create_wallet(OpenOrCreateWalletRequest {
-            password: "S3cret!!".to_owned(),
+            password: PASSWORD.to_owned(),
         })
         .await
         .expect("the wallet is created");
@@ -157,7 +116,7 @@ fn musigd_does_not_start_with_a_lock_time_outside_the_limits() {
     ] {
         let musigd = Command::new(env!("CARGO_BIN_EXE_musigd"))
             .arg("--port")
-            .arg(free_port().to_string())
+            .arg(free_port().expect("free loopback port").to_string())
             .env(variable, value)
             .env("RUST_LOG", "off")
             .stdout(Stdio::null())
@@ -195,17 +154,21 @@ fn musigd_does_not_start_with_a_lock_time_outside_the_limits() {
 
 // ---- A trade of two daemons on a regtest chain ----
 
-const PASSWORD: &str = "S3cret!!";
 const FUNDING: u64 = 100_000_000;
 const TRADE_AMOUNT: u64 = 5_000_000;
 const BUYERS_SECURITY_DEPOSIT: u64 = 1_000_000;
 const SELLERS_SECURITY_DEPOSIT: u64 = 1_200_000;
-/// 10 sat per vbyte.
-const FEE_RATE: u64 = 2_500;
-const WAIT: Duration = Duration::from_secs(90);
+/// The terms of every trade of these tests.
+const TERMS: Terms = Terms {
+    trade_amount: Amount::from_sat(TRADE_AMOUNT),
+    buyers_security_deposit: Amount::from_sat(BUYERS_SECURITY_DEPOSIT),
+    sellers_security_deposit: Amount::from_sat(SELLERS_SECURITY_DEPOSIT),
+};
 
 /// One trader: a `musigd` process with its wallet directory, and clients of its two services.
 struct Daemon {
+    /// "buyer" or "seller". The log files of the processes of the trader are named after it.
+    name: &'static str,
     /// `None` while the daemon is stopped.
     process: Option<MusigdProcess>,
     wallet_dir: tempfile::TempDir,
@@ -217,70 +180,52 @@ struct Daemon {
 
 impl Daemon {
     /// Starts `musigd` with a new wallet. Its only connection to the chain is the peer-to-peer
-    /// port of the node: no option for the RPC interface of a node exists.
-    /// `deposit_timeout` is given to every process of this trader, if it is set.
-    async fn start_with_deposit_timeout(env: &TestEnv, deposit_timeout: Option<u16>) -> Self {
+    /// port of the node. `deposit_timeout` is given to every process of this trader, if it is
+    /// set.
+    async fn start_with_deposit_timeout(
+        name: &'static str,
+        env: &TestEnv,
+        deposit_timeout: Option<u16>,
+    ) -> Self {
         let wallet_dir = tempfile::tempdir().expect("temporary directory");
-        let (process, wallet, musig) = Self::launch(env, wallet_dir.path(), deposit_timeout).await;
+        let app = Self::launch(name, env, wallet_dir.path(), deposit_timeout, true).await;
         Self {
-            process: Some(process),
+            name,
+            process: Some(app.process),
             wallet_dir,
-            wallet,
-            musig,
+            wallet: app.wallet,
+            musig: app.musig,
             deposit_timeout,
         }
     }
 
     /// Starts a `musigd` process on a wallet directory and opens the wallet, which creates it if
-    /// the directory is empty.
+    /// the directory is empty. The lock times of the process are shorter than the defaults, so
+    /// that a test mines fewer blocks. `first` tells whether this is the first process of the
+    /// trader in the test.
     async fn launch(
+        name: &str,
         env: &TestEnv,
         wallet_dir: &std::path::Path,
         deposit_timeout: Option<u16>,
-    ) -> (MusigdProcess, WalletClient<Channel>, MusigClient<Channel>) {
-        let port = free_port();
-        let peer = env.p2p_socket_addr().expect("peer address");
-        // For the search for an error: with the directory `MUSIGD_TEST_LOG_DIR` in the
-        // environment, every daemon writes its log to a file there, named after its port.
-        let log_dir = std::env::var_os("MUSIGD_TEST_LOG_DIR");
-        let log_level = if log_dir.is_some() { "debug" } else { "off" };
-        let log_file = |port: u16, stream: &str| match &log_dir {
-            Some(dir) => {
-                let path = std::path::Path::new(dir).join(format!("musigd-{port}.{stream}"));
-                Stdio::from(std::fs::File::create(path).expect("log file"))
-            }
-            None => Stdio::null(),
-        };
-        let mut command = Command::new(env!("CARGO_BIN_EXE_musigd"));
+        first: bool,
+    ) -> App {
+        let mut config = vec![
+            ("BISQ_MUSIG_WARNING_LOCK_TIME", "20".to_owned()),
+            ("BISQ_MUSIG_CLAIM_LOCK_TIME", "10".to_owned()),
+        ];
         if let Some(deposit_timeout) = deposit_timeout {
-            command.env("BISQ_MUSIG_DEPOSIT_TIMEOUT", deposit_timeout.to_string());
+            config.push(("BISQ_MUSIG_DEPOSIT_TIMEOUT", deposit_timeout.to_string()));
         }
-        let process = command
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--wallet-dir")
-            .arg(wallet_dir)
-            .arg("--wallet-peer")
-            .arg(peer.to_string())
-            .arg("--wallet-poll-secs")
-            .arg("1")
-            .env("BISQ_MUSIG_WARNING_LOCK_TIME", "20")
-            .env("BISQ_MUSIG_CLAIM_LOCK_TIME", "10")
-            .env("RUST_LOG", log_level)
-            .stdout(log_file(port, "out"))
-            .stderr(log_file(port, "err"))
-            .spawn()
-            .expect("musigd starts");
-        let process = MusigdProcess(process);
-        let channel = connect(port).await;
-        let mut wallet = WalletClient::new(channel.clone());
-        wallet
-            .open_or_create_wallet(OpenOrCreateWalletRequest {
-                password: PASSWORD.to_owned(),
-            })
-            .await
-            .expect("the wallet is opened");
-        (process, wallet, MusigClient::new(channel))
+        App::start(&Launch {
+            trader: name,
+            wallet_dir,
+            peer: env.p2p_socket_addr().expect("peer address"),
+            config: &config,
+            first,
+        })
+        .await
+        .expect("musigd starts and opens the wallet")
     }
 
     /// Ends the `musigd` process at once, as a crash or a loss of power does: the process gets
@@ -293,28 +238,23 @@ impl Daemon {
     /// wallet, as bisq2 does at its start.
     async fn restart(&mut self, env: &TestEnv) {
         self.stop();
-        let (process, wallet, musig) =
-            Self::launch(env, self.wallet_dir.path(), self.deposit_timeout).await;
-        self.process = Some(process);
-        self.wallet = wallet;
-        self.musig = musig;
+        let app = Self::launch(
+            self.name,
+            env,
+            self.wallet_dir.path(),
+            self.deposit_timeout,
+            false,
+        )
+        .await;
+        self.process = Some(app.process);
+        self.wallet = app.wallet;
+        self.musig = app.musig;
     }
 
     async fn new_address(&mut self) -> Address {
-        let address = self
-            .wallet
-            .get_unused_address(GetUnusedAddressRequest {})
+        musigd::new_address(&mut self.wallet)
             .await
-            .expect("an address")
-            .into_inner()
-            .address
-            .expect("address is set")
-            .address;
-        address
-            .parse::<Address<_>>()
-            .expect("valid address")
-            .require_network(Network::Regtest)
-            .expect("regtest address")
+            .expect("an address of the wallet")
     }
 
     async fn balance(&mut self) -> u64 {
@@ -352,149 +292,21 @@ async fn next_status(events: &mut Streaming<TxConfirmationStatus>) -> Option<TxC
 }
 
 /// Runs the setup of a trade in which the buyer is the taker: messages A to D. Both traders
-/// sign the deposit transaction. Returns the deposit PSBT with the signatures of the seller.
+/// sign the deposit transaction. One receiver, an address of the node, gets everything that a
+/// redirect transaction can distribute.
 async fn set_up_trade(
     buyer: &mut Daemon,
     seller: &mut Daemon,
     env: &TestEnv,
     trade_id: &str,
-) -> anyhow::Result<DepositPsbt> {
-    let init = |my_role: Role| PubKeySharesRequest {
-        trade_id: trade_id.to_owned(),
-        my_role: my_role.into(),
-    };
-    let buyers_keys = buyer
-        .musig
-        .init_trade(init(Role::BuyerAsTaker))
-        .await?
-        .into_inner();
-    let sellers_keys = seller
-        .musig
-        .init_trade(init(Role::SellerAsMaker))
-        .await?
-        .into_inner();
-    let nonce_request = |peers_keys: &PubKeySharesResponse| NonceSharesRequest {
-        trade_id: trade_id.to_owned(),
-        buyer_output_peers_pub_key_share: peers_keys.buyer_output_pub_key_share.clone(),
-        seller_output_peers_pub_key_share: peers_keys.seller_output_pub_key_share.clone(),
-        peers_multisig_script_key: peers_keys.multisig_script_key.clone(),
-        deposit_tx_fee_rate: FEE_RATE,
-        prepared_tx_fee_rate: FEE_RATE,
-        trade_amount: TRADE_AMOUNT,
-        buyers_security_deposit: BUYERS_SECURITY_DEPOSIT,
-        sellers_security_deposit: SELLERS_SECURITY_DEPOSIT,
-        trade_fee_receiver: None,
-    };
-    let sellers_nonces = seller
-        .musig
-        .get_nonce_shares(nonce_request(&buyers_keys))
-        .await?
-        .into_inner();
-    let buyers_nonces = buyer
-        .musig
-        .get_nonce_shares(nonce_request(&sellers_keys))
-        .await?
-        .into_inner();
-    // The coins of both deposits are reserved now.
+) -> anyhow::Result<SignedDeposit> {
+    let redirect_receiver = env.new_address()?;
+    let (sellers, buyers) = (&mut seller.musig, &mut buyer.musig);
+    let deposit = trade::set_up(sellers, buyers, trade_id, &TERMS, redirect_receiver).await?;
+    // The coins of both deposits are reserved.
     assert_eq!(buyer.balance().await, 0);
     assert_eq!(seller.balance().await, 0);
-
-    // One receiver gets everything that a redirect transaction can distribute.
-    assert_eq!(
-        buyers_nonces.redirection_amount_msat,
-        sellers_nonces.redirection_amount_msat
-    );
-    let receivers = Receiver::compute_receivers_from_shares(
-        vec![(env.new_address()?, 1.0)],
-        buyers_nonces.redirection_amount_msat,
-        FeeRate::from_sat_per_kwu(FEE_RATE),
-    )
-    .expect("one receiver");
-    let redirection_receivers = vec![ReceiverAddressAndAmount {
-        address: receivers[0].address.to_string(),
-        amount: receivers[0].amount.to_sat(),
-    }];
-    let signatures_request = |peers_nonces: &NonceSharesMessage| PartialSignaturesRequest {
-        trade_id: trade_id.to_owned(),
-        peers_nonce_shares: Some(peers_nonces.clone()),
-        redirection_receivers: redirection_receivers.clone(),
-        buyer_ready_to_release: false,
-    };
-    let buyers_signatures = buyer
-        .musig
-        .get_partial_signatures(signatures_request(&sellers_nonces))
-        .await?
-        .into_inner();
-    let sellers_signatures = seller
-        .musig
-        .get_partial_signatures(signatures_request(&buyers_nonces))
-        .await?
-        .into_inner();
-    let deposit_request = |peers_signatures: &PartialSignaturesMessage| DepositTxSignatureRequest {
-        trade_id: trade_id.to_owned(),
-        peers_partial_signatures: Some(peers_signatures.clone()),
-    };
-    let sellers_deposit_psbt = seller
-        .musig
-        .sign_deposit_tx(deposit_request(&buyers_signatures))
-        .await?
-        .into_inner();
-    buyer
-        .musig
-        .sign_deposit_tx(deposit_request(&sellers_signatures))
-        .await?;
-
-    Ok(sellers_deposit_psbt)
-}
-
-/// Closes the trade cooperatively: messages E, F and G.
-async fn close_cooperatively(
-    buyer: &mut Daemon,
-    seller: &mut Daemon,
-    trade_id: &str,
-) -> anyhow::Result<()> {
-    let message_e = buyer
-        .musig
-        .get_partial_signatures(PartialSignaturesRequest {
-            trade_id: trade_id.to_owned(),
-            buyer_ready_to_release: true,
-            ..PartialSignaturesRequest::default()
-        })
-        .await?
-        .into_inner();
-    let swap_request = |signature: Vec<u8>, seller_ready_to_release| SwapTxSignatureRequest {
-        trade_id: trade_id.to_owned(),
-        swap_tx_input_peers_partial_signature: signature,
-        seller_ready_to_release,
-    };
-    let buyers_swap_signature = message_e
-        .swap_tx_input_partial_signature
-        .expect("message E contains the signature");
-    seller
-        .musig
-        .sign_swap_tx(swap_request(buyers_swap_signature, false))
-        .await?;
-    let message_f = seller
-        .musig
-        .sign_swap_tx(swap_request(Vec::new(), true))
-        .await?
-        .into_inner();
-    let close_request = |key_share: Option<Vec<u8>>| CloseTradeRequest {
-        trade_id: trade_id.to_owned(),
-        my_output_peers_prv_key_share: key_share,
-        ..CloseTradeRequest::default()
-    };
-    let message_g = buyer
-        .musig
-        .close_trade(close_request(message_f.peer_output_prv_key_share))
-        .await?
-        .into_inner();
-    seller
-        .musig
-        .close_trade(close_request(message_g.peer_output_prv_key_share))
-        .await?;
-
-    Ok(())
+    Ok(deposit)
 }
 
 /// Starts the daemons of the buyer and of the seller and funds both wallets.
@@ -507,8 +319,8 @@ async fn funded_daemons_with_deposit_timeout(
     env: &mut TestEnv,
     deposit_timeout: Option<u16>,
 ) -> anyhow::Result<(Daemon, Daemon)> {
-    let mut buyer = Daemon::start_with_deposit_timeout(env, deposit_timeout).await;
-    let mut seller = Daemon::start_with_deposit_timeout(env, deposit_timeout).await;
+    let mut buyer = Daemon::start_with_deposit_timeout("buyer", env, deposit_timeout).await;
+    let mut seller = Daemon::start_with_deposit_timeout("seller", env, deposit_timeout).await;
     for daemon in [&mut buyer, &mut seller] {
         let address = daemon.new_address().await;
         env.fund_address(&address, Amount::from_sat(FUNDING))?;
@@ -535,24 +347,14 @@ async fn j11_trade_of_two_daemons_without_bitcoin_core_rpc() -> anyhow::Result<(
     let (mut buyer, mut seller) = funded_daemons(&mut env).await?;
 
     let trade_id = "trade-1".to_owned();
-    let sellers_deposit_psbt = set_up_trade(&mut buyer, &mut seller, &env, &trade_id).await?;
+    let deposit = set_up_trade(&mut buyer, &mut seller, &env, &trade_id).await?;
+    let deposit_txid = deposit.txid;
 
     // The maker observes the deposit, and the taker publishes it over the peer-to-peer network.
-    let mut sellers_events = seller
-        .musig
-        .subscribe_tx_confirmation_status(SubscribeTxConfirmationStatusRequest {
-            trade_id: trade_id.clone(),
-        })
-        .await?
-        .into_inner();
-    let mut buyers_events = buyer
-        .musig
-        .publish_deposit_tx(PublishDepositTxRequest {
-            trade_id: trade_id.clone(),
-            peers_deposit_psbt: Some(sellers_deposit_psbt),
-        })
-        .await?
-        .into_inner();
+    let DepositConfirmations {
+        sellers: mut sellers_events,
+        buyers: mut buyers_events,
+    } = trade::publish_deposit(&mut seller.musig, &mut buyer.musig, &trade_id, deposit).await?;
 
     // The engine does not learn whether the node accepted the transaction, so the test mines
     // blocks until the first confirmation is reported. Then two more blocks follow.
@@ -568,6 +370,7 @@ async fn j11_trade_of_two_daemons_without_bitcoin_core_rpc() -> anyhow::Result<(
     let first = first.expect("the deposit transaction was confirmed");
     assert_eq!(first.num_confirmations, 1);
     let deposit_tx: Transaction = consensus::deserialize(&first.tx)?;
+    assert_eq!(deposit_tx.compute_txid(), deposit_txid);
     let deposit_height = first.current_block_height;
     assert_eq!(u64::from(deposit_height), env.block_count()?);
     env.mine_blocks(2)?;
@@ -597,7 +400,7 @@ async fn j11_trade_of_two_daemons_without_bitcoin_core_rpc() -> anyhow::Result<(
         "{reported:?}"
     );
 
-    close_cooperatively(&mut buyer, &mut seller, &trade_id).await?;
+    trade::close_cooperatively(&mut seller.musig, &mut buyer.musig, &trade_id).await?;
 
     // Each wallet shows the payout of its trader: the buyer gained the trade amount, the seller
     // paid it, apart from the fee of the deposit transaction.
@@ -673,31 +476,8 @@ async fn confirm_deposit_and_release(
     trade_id: &str,
 ) -> anyhow::Result<()> {
     set_up_and_confirm_deposit(env, buyer, seller, trade_id).await?;
-    let message_e = buyer
-        .musig
-        .get_partial_signatures(PartialSignaturesRequest {
-            trade_id: trade_id.to_owned(),
-            buyer_ready_to_release: true,
-            ..PartialSignaturesRequest::default()
-        })
-        .await?
-        .into_inner();
-    let swap_request = |signature: Vec<u8>, seller_ready_to_release| SwapTxSignatureRequest {
-        trade_id: trade_id.to_owned(),
-        swap_tx_input_peers_partial_signature: signature,
-        seller_ready_to_release,
-    };
-    let buyers_swap_signature = message_e
-        .swap_tx_input_partial_signature
-        .expect("message E contains the signature");
-    seller
-        .musig
-        .sign_swap_tx(swap_request(buyers_swap_signature, false))
-        .await?;
-    seller
-        .musig
-        .sign_swap_tx(swap_request(Vec::new(), true))
-        .await?;
+    trade::start_payment(&mut seller.musig, &mut buyer.musig, trade_id).await?;
+    trade::release(&mut seller.musig, trade_id).await?;
     Ok(())
 }
 
@@ -709,15 +489,11 @@ async fn set_up_and_confirm_deposit(
     seller: &mut Daemon,
     trade_id: &str,
 ) -> anyhow::Result<()> {
-    let sellers_deposit_psbt = set_up_trade(buyer, seller, env, trade_id).await?;
-    let mut deposit_events = buyer
-        .musig
-        .publish_deposit_tx(PublishDepositTxRequest {
-            trade_id: trade_id.to_owned(),
-            peers_deposit_psbt: Some(sellers_deposit_psbt),
-        })
+    let deposit = set_up_trade(buyer, seller, env, trade_id).await?;
+    let (sellers, buyers) = (&mut seller.musig, &mut buyer.musig);
+    let mut deposit_events = trade::publish_deposit(sellers, buyers, trade_id, deposit)
         .await?
-        .into_inner();
+        .buyers;
     // Blocks are mined until the stream of the deposit ends, at 3 confirmations.
     let mut confirmed = false;
     for _ in 0..30 {
@@ -774,7 +550,7 @@ async fn wait_for_state(
             env.mine_block()?;
         }
         for _ in 0..4 {
-            let state = trade_state(daemon, trade_id).await?;
+            let state = trade::trade_state(&mut daemon.musig, trade_id).await?;
             if expected(&state) {
                 return Ok(state);
             }
@@ -783,39 +559,18 @@ async fn wait_for_state(
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
             "{what}: the trade stays in {:?} {:?}",
-            trade_state(daemon, trade_id).await?.state(),
-            trade_state(daemon, trade_id).await?.closure_type
+            trade::trade_state(&mut daemon.musig, trade_id)
+                .await?
+                .state(),
+            trade::trade_state(&mut daemon.musig, trade_id)
+                .await?
+                .closure_type
         );
     }
 }
 
 fn is_closed_as(closure: ClosureKind) -> impl Fn(&TradeEvent) -> bool {
     move |event| event.state() == TradeStateKind::TradeClosed && event.closure_type() == closure
-}
-
-/// The event stream of a trade.
-async fn trade_events(
-    daemon: &mut Daemon,
-    trade_id: &str,
-) -> anyhow::Result<Streaming<TradeEvent>> {
-    let request = SubscribeTradeEventsRequest {
-        trade_id: trade_id.to_owned(),
-    };
-    Ok(daemon
-        .musig
-        .subscribe_trade_events(request)
-        .await?
-        .into_inner())
-}
-
-/// The first event of a new event stream of a trade: its current state.
-async fn trade_state(daemon: &mut Daemon, trade_id: &str) -> anyhow::Result<TradeEvent> {
-    let mut events = trade_events(daemon, trade_id).await?;
-    let first = tokio::time::timeout(WAIT, events.next())
-        .await?
-        .expect("the stream starts with the state")?;
-    assert_eq!(first.r#type(), TradeEventType::State);
-    Ok(first)
 }
 
 /// C1, C2, C4 (D7) through the real daemon: the seller releases, and the buyer does not answer.
@@ -831,8 +586,8 @@ async fn c4_forced_close_of_two_daemons() -> anyhow::Result<()> {
     let trade_id = "trade-1".to_owned();
     confirm_deposit_and_release(&mut env, &mut buyer, &mut seller, &trade_id).await?;
 
-    let mut buyers_events = trade_events(&mut buyer, &trade_id).await?;
-    let mut sellers_events = trade_events(&mut seller, &trade_id).await?;
+    let mut buyers_events = trade::trade_events(&mut buyer.musig, &trade_id).await?;
+    let mut sellers_events = trade::trade_events(&mut seller.musig, &trade_id).await?;
 
     // The warning lock time is 20 blocks and the release safety margin 6 blocks. At 14
     // confirmations of the deposit the seller's daemon sends the swap transaction.
@@ -883,19 +638,15 @@ async fn h2_h5_restart_of_two_daemons_during_a_forced_close() -> anyhow::Result<
 
     buyer.restart(&env).await;
     seller.restart(&env).await;
-    let buyers_state = trade_state(&mut buyer, &trade_id).await?;
+    let buyers_state = trade::trade_state(&mut buyer.musig, &trade_id).await?;
     assert_eq!(buyers_state.state(), TradeStateKind::BuyerReadyToRelease);
-    let sellers_state = trade_state(&mut seller, &trade_id).await?;
+    let sellers_state = trade::trade_state(&mut seller.musig, &trade_id).await?;
     assert_eq!(sellers_state.state(), TradeStateKind::SellerReadyToRelease);
     // H3: the seller's caller repeats the release after the restart and gets the key share
     // again.
     let repeated = until_accepted("release", || {
         let mut musig = seller.musig.clone();
-        let request = SwapTxSignatureRequest {
-            trade_id: trade_id.clone(),
-            swap_tx_input_peers_partial_signature: Vec::new(),
-            seller_ready_to_release: true,
-        };
+        let request = trade::swap_request(&trade_id, Vec::new(), true);
         async move { musig.sign_swap_tx(request).await }
     })
     .await;
@@ -903,17 +654,14 @@ async fn h2_h5_restart_of_two_daemons_during_a_forced_close() -> anyhow::Result<
     // K2: the ID of the trade is known after the restart.
     let duplicate = buyer
         .musig
-        .init_trade(PubKeySharesRequest {
-            trade_id: trade_id.clone(),
-            my_role: Role::BuyerAsTaker.into(),
-        })
+        .init_trade(trade::init_request(&trade_id, Role::BuyerAsTaker))
         .await
         .expect_err("the trade ID is used");
     assert_eq!(duplicate.code(), Code::AlreadyExists);
 
     // The buyer's daemon does not run while the seller's daemon closes by force.
     buyer.stop();
-    let mut sellers_events = trade_events(&mut seller, &trade_id).await?;
+    let mut sellers_events = trade::trade_events(&mut seller.musig, &trade_id).await?;
     mine_until_event(&mut env, &mut sellers_events, "swap sent", |event| {
         event.r#type() == TradeEventType::TxSent && event.tx_kind() == TradeTxKind::SwapTx
     })
@@ -922,7 +670,7 @@ async fn h2_h5_restart_of_two_daemons_during_a_forced_close() -> anyhow::Result<
     env.mine_blocks(4)?;
 
     buyer.restart(&env).await;
-    let mut buyers_events = trade_events(&mut buyer, &trade_id).await?;
+    let mut buyers_events = trade::trade_events(&mut buyer.musig, &trade_id).await?;
     let deadline = tokio::time::Instant::now() + WAIT;
     let closed = loop {
         let event = tokio::time::timeout_at(deadline, buyers_events.next())
@@ -998,20 +746,20 @@ async fn h2_h5_restart_of_two_daemons_in_the_dispute_path() -> anyhow::Result<()
     buyer.restart(&env).await;
     seller.restart(&env).await;
     for daemon in [&mut buyer, &mut seller] {
-        let state = trade_state(daemon, &trade_id).await?;
+        let state = trade::trade_state(&mut daemon.musig, &trade_id).await?;
         assert_eq!(state.state(), TradeStateKind::Deposit);
     }
     mine_until_the_warning_is_valid(&mut env)?;
 
     let warning_tx = publish_warning(&buyer, &trade_id).await;
     buyer.restart(&env).await;
-    let state = trade_state(&mut buyer, &trade_id).await?;
+    let state = trade::trade_state(&mut buyer.musig, &trade_id).await?;
     assert_eq!(state.state(), TradeStateKind::BuyersWarning);
     assert_eq!(publish_warning(&buyer, &trade_id).await, warning_tx);
 
     // The seller's daemon does not run while the warning transaction is confirmed.
     seller.stop();
-    let mut buyers_events = trade_events(&mut buyer, &trade_id).await?;
+    let mut buyers_events = trade::trade_events(&mut buyer.musig, &trade_id).await?;
     let confirmed = mine_until_event(&mut env, &mut buyers_events, "warning confirmed", |event| {
         event.r#type() == TradeEventType::TxConfirmed && event.tx_kind() == TradeTxKind::WarningTx
     })
@@ -1090,7 +838,7 @@ async fn h2_h5_m6_restart_of_two_daemons_before_a_claim() -> anyhow::Result<()> 
     seller.stop();
 
     publish_warning(&buyer, &trade_id).await;
-    let mut buyers_events = trade_events(&mut buyer, &trade_id).await?;
+    let mut buyers_events = trade::trade_events(&mut buyer.musig, &trade_id).await?;
     let confirmed = mine_until_event(&mut env, &mut buyers_events, "warning confirmed", |event| {
         event.r#type() == TradeEventType::TxConfirmed && event.tx_kind() == TradeTxKind::WarningTx
     })
@@ -1154,7 +902,7 @@ async fn h2_h5_restart_of_two_daemons_during_a_custom_payout() -> anyhow::Result
         let request = CustomPayoutPsbtRequest {
             trade_id: trade_id.clone(),
             sellers_payout_amount_excluding_fee: SELLERS_AMOUNT,
-            fee_rate: FEE_RATE,
+            fee_rate: FEE_RATE.to_sat_per_kwu(),
         };
         until_accepted("SignCustomPayoutTx", move || {
             let (mut musig, request) = (musig.clone(), request.clone());
@@ -1168,7 +916,7 @@ async fn h2_h5_restart_of_two_daemons_during_a_custom_payout() -> anyhow::Result
     buyer.restart(&env).await;
     seller.restart(&env).await;
     for daemon in [&mut buyer, &mut seller] {
-        let state = trade_state(daemon, &trade_id).await?;
+        let state = trade::trade_state(&mut daemon.musig, &trade_id).await?;
         assert_eq!(state.state(), TradeStateKind::CustomPayoutSigned);
     }
     assert_eq!(sign(&buyer).await, buyers_psbt);
@@ -1229,7 +977,7 @@ async fn a3_h2_deposit_abort_of_two_daemons_after_a_restart() -> anyhow::Result<
         funded_daemons_with_deposit_timeout(&mut env, Some(DEPOSIT_TIMEOUT)).await?;
     let trade_id = "trade-1".to_owned();
     set_up_trade(&mut buyer, &mut seller, &env, &trade_id).await?;
-    let signed = trade_state(&mut seller, &trade_id).await?;
+    let signed = trade::trade_state(&mut seller.musig, &trade_id).await?;
     assert_eq!(signed.state(), TradeStateKind::Deposit);
     assert_eq!(signed.deadlines.len(), 1, "the deposit timeout");
     let timeout_height = signed.deadlines[0].block_height;
@@ -1242,7 +990,7 @@ async fn a3_h2_deposit_abort_of_two_daemons_after_a_restart() -> anyhow::Result<
     seller.stop();
     env.mine_blocks(usize::from(DEPOSIT_TIMEOUT) + 1)?;
     seller.restart(&env).await;
-    let state = trade_state(&mut seller, &trade_id).await?;
+    let state = trade::trade_state(&mut seller.musig, &trade_id).await?;
     assert_eq!(state.deadlines[0].block_height, timeout_height);
 
     let aborted = is_closed_as(ClosureKind::DepositAborted);
@@ -1298,35 +1046,21 @@ async fn interrupt_a_setup(
     delay: Duration,
 ) -> anyhow::Result<()> {
     let interrupted = "trade-0".to_owned();
-    let init = |my_role: Role| PubKeySharesRequest {
-        trade_id: interrupted.clone(),
-        my_role: my_role.into(),
-    };
+    let init = |my_role: Role| trade::init_request(&interrupted, my_role);
     buyer.musig.init_trade(init(Role::BuyerAsTaker)).await?;
     let sellers_keys = seller
         .musig
         .init_trade(init(Role::SellerAsMaker))
         .await?
         .into_inner();
-    let nonce_request = NonceSharesRequest {
-        trade_id: interrupted.clone(),
-        buyer_output_peers_pub_key_share: sellers_keys.buyer_output_pub_key_share,
-        seller_output_peers_pub_key_share: sellers_keys.seller_output_pub_key_share,
-        peers_multisig_script_key: sellers_keys.multisig_script_key,
-        deposit_tx_fee_rate: FEE_RATE,
-        prepared_tx_fee_rate: FEE_RATE,
-        trade_amount: TRADE_AMOUNT,
-        buyers_security_deposit: BUYERS_SECURITY_DEPOSIT,
-        sellers_security_deposit: SELLERS_SECURITY_DEPOSIT,
-        trade_fee_receiver: None,
-    };
+    let nonce_request = trade::nonce_request(&interrupted, &TERMS, sellers_keys);
     let mut musig = buyer.musig.clone();
     kill_during(buyer, delay, async move {
         musig.get_nonce_shares(nonce_request).await
     })
     .await;
     buyer.restart(env).await;
-    let state = trade_state(buyer, &interrupted).await?;
+    let state = trade::trade_state(&mut buyer.musig, &interrupted).await?;
     assert_eq!(state.state(), TradeStateKind::TradeClosed);
     assert_eq!(state.closure_type(), ClosureKind::Abandoned);
     buyer
@@ -1366,11 +1100,7 @@ async fn h3_h4_h8_daemon_is_ended_while_it_processes_a_request() -> anyhow::Resu
     set_up_and_confirm_deposit(&mut env, &mut buyer, &mut seller, &trade_id).await?;
 
     // Message E: the buyer starts the payment.
-    let start_payment = PartialSignaturesRequest {
-        trade_id: trade_id.clone(),
-        buyer_ready_to_release: true,
-        ..PartialSignaturesRequest::default()
-    };
+    let start_payment = trade::start_payment_request(&trade_id);
     let (mut musig, request) = (buyer.musig.clone(), start_payment.clone());
     let first = kill_during(&mut buyer, delays[1], async move {
         musig.get_partial_signatures(request).await
@@ -1390,15 +1120,13 @@ async fn h3_h4_h8_daemon_is_ended_while_it_processes_a_request() -> anyhow::Resu
         .expect("message E contains the signature");
 
     // The seller takes message E, and releases: message F.
-    let swap_request = |signature: Vec<u8>, seller_ready_to_release| SwapTxSignatureRequest {
-        trade_id: trade_id.clone(),
-        swap_tx_input_peers_partial_signature: signature,
-        seller_ready_to_release,
-    };
     let mut message_f = None;
     for (delay, request) in [
-        (delays[2], swap_request(buyers_swap_signature, false)),
-        (delays[3], swap_request(Vec::new(), true)),
+        (
+            delays[2],
+            trade::swap_request(&trade_id, buyers_swap_signature, false),
+        ),
+        (delays[3], trade::swap_request(&trade_id, Vec::new(), true)),
     ] {
         let (mut musig, first_request) = (seller.musig.clone(), request.clone());
         let first = kill_during(&mut seller, delay, async move {
@@ -1419,15 +1147,10 @@ async fn h3_h4_h8_daemon_is_ended_while_it_processes_a_request() -> anyhow::Resu
     assert!(message_f.is_some(), "message F contains the key share");
 
     // The buyer closes with message F and returns message G. The seller closes with message G.
-    let close_request = |key_share: Option<Vec<u8>>| CloseTradeRequest {
-        trade_id: trade_id.clone(),
-        my_output_peers_prv_key_share: key_share,
-        ..CloseTradeRequest::default()
-    };
     let mut key_share = message_f;
     for (delay, is_buyer) in [(delays[4], true), (delays[5], false)] {
         let daemon = if is_buyer { &mut buyer } else { &mut seller };
-        let request = close_request(key_share.clone());
+        let request = trade::close_request(&trade_id, key_share.clone());
         let (mut musig, first_request) = (daemon.musig.clone(), request.clone());
         let first = kill_during(daemon, delay, async move {
             musig.close_trade(first_request).await
@@ -1449,7 +1172,7 @@ async fn h3_h4_h8_daemon_is_ended_while_it_processes_a_request() -> anyhow::Resu
     }
 
     for daemon in [&mut buyer, &mut seller] {
-        let state = trade_state(daemon, &trade_id).await?;
+        let state = trade::trade_state(&mut daemon.musig, &trade_id).await?;
         assert_eq!(state.state(), TradeStateKind::TradeClosed);
         assert_eq!(state.closure_type(), ClosureKind::Cooperative);
     }

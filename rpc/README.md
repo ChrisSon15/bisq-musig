@@ -162,12 +162,16 @@ The host and port can be overridden with `-Dwallet.host=...` / `-Dwallet.port=..
 ### Integration tests using testenv crate
 
 The Rust tests in `rpc/tests/test_musigd.rs` start real `musigd` processes. With the directory `MUSIGD_TEST_LOG_DIR` in
-the environment, every process writes its log at debug level to a file in that directory.
+the environment, every process writes its log at debug level to a file in that directory. The files are named after
+the trader (`buyer` or `seller`), and a process that a test starts again adds to the files of its trader.
 
 The blackbox tests in `rpc/tests/blackbox/` play use cases of two users, Alice and Bob. Each user has an own Bitcoin
 node and an own `musigd` process, and the two nodes are peers of each other. The plan of these tests is
 `rpc/tests/blackbox/BlackPlan.md`. Run them with `cargo test -p rpc --test blackbox`. They write the logs of the
 `musigd` processes to `MUSIGD_TEST_LOG_DIR` in the same way, in files named after the user.
+
+Both test binaries share the code in `rpc/tests/common/`: the start of a `musigd` process with its clients, and the
+steps of a trade.
 
 The Java integration tests (`mvn verify`) are:
 
