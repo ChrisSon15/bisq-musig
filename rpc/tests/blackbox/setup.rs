@@ -14,12 +14,12 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use bdk_wallet::bitcoin::{
-    Address, Amount, Block, BlockHash, Network, Transaction, TxIn, TxOut, Txid,
+    Address, Amount, Block, BlockHash, Network, SignedAmount, Transaction, TxIn, TxOut, Txid,
 };
 use rpc::pb::bmp_wallet::wallet_client::WalletClient;
 use rpc::pb::bmp_wallet::{
     self, CloseRequest, GetBalanceRequest, GetBalanceResponse, GetUnusedAddressRequest,
-    GetWalletAddressesRequest, IsWalletReadyRequest, ListTransactionsRequest, ListUtxosRequest,
+    GetWalletAddressesRequest, IsWalletReadyRequest, ListTransactionsRequest,
     OpenOrCreateWalletRequest, PubAddressInfo, SendToAddressRequest,
 };
 use rpc::pb::musigrpc::musig_client::MusigClient;
@@ -102,12 +102,13 @@ fn settled_balance(amount: Amount) -> GetBalanceResponse {
     }
 }
 
-/// The coins of a wallet, by the kind of key that owns them.
+/// The unspent coins of a wallet, by the part of the wallet that holds them.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Coins {
-    /// The amounts of the coins at addresses of the seed of the wallet.
+    /// The amounts of the coins of the seed wallet, which is the main wallet of the user.
     pub seed: Vec<Amount>,
-    /// The amounts of the coins of imported keys. They are the payouts of closed trades.
+    /// The amounts of the coins in the wallets of imported keys. They are the payouts of closed
+    /// trades.
     pub imported: Vec<Amount>,
 }
 
@@ -227,18 +228,38 @@ impl User {
         self.musigd = None;
     }
 
-    /// The keys that the wallet of the user has imported: the keys of the payouts of closed
-    /// trades. No request of the wallet service hands out a key, so the keys are read from the
-    /// wallet directory with the `wallet` crate. The app must be stopped for that, so that only
-    /// one process has the database of the wallet open.
-    pub fn imported_keys(&self) -> anyhow::Result<Vec<ImportedKey>> {
+    /// Opens the wallet of the user with the `wallet` crate, to look at its internal structure.
+    /// The wallet service does not show in which part of the wallet a coin is, and it hands out
+    /// no key. The app must be stopped, so that only one process has the database of the wallet
+    /// open. The wallet is as the app stored it last.
+    fn open_wallet(&self) -> anyhow::Result<BMPWallet> {
         anyhow::ensure!(self.musigd.is_none(), "the app of {} runs", self.name);
-        let wallet = BMPWallet::load_wallet(
+        Ok(BMPWallet::load_wallet(
             self.wallet_dir.path().into(),
             Network::Regtest,
             &Password::check(PASSWORD)?,
-        )?;
-        Ok(wallet.imported_keys())
+        )?)
+    }
+
+    /// The unspent coins of the wallet, as the wallet itself assigns them to the seed wallet or
+    /// to the wallet of an imported key. The app must be stopped (see [`Self::open_wallet`]).
+    pub fn coins(&self) -> anyhow::Result<Coins> {
+        let mut coins = Coins::default();
+        for utxo in self.open_wallet()?.list_utxos() {
+            let amounts = if utxo.imported {
+                &mut coins.imported
+            } else {
+                &mut coins.seed
+            };
+            amounts.push(utxo.amount);
+        }
+        Ok(coins)
+    }
+
+    /// The keys that the wallet of the user has imported: the keys of the payouts of closed
+    /// trades. The app must be stopped (see [`Self::open_wallet`]).
+    pub fn imported_keys(&self) -> anyhow::Result<Vec<ImportedKey>> {
+        Ok(self.open_wallet()?.imported_keys())
     }
 
     /// The user starts the app again: a new `musigd` process on the wallet directory of the
@@ -304,61 +325,32 @@ impl User {
         })
     }
 
-    /// The addresses that the wallet has derived from its seed.
-    async fn seed_addresses(&mut self) -> anyhow::Result<HashSet<String>> {
+    /// The amount by which the transaction `tx` of the chain reduced the coins of the wallet:
+    /// the amount of the coins at addresses of the wallet that `tx` spends, less the amount of
+    /// the outputs of `tx` to addresses of the wallet. It is negative if the wallet gained. The
+    /// amount is calculated from the chain; the wallet only names its addresses. These include
+    /// the addresses of imported keys, so the payout of a closed trade counts as a coin of the
+    /// wallet.
+    pub async fn loss_by(&mut self, tx: &Transaction) -> anyhow::Result<SignedAmount> {
         let addresses = self
             .wallet
             .get_wallet_addresses(GetWalletAddressesRequest {})
             .await?
             .into_inner()
             .addresses;
-        Ok(addresses.into_iter().map(|info| info.address).collect())
-    }
-
-    /// The unspent coins of the wallet. A coin whose address is not an address of the seed of
-    /// the wallet belongs to an imported key.
-    pub async fn coins(&mut self) -> anyhow::Result<Coins> {
-        let seed_addresses = self.seed_addresses().await?;
-        let utxos = self
-            .wallet
-            .list_utxos(ListUtxosRequest {})
-            .await?
-            .into_inner()
-            .utxos;
-        let mut coins = Coins::default();
-        for utxo in utxos {
-            let at_seed_address = utxo
-                .address
-                .is_some_and(|info| seed_addresses.contains(&info.address));
-            let amounts = if at_seed_address {
-                &mut coins.seed
-            } else {
-                &mut coins.imported
-            };
-            amounts.push(Amount::from_sat(utxo.amount));
+        let mut scripts = HashSet::new();
+        for info in addresses {
+            let address = info.address.parse::<Address<_>>()?;
+            scripts.insert(address.require_network(Network::Regtest)?.script_pubkey());
         }
-        Ok(coins)
-    }
-
-    /// What the seed wallet of the user paid into the transaction `tx` of the chain: the amount
-    /// of the coins at seed addresses that `tx` spends, less the amount of the outputs of `tx`
-    /// to seed addresses. It is calculated from the chain; the wallet only names its addresses.
-    pub async fn paid_into(&mut self, tx: &Transaction) -> anyhow::Result<Amount> {
-        let mut seed_scripts = HashSet::new();
-        for address in self.seed_addresses().await? {
-            let address = address.parse::<Address<_>>()?;
-            seed_scripts.insert(address.require_network(Network::Regtest)?.script_pubkey());
-        }
-        let own_amount = |coins: &[TxOut]| -> Amount {
+        let own_amount = |coins: &[TxOut]| -> anyhow::Result<SignedAmount> {
             let own = coins
                 .iter()
-                .filter(|coin| seed_scripts.contains(&coin.script_pubkey));
-            own.map(|coin| coin.value).sum()
+                .filter(|coin| scripts.contains(&coin.script_pubkey));
+            Ok(own.map(|coin| coin.value).sum::<Amount>().to_signed()?)
         };
-        let spent = own_amount(&spent_coins(&self.node, tx)?);
-        spent
-            .checked_sub(own_amount(&tx.output))
-            .with_context(|| format!("{} gets more from the transaction than {spent}", self.name))
+        let spent = own_amount(&spent_coins(&self.node, tx)?)?;
+        Ok(spent - own_amount(&tx.output)?)
     }
 
     /// The transaction `txid` as the wallet lists it, or `None` if the wallet does not list it.

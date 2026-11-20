@@ -9,7 +9,8 @@ use crate::setup::{self, FUNDING, Setup};
 use crate::trade::{self, Terms};
 
 const TRADE_ID: &str = "bt3";
-/// Alice sells 0.1 BTC. The plan does not name the security deposits, so the test chooses them.
+/// Alice sells 0.1 BTC. The security deposits are those of the plan: 0.01 BTC of Bob, the buyer,
+/// and 0.015 BTC of Alice, the seller.
 const TERMS: Terms = Terms {
     trade_amount: Amount::from_sat(10_000_000),
     buyers_security_deposit: Amount::from_sat(1_000_000),
@@ -43,23 +44,22 @@ async fn bt3_alice_sells_bitcoin_to_bob_and_the_payouts_stay() -> anyhow::Result
     setup.alice.wait_for_balance(alices_balance).await?;
     setup.bob.wait_for_balance(bobs_balance).await?;
 
-    // Postcondition: Alice and Bob have an imported wallet. Each wallet holds the payout of its
-    // user as the one coin of an imported key.
-    assert_eq!(
-        setup.alice.coins().await?.imported,
-        [TERMS.sellers_payout()]
-    );
-    assert_eq!(setup.bob.coins().await?.imported, [TERMS.buyers_payout()]);
+    // The other postconditions concern the internal structure of the wallets, which the wallet
+    // service does not show. The test stops the `musigd` processes and reads the wallets
+    // themselves. The wallets are not closed in the regular way, which would move the payouts.
+    setup.alice.stop_app();
+    setup.bob.stop_app();
+
+    // Postcondition: Alice and Bob have an imported wallet. It holds the payout of its user as
+    // its one coin.
+    assert_eq!(setup.alice.coins()?.imported, [TERMS.sellers_payout()]);
+    assert_eq!(setup.bob.coins()?.imported, [TERMS.buyers_payout()]);
 
     // Postcondition: Alice and Bob hold the keys that spend their outputs of the trade. The
     // outputs are read from the chain: they are the outputs of the deposit transaction with the
-    // amounts of the payouts. The keys are read from the wallet directories, for which the
-    // `musigd` processes are stopped. They are not closed in the regular way, which would move
-    // the payouts.
+    // amounts of the payouts.
     let alices_output = trade::payout_output(&deposit_tx, TERMS.sellers_payout())?;
     let bobs_output = trade::payout_output(&deposit_tx, TERMS.buyers_payout())?;
-    setup.alice.stop_app();
-    setup.bob.stop_app();
     let alices_keys = setup.alice.imported_keys()?;
     let bobs_keys = setup.bob.imported_keys()?;
     let ([alices_key], [bobs_key]) = (&alices_keys[..], &bobs_keys[..]) else {

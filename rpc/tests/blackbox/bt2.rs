@@ -9,7 +9,8 @@ use crate::setup::{self, Coins, FUNDING, Setup};
 use crate::trade::{self, Terms};
 
 const TRADE_ID: &str = "bt2";
-/// Alice sells 0.1 BTC. The plan does not name the security deposits, so the test chooses them.
+/// Alice sells 0.1 BTC. The security deposits are those of the plan: 0.01 BTC of Bob, the buyer,
+/// and 0.015 BTC of Alice, the seller.
 const TERMS: Terms = Terms {
     trade_amount: Amount::from_sat(10_000_000),
     buyers_security_deposit: Amount::from_sat(1_000_000),
@@ -38,17 +39,12 @@ async fn bt2_alice_sells_bitcoin_to_bob() -> anyhow::Result<()> {
     setup::assert_small_fee(deposit_fees.sellers, "the deposit fee of Alice");
     setup::assert_small_fee(deposit_fees.buyers, "the deposit fee of Bob");
 
-    // After the trade each trader owns his payout in an output of the deposit transaction. Its
-    // key is an imported key of his wallet, not a key of the seed.
+    // After the trade each trader owns his payout in an output of the deposit transaction, and
+    // his wallet counts it.
     let alice_after_trade = FUNDING - TERMS.trade_amount - deposit_fees.sellers;
     let bob_after_trade = FUNDING + TERMS.trade_amount - deposit_fees.buyers;
     setup.alice.wait_for_balance(alice_after_trade).await?;
     setup.bob.wait_for_balance(bob_after_trade).await?;
-    assert_eq!(
-        setup.alice.coins().await?.imported,
-        [TERMS.sellers_payout()]
-    );
-    assert_eq!(setup.bob.coins().await?.imported, [TERMS.buyers_payout()]);
 
     // UC2: both close the app. Each app sends a drain transaction, which moves the payout to the
     // seed wallet. The network confirms the two transactions while the apps are closed.
@@ -72,13 +68,15 @@ async fn bt2_alice_sells_bitcoin_to_bob() -> anyhow::Result<()> {
     setup.alice.wait_for_balance(alices_balance).await?;
     setup.bob.wait_for_balance(bobs_balance).await?;
 
-    // Postcondition: all coins of Alice and of Bob are coins of the seed wallet. No coin of an
-    // imported key is left.
+    // Postcondition: all coins of Alice and of Bob are coins of the seed wallet. No coin is left
+    // in the wallet of an imported key. The wallet service does not show in which part of a
+    // wallet a coin is, so the test stops the apps and reads the wallets themselves.
     for (user, balance) in [
         (&mut setup.alice, alices_balance),
         (&mut setup.bob, bobs_balance),
     ] {
-        let Coins { seed, imported } = user.coins().await?;
+        user.stop_app();
+        let Coins { seed, imported } = user.coins()?;
         assert_eq!(imported, [], "no coin of an imported key is left");
         assert_eq!(seed.into_iter().sum::<Amount>(), balance);
     }

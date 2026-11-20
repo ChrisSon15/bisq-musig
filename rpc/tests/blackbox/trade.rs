@@ -37,11 +37,6 @@ pub struct Terms {
 }
 
 impl Terms {
-    /// The amount that the seller pays into the deposit transaction.
-    pub fn sellers_part(&self) -> Amount {
-        self.trade_amount + self.sellers_security_deposit
-    }
-
     /// The amount of the output of the deposit transaction that the buyer owns after a
     /// cooperative close.
     pub fn buyers_payout(&self) -> Amount {
@@ -233,24 +228,28 @@ pub async fn set_up_and_confirm_deposit(
     Ok(deposit_tx)
 }
 
-/// Calculates from the chain which part of the fee of the deposit transaction each trader paid:
-/// what his seed wallet paid into the transaction, less his part of the deposit. Fails if the
-/// two parts are not the fee of the transaction.
+/// Calculates from the chain which part of the fee of the deposit transaction each trader paid.
+/// The trade must be closed cooperatively: each trader then owns his payout output of the
+/// deposit transaction. Without a fee, the deposit transaction would reduce the coins of the
+/// seller by the trade amount and raise the coins of the buyer by the trade amount. What a trader
+/// lost beyond that is his part of the fee. Fails if the two parts are not the fee of the
+/// transaction.
 pub async fn deposit_fees(
     seller: &mut User,
     buyer: &mut User,
     deposit_tx: &Transaction,
     terms: &Terms,
 ) -> anyhow::Result<DepositFees> {
-    let sellers = seller.paid_into(deposit_tx).await?;
-    let buyers = buyer.paid_into(deposit_tx).await?;
+    let trade_amount = terms.trade_amount.to_signed()?;
+    let sellers = seller.loss_by(deposit_tx).await? - trade_amount;
+    let buyers = buyer.loss_by(deposit_tx).await? + trade_amount;
     let fees = DepositFees {
         sellers: sellers
-            .checked_sub(terms.sellers_part())
-            .context("the seller paid less than his part of the deposit")?,
+            .to_unsigned()
+            .context("the seller lost less than the trade amount")?,
         buyers: buyers
-            .checked_sub(terms.buyers_security_deposit)
-            .context("the buyer paid less than his security deposit")?,
+            .to_unsigned()
+            .context("the buyer gained more than the trade amount")?,
     };
     let fee = setup::fee(&buyer.node, deposit_tx)?;
     anyhow::ensure!(
