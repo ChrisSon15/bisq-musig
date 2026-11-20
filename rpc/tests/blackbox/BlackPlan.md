@@ -38,6 +38,11 @@ Alice gets 0.15 BTC, Bob gets 0.05 BTC, both minus their fees.
 Alice and Bob are doing a trade. Alice as Maker sells Bitcoin worth 0.2 BTC to Bob.
 After successfully making the DepositTx, Alice stops responding.
 
+### UC6: trade redirect
+
+Alice and Bob are doing a trade. Alice as Maker sells Bitcoin worth 0.2 BTC to Bob.
+After successfully making the DepositTx, Bob issues the warning transaction. Then Alice issues the Redirect transaction.
+
 ## Tests
 
 Tests run on regtest.
@@ -138,6 +143,35 @@ Test UC6.
 Postconditions:
 
 - check that Bob sent the WarningTx and ClaimTx
-- check that Bob has 2 BTC in his wallet minus fees.
+- check that Bob has 1.215 BTC in his wallet minus fees.
 - check that warning time blocks+ claim lock time has passed since the DepositTx.
 
+Defects found (not fixed)
+
+The first BT6 version used the default lock times and mined each lock time in one call, as the plan suggests.
+
+1. The chain client can stop following the chain. After several hundred blocks at once, the compact block filter client
+   of musigd stayed below the chain tip in two runs, without an error and without a
+   reconnect. The claim was never sent. The cause is not established; my hypothesis is a race in the filter library when
+   the tip moves during a sync. Whether this can happen on a real network is not
+   checked.
+2. Requests then get no response. The wallet sync keeps the wallet locked while it waits, without a time limit, for the
+   chain client to reach the tip. Every trade and wallet request waits for that
+   lock. In one run SubscribeTradeEvents hung for 10 minutes and I had to stop the test by hand. This cause is confirmed
+   from the code.
+
+### BT7: trade redirect
+
+Preconditions
+
+- setup
+- Alice as maker and Bob as taker, and security deposits of 0.01 BTC (Bob) and 0.015 BTC (Alice).
+- fee shall be 10sats/vbyte
+
+Test UC7.
+
+Postconditions:
+
+- check that Bob sent the WarningTx and Alice has sent the RedirectTx.
+- check that Bob has 0.99 BTC in his wallet minus fees.
+- check that Alice has 0.78 BTC in his wallet minus fees.
