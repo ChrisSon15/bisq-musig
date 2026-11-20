@@ -19,9 +19,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bdk_kyoto::bip157::chain::{BlockHeaderChanges, ChainState};
+use bdk_kyoto::bip157::client::EventReceiver;
 use bdk_kyoto::bip157::{Builder, Event, Network, Package, ServiceFlags};
 pub use bdk_kyoto::{HashCheckpoint, TrustedPeer};
-use bdk_kyoto::{Info, Receiver, Requester, UnboundedReceiver, Warning};
+use bdk_kyoto::{Info, Receiver, Requester, Warning};
 use bdk_wallet::bitcoin::{Block, BlockHash, OutPoint, ScriptBuf, Transaction, Txid};
 use tokio::sync::broadcast;
 
@@ -987,7 +988,7 @@ async fn run_connections(shared: Arc<Shared>) {
 /// Writes the messages of a connection to the log and keeps the problem with the peers.
 async fn log_and_track_peers(
     mut info_rx: Receiver<Info>,
-    mut warn_rx: UnboundedReceiver<Warning>,
+    mut warn_rx: Receiver<Warning>,
     requester: Requester,
     shared: Arc<Shared>,
 ) {
@@ -1008,11 +1009,6 @@ async fn log_and_track_peers(
                         shared.set_problem(PeerProblem::NoCompactFilters);
                     }
                 }
-                Some(Info::Progress(progress)) => tracing::debug!(
-                    chain_height = progress.chain_height(),
-                    percent = progress.percentage_complete(),
-                    "Filter download progress."
-                ),
                 Some(info) => tracing::debug!("{info}"),
                 None => break,
             },
@@ -1034,11 +1030,7 @@ async fn log_and_track_peers(
 
 /// Follows the events of a connection until it ends: header changes, filters and the end of a
 /// filter scan.
-async fn process_events(
-    mut event_rx: UnboundedReceiver<Event>,
-    requester: &Requester,
-    shared: &Shared,
-) {
+async fn process_events(mut event_rx: EventReceiver, requester: &Requester, shared: &Shared) {
     // The blocks whose filter matched a watched script, with their height.
     let mut matched_blocks: Vec<(u32, BlockHash)> = Vec::new();
     while let Some(event) = event_rx.recv().await {

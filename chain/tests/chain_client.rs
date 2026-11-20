@@ -180,6 +180,58 @@ async fn finds_payments_spends_and_confirmations() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The client follows many blocks that arrive in quick succession while it is connected. The
+/// blocks are mined on a second node with one call. The node of the client gets them from that
+/// node one after the other, so the client sees a chain tip that moves for some time. The client
+/// reaches the new chain tip after every such burst.
+///
+/// This failed with `bdk_kyoto` 0.17.0, which used the version 0.6.3 of the library `bip157`:
+/// in the first burst the connection of the library stopped for good, without an error, and the
+/// client stayed below the chain tip. The cause was a deadlock between the node task and the
+/// peer task of the library. The library removed it in its version 0.8.0.
+#[tokio::test(flavor = "multi_thread")]
+async fn follows_bursts_of_blocks() -> anyhow::Result<()> {
+    const ROUNDS: u32 = 4;
+    const BLOCKS_PER_ROUND: usize = 1000;
+    let mut miner = test_env()?;
+    // The node of the client is a peer of the mining node.
+    let add_node = format!(
+        "-addnode={}",
+        miner.p2p_socket_addr().expect("peer address")
+    );
+    let mut config = Config::default();
+    config.bitcoind.args.push(&add_node);
+    // The mining node holds the lock by which test environments run one after the other.
+    config.runmultithreaded = true;
+    let env = TestEnv::new_with_conf(config)?;
+    let client = start_client(&env);
+
+    for round in 0..=ROUNDS {
+        // Round 0 waits for the blocks that the mining node has from the start.
+        if round > 0 {
+            miner.mine_blocks(BLOCKS_PER_ROUND)?;
+        }
+        let tip = miner.best_block_hash()?;
+        eventually("the node of the client has the blocks", || {
+            env.best_block_hash().is_ok_and(|hash| hash == tip)
+        })
+        .await;
+        let height = u32::try_from(env.block_count()?)?;
+        let synced = tokio::time::timeout(TIMEOUT, client.wait_until_synced_to(height)).await;
+        let Ok(synced) = synced else {
+            panic!(
+                "burst {round} of {ROUNDS}: the client is at height {:?} of {height}, {} \
+                 seconds after its node had all blocks",
+                client.synced_height(),
+                TIMEOUT.as_secs()
+            );
+        };
+        synced?;
+    }
+    client.shutdown()?;
+    Ok(())
+}
+
 /// The client reports a reorganisation, forgets the transactions of the replaced blocks, and
 /// finds them again when a new block contains them.
 #[tokio::test(flavor = "multi_thread")]
