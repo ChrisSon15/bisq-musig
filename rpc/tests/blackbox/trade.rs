@@ -1,19 +1,19 @@
 //! The parts of a trade that only the blackbox tests need: the trade of Alice and Bob up to the
-//! confirmed deposit, and the checks of its results on the chain and in the wallets. The steps of
-//! the trade protocol are in [`crate::common::trade`].
+//! confirmed deposit, and the checks of the results on the chain and in the wallets. The steps
+//! of the trade protocol are in [`crate::common::trade`].
 
 use anyhow::Context as _;
 use bdk_wallet::bitcoin::key::{Keypair, Secp256k1, TapTweak as _};
 use bdk_wallet::bitcoin::secp256k1::Message;
-use bdk_wallet::bitcoin::{Amount, Transaction, TxOut, XOnlyPublicKey};
+use bdk_wallet::bitcoin::{Amount, OutPoint, SignedAmount, Transaction, TxOut, XOnlyPublicKey};
 use futures_util::StreamExt as _;
 use protocol::params::MIN_CONFIRMATIONS;
 use rpc::pb::musigrpc::{ClosureKind, TradeStateKind};
 use wallet::bmp_wallet::ImportedKey;
 
-use crate::common::musigd::WAIT;
+use crate::common::musigd::{WAIT, wait_for};
 use crate::common::trade::{self, DepositConfirmations};
-pub use crate::common::trade::{Terms, close_cooperatively};
+pub use crate::common::trade::{Terms, close_cooperatively, close_request, release, start_payment};
 use crate::setup::{self, Setup, User};
 
 impl Terms {
@@ -34,6 +34,17 @@ impl Terms {
 pub struct DepositFees {
     pub sellers: Amount,
     pub buyers: Amount,
+}
+
+/// Whether the wallets of the traders count the two payout outputs of the deposit transaction as
+/// their coins. A wallet counts the payout of its user from the moment at which it holds the key
+/// of the output.
+#[derive(Clone, Copy)]
+pub enum Payouts {
+    /// Each trader holds the key of his payout: the trade is closed cooperatively.
+    Owned,
+    /// No trader holds the key of his payout: no key share was handed over.
+    NotOwned,
 }
 
 /// Alice and Bob set up a trade in which Alice is the seller and Bob is the buyer. Bob publishes
@@ -60,27 +71,33 @@ pub async fn set_up_and_confirm_deposit(
 }
 
 /// Calculates from the chain which part of the fee of the deposit transaction each trader paid.
-/// The trade must be closed cooperatively: each trader then owns his payout output of the
-/// deposit transaction. Without a fee, the deposit transaction would reduce the coins of the
-/// seller by the trade amount and raise the coins of the buyer by the trade amount. What a trader
-/// lost beyond that is his part of the fee. Fails if the two parts are not the fee of the
-/// transaction.
+/// `payouts` tells whether the wallets count the payout outputs at this moment. Without a fee,
+/// the deposit transaction would reduce the coins of a wallet by what the trader paid in, less
+/// his payout if the wallet counts it: the seller paid the trade amount and his security deposit,
+/// and the buyer paid his security deposit. What a trader lost beyond that is his part of the
+/// fee. Fails if the two parts are not the fee of the transaction.
 pub async fn deposit_fees(
     seller: &mut User,
     buyer: &mut User,
     deposit_tx: &Transaction,
     terms: &Terms,
+    payouts: Payouts,
 ) -> anyhow::Result<DepositFees> {
-    let trade_amount = terms.trade_amount.to_signed()?;
-    let sellers = seller.loss_by(deposit_tx).await? - trade_amount;
-    let buyers = buyer.loss_by(deposit_tx).await? + trade_amount;
+    let mut sellers_stake = (terms.trade_amount + terms.sellers_security_deposit).to_signed()?;
+    let mut buyers_stake = terms.buyers_security_deposit.to_signed()?;
+    if matches!(payouts, Payouts::Owned) {
+        sellers_stake -= terms.sellers_payout().to_signed()?;
+        buyers_stake -= terms.buyers_payout().to_signed()?;
+    }
+    let sellers = seller.loss_by(deposit_tx).await? - sellers_stake;
+    let buyers = buyer.loss_by(deposit_tx).await? - buyers_stake;
     let fees = DepositFees {
         sellers: sellers
             .to_unsigned()
-            .context("the seller lost less than the trade amount")?,
+            .context("the seller lost less than he paid into the deposit")?,
         buyers: buyers
             .to_unsigned()
-            .context("the buyer gained more than the trade amount")?,
+            .context("the buyer lost less than he paid into the deposit")?,
     };
     let fee = setup::fee(&buyer.node, deposit_tx)?;
     anyhow::ensure!(
@@ -121,19 +138,44 @@ pub async fn closure(user: &mut User, trade_id: &str) -> anyhow::Result<Option<C
     Ok((state.state() == TradeStateKind::TradeClosed).then(|| state.closure_type()))
 }
 
-/// The output of the deposit transaction that pays `amount`, which is the amount of a payout.
-/// Fails unless exactly one output pays this amount.
-pub fn payout_output(deposit_tx: &Transaction, amount: Amount) -> anyhow::Result<&TxOut> {
-    let mut outputs = deposit_tx
-        .output
-        .iter()
-        .filter(|output| output.value == amount);
+/// Waits until the app of `user` reports that the trade is closed in the way `closure`.
+pub async fn wait_for_closure(
+    user: &mut User,
+    trade_id: &str,
+    closure: ClosureKind,
+) -> anyhow::Result<()> {
+    let what = format!("the trade {trade_id} is closed as {closure:?}");
+    wait_for(&what, async || {
+        Ok((self::closure(user, trade_id).await? == Some(closure)).then_some(()))
+    })
+    .await
+}
+
+/// The output of the deposit transaction that pays `amount`, which is the amount of a payout,
+/// with its position on the chain. Fails unless exactly one output pays this amount.
+pub fn payout_output(
+    deposit_tx: &Transaction,
+    amount: Amount,
+) -> anyhow::Result<(OutPoint, &TxOut)> {
+    let mut outputs = (0..)
+        .zip(&deposit_tx.output)
+        .filter(|(_, output)| output.value == amount);
     let output = outputs.next();
     anyhow::ensure!(
         outputs.next().is_none(),
         "more than one output of the deposit transaction pays {amount}"
     );
-    output.with_context(|| format!("no output of the deposit transaction pays {amount}"))
+    let (vout, output) =
+        output.with_context(|| format!("no output of the deposit transaction pays {amount}"))?;
+    Ok((OutPoint::new(deposit_tx.compute_txid(), vout), output))
+}
+
+/// The amount that the transaction `tx` of the chain added to the coins of the wallet of `user`.
+/// Fails if the transaction reduced them.
+pub async fn gain_by(user: &mut User, tx: &Transaction) -> anyhow::Result<Amount> {
+    let gain: SignedAmount = -user.loss_by(tx).await?;
+    gain.to_unsigned()
+        .context("the transaction reduced the coins of the wallet")
 }
 
 /// Proves that `key` can spend the Taproot output `output` of the chain. A message of 32 random

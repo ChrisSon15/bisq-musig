@@ -6,7 +6,7 @@ use bdk_wallet::bitcoin::Amount;
 use rpc::pb::musigrpc::ClosureKind;
 
 use crate::setup::{self, FUNDING, Setup};
-use crate::trade::{self, Terms};
+use crate::trade::{self, Payouts, Terms};
 
 const TRADE_ID: &str = "bt3";
 /// Alice sells 0.1 BTC. The security deposits are those of the plan: 0.01 BTC of Bob, the buyer,
@@ -36,8 +36,8 @@ async fn bt3_alice_sells_bitcoin_to_bob_and_the_payouts_stay() -> anyhow::Result
     // Postcondition: Bob has 0.1 BTC more and Alice has 0.1 BTC less, minus the fees. The only
     // transaction of the trade is the deposit transaction. The part of its fee that each trader
     // paid is calculated from the chain.
-    let deposit_fees =
-        trade::deposit_fees(&mut setup.alice, &mut setup.bob, &deposit_tx, &TERMS).await?;
+    let (alice, bob) = (&mut setup.alice, &mut setup.bob);
+    let deposit_fees = trade::deposit_fees(alice, bob, &deposit_tx, &TERMS, Payouts::Owned).await?;
     setup::assert_small_fee(deposit_fees.sellers, "the deposit fee of Alice");
     setup::assert_small_fee(deposit_fees.buyers, "the deposit fee of Bob");
     let alices_balance = FUNDING - TERMS.trade_amount - deposit_fees.sellers;
@@ -59,8 +59,8 @@ async fn bt3_alice_sells_bitcoin_to_bob_and_the_payouts_stay() -> anyhow::Result
     // Postcondition: Alice and Bob hold the keys that spend their outputs of the trade. The
     // outputs are read from the chain: they are the outputs of the deposit transaction with the
     // amounts of the payouts.
-    let alices_output = trade::payout_output(&deposit_tx, TERMS.sellers_payout())?;
-    let bobs_output = trade::payout_output(&deposit_tx, TERMS.buyers_payout())?;
+    let (_, alices_output) = trade::payout_output(&deposit_tx, TERMS.sellers_payout())?;
+    let (_, bobs_output) = trade::payout_output(&deposit_tx, TERMS.buyers_payout())?;
     let alices_keys = setup.alice.imported_keys()?;
     let bobs_keys = setup.bob.imported_keys()?;
     let ([alices_key], [bobs_key]) = (&alices_keys[..], &bobs_keys[..]) else {

@@ -6,7 +6,7 @@ use bdk_wallet::bitcoin::Amount;
 use rpc::pb::musigrpc::ClosureKind;
 
 use crate::setup::{self, Coins, FUNDING, Setup};
-use crate::trade::{self, Terms};
+use crate::trade::{self, Payouts, Terms};
 
 const TRADE_ID: &str = "bt2";
 /// Alice sells 0.1 BTC. The security deposits are those of the plan: 0.01 BTC of Bob, the buyer,
@@ -35,8 +35,8 @@ async fn bt2_alice_sells_bitcoin_to_bob() -> anyhow::Result<()> {
 
     // Each trader paid his part of the deposit and a part of the fee of the deposit
     // transaction. The parts of the fee are calculated from the chain.
-    let deposit_fees =
-        trade::deposit_fees(&mut setup.alice, &mut setup.bob, &deposit_tx, &TERMS).await?;
+    let (alice, bob) = (&mut setup.alice, &mut setup.bob);
+    let deposit_fees = trade::deposit_fees(alice, bob, &deposit_tx, &TERMS, Payouts::Owned).await?;
     setup::assert_small_fee(deposit_fees.sellers, "the deposit fee of Alice");
     setup::assert_small_fee(deposit_fees.buyers, "the deposit fee of Bob");
 
