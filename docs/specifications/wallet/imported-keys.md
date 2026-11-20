@@ -13,6 +13,13 @@ protection after a close are in
 3. **An imported key is unique.** A second import of the same key is refused.
 4. **The import is the last step of the close.** If it fails, the trade is not closed, and the
    close can be repeated.
+5. **The address of an imported key is an address of the wallet.** The list of the addresses of
+   the wallet (`GetWalletAddresses`) contains it, after the addresses of the seed. It stays in
+   the list after its coin is spent.
+
+Rule 5 is a decision of the project owner of 2026-11-20. Consequence: the list contains the
+address of every coin that the wallet reports. A caller cannot tell from the list whether an
+address belongs to the seed or to an imported key.
 
 ## Start of the scan
 

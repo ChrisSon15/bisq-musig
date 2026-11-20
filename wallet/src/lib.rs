@@ -2254,6 +2254,47 @@ mod tests {
         Ok(())
     }
 
+    /// The address of an imported key is an address of the wallet, also after the wallet was
+    /// loaded again.
+    #[test]
+    fn list_wallet_addresses_contains_the_addresses_of_imported_keys() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(
+            mem_storage.store.clone(),
+            &test_password(),
+            Network::Regtest,
+        )?;
+        let seed_address = wallet.get_new_address()?.address;
+
+        // One key with scripts, as the payout of a trade has them, and one key without.
+        let (a, b) = (
+            derive_public_key(&new_private_key()),
+            derive_public_key(&new_private_key()),
+        );
+        wallet.import_private_key(new_private_key(), Some(sample_tap_tree(&a, &b)))?;
+        wallet.import_private_key(new_private_key(), None)?;
+        let mut imported_addresses = wallet
+            .imported_keys()
+            .iter()
+            .map(|key| Address::from_script(&key.script_pubkey(), Network::Regtest))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(imported_addresses.len(), 2);
+
+        let listed = |wallet: &BMPWallet| {
+            let addresses = wallet.list_wallet_addresses().into_iter();
+            addresses.map(|info| info.address).collect::<Vec<_>>()
+        };
+        // The address of the seed comes first, and then the imported addresses in the order of
+        // their scripts, which is the order of `imported_keys`.
+        imported_addresses.insert(0, seed_address);
+        assert_eq!(listed(&wallet), imported_addresses);
+
+        drop(wallet);
+        let wallet = BMPWallet::load_wallet(mem_storage.store, Network::Regtest, &test_password())?;
+        assert_eq!(listed(&wallet), imported_addresses);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn send_to_address_builds_a_fully_signed_tx() -> anyhow::Result<()> {
         let mem_storage = MemDbHandle::new()?;

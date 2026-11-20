@@ -53,6 +53,9 @@ service Wallet {
     // that call would open an existing wallet or create a new one (see `IsWalletReadyResponse`).
     rpc IsWalletReady (IsWalletReadyRequest) returns (IsWalletReadyResponse);
     rpc GetUnusedAddress (GetUnusedAddressRequest) returns (GetUnusedAddressResponse);
+    // All addresses of the wallet: the addresses that the wallet has derived from its seed, and
+    // the addresses of the imported keys, which are the payout outputs of closed trades. So the
+    // list contains the address of every output that ListUtxos reports.
     rpc GetWalletAddresses (GetWalletAddressesRequest) returns (GetWalletAddressesResponse);
     rpc ListTransactions (ListTransactionsRequest) returns (ListTransactionsResponse);
     rpc ListUtxos (ListUtxosRequest) returns (ListUtxosResponse);

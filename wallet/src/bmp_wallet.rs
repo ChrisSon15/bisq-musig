@@ -508,9 +508,14 @@ impl BMPWallet {
         self.imported_balance() + self.wallet.balance()
     }
 
-    /// Every address revealed so far on either keychain, external first.
+    /// Every address of the wallet: the addresses revealed so far on either keychain of the
+    /// seed, external first, and then the addresses of the imported keys.
+    ///
+    /// With the imported keys the list contains the address of every coin that [`Self::list_utxos`]
+    /// reports. The imported addresses are in the order of their scripts, so that the order does
+    /// not change between two calls.
     pub fn list_wallet_addresses(&self) -> Vec<PubAddressInfo> {
-        [KeychainKind::External, KeychainKind::Internal]
+        let seed_addresses = [KeychainKind::External, KeychainKind::Internal]
             .into_iter()
             .flat_map(|kind| {
                 // `derivation_index` is `None` until the keychain has revealed anything, in
@@ -523,8 +528,13 @@ impl BMPWallet {
                             address: self.wallet.peek_address(kind, index).address,
                         })
                     })
-            })
-            .collect()
+            });
+        let mut imported_scripts = self.imported_keys.keys().collect::<Vec<_>>();
+        imported_scripts.sort_unstable();
+        let imported_addresses = imported_scripts
+            .into_iter()
+            .filter_map(|script_pubkey| self.address_for_script(script_pubkey));
+        seed_addresses.chain(imported_addresses).collect()
     }
 
     /// The imported key controlling `script_pubkey`, if any.
