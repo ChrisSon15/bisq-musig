@@ -33,6 +33,11 @@ Alice and Bob are doing a trade. Alice sells Bitcoin worth 0.2 BTC to Bob.
 Alice and Bob agree on a custom payout instead of closing the trade normally.
 Alice gets 0.15 BTC, Bob gets 0.05 BTC, both minus their fees.
 
+### UC6: trade claim
+
+Alice and Bob are doing a trade. Alice as Maker sells Bitcoin worth 0.2 BTC to Bob.
+After successfully making the DepositTx, Alice stops responding.
+
 ## Tests
 
 Tests run on regtest.
@@ -119,3 +124,20 @@ Postconditions:
 
 - check that Alice has 0.95 BTC in the wallet and Bob 1.05 BTC minus fees.
 - check that the right amounts are on chain, read the CustomPayoutTx and check the outputs. 
+
+### BT6: trade claim
+
+Preconditions
+
+- setup
+- Alice as maker and Bob as taker, and security deposits of 0.01 BTC (Bob) and 0.015 BTC (Alice).
+- fee shall be 10sats/vbyte
+
+Test UC6.
+
+Postconditions:
+
+- check that Bob sent the WarningTx and ClaimTx
+- check that Bob has 2 BTC in his wallet minus fees.
+- check that warning time blocks+ claim lock time has passed since the DepositTx.
+
