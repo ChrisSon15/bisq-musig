@@ -6,21 +6,23 @@ use anyhow::Context as _;
 use bdk_wallet::bitcoin::key::{Keypair, Secp256k1, TapTweak as _};
 use bdk_wallet::bitcoin::secp256k1::Message;
 use bdk_wallet::bitcoin::{
-    Amount, FeeRate, OutPoint, SignedAmount, Transaction, TxOut, XOnlyPublicKey, consensus,
+    Amount, FeeRate, OutPoint, SignedAmount, Transaction, TxOut, Txid, XOnlyPublicKey, consensus,
 };
 use futures_util::StreamExt as _;
 use protocol::params::MIN_CONFIRMATIONS;
 use rpc::pb::musigrpc::musig_client::MusigClient;
 use rpc::pb::musigrpc::{
-    ClosureKind, CustomCloseTradeRequest, CustomPayoutPsbt, CustomPayoutPsbtRequest, TradeStateKind,
+    ClosureKind, CustomCloseTradeRequest, CustomPayoutPsbt, CustomPayoutPsbtRequest,
+    PublishWarningTxRequest, TradeEvent, TradeEventType, TradeStateKind, TradeTxKind,
 };
+use tonic::Streaming;
 use tonic::transport::Channel;
 use wallet::bmp_wallet::ImportedKey;
 
 use crate::common::musigd::{WAIT, wait_for};
 use crate::common::trade::{self, DepositConfirmations};
 pub use crate::common::trade::{
-    FEE_RATE, Terms, close_cooperatively, close_request, release, start_payment,
+    FEE_RATE, Terms, close_cooperatively, close_request, release, start_payment, trade_events,
 };
 use crate::setup::{self, Setup, User};
 
@@ -216,6 +218,63 @@ pub async fn finalise_custom_payout(
     };
     let response = musig.custom_close_trade(request).await?.into_inner();
     Ok(consensus::deserialize(&response.custom_payout_tx)?)
+}
+
+/// Waits until the app of `user` has seen the block at `height`. The events of a trade report
+/// the height of the chain as the app sees it.
+pub async fn wait_for_height(user: &mut User, trade_id: &str, height: u64) -> anyhow::Result<()> {
+    let what = format!("the app has seen the block {height}");
+    wait_for(&what, async || {
+        let state = trade::trade_state(&mut user.musig, trade_id).await?;
+        Ok((u64::from(state.current_block_height) >= height).then_some(()))
+    })
+    .await
+}
+
+/// Mines blocks until the chain has the height `height`. The blocks are mined one after the
+/// other, and the app of Bob evaluates each block before the next one is mined.
+///
+/// The blocks are not mined at once, because the apps do not follow a chain that grows by many
+/// blocks within a moment: their connection to the chain can stop then, which also stops their
+/// answers to requests.
+pub async fn mine_to_height(setup: &mut Setup, trade_id: &str, height: u64) -> anyhow::Result<()> {
+    while setup.height()? < height {
+        setup.mine_block().await?;
+        let mined = setup.height()?;
+        wait_for_height(&mut setup.bob, trade_id, mined).await?;
+    }
+    Ok(())
+}
+
+/// The trader asks his app to publish his warning transaction. Returns the transaction. The
+/// request fails while the warning lock time has not passed.
+pub async fn publish_warning(
+    musig: &mut MusigClient<Channel>,
+    trade_id: &str,
+) -> anyhow::Result<Transaction> {
+    let request = PublishWarningTxRequest {
+        trade_id: trade_id.to_owned(),
+    };
+    let response = musig.publish_warning_tx(request).await?.into_inner();
+    Ok(consensus::deserialize(&response.warning_tx)?)
+}
+
+/// Waits until the event stream `events` of a trade reports that the app sent a transaction of
+/// the kind `kind` to the network. Returns the ID of the transaction.
+pub async fn wait_for_sent(
+    events: &mut Streaming<TradeEvent>,
+    kind: TradeTxKind,
+) -> anyhow::Result<Txid> {
+    loop {
+        let event = tokio::time::timeout(WAIT, events.next())
+            .await
+            .with_context(|| format!("the app does not report that it sent the {kind:?}"))?
+            .context("the event stream of the trade ended")??;
+        if event.r#type() == TradeEventType::TxSent && event.tx_kind() == kind {
+            let txid = event.tx_id.context("the event names no transaction")?;
+            return Ok(txid.parse()?);
+        }
+    }
 }
 
 /// Proves that `key` can spend the Taproot output `output` of the chain. A message of 32 random

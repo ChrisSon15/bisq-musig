@@ -65,6 +65,9 @@ pub struct User {
     // ends before its wallet directory is deleted and before its node stops.
     /// `None` while the app is closed. The two clients do not work then.
     musigd: Option<MusigdProcess>,
+    /// Configuration values of the trade engine of the app, as environment variables of every
+    /// `musigd` process of the user.
+    config: Vec<(&'static str, String)>,
     wallet_dir: tempfile::TempDir,
     /// The Bitcoin node of the user.
     pub node: TestEnv,
@@ -73,22 +76,24 @@ pub struct User {
 impl User {
     /// Starts a `musigd` process for the user `name` on a wallet directory, opens the wallet,
     /// which creates it if the directory is empty, and waits until the wallet has synced with
-    /// `node`. `first` tells whether this is the first process of the user in the test.
+    /// `node`. `config` holds configuration values of the trade engine; without them the engine
+    /// runs with its default configuration. `first` tells whether this is the first process of
+    /// the user in the test.
     async fn launch(
         name: &str,
         wallet_dir: &Path,
         node: &TestEnv,
+        config: &[(&str, String)],
         first: bool,
     ) -> anyhow::Result<App> {
         let peer = node
             .p2p_socket_addr()
             .context("the node has no peer port")?;
-        // The trade engine runs with its default configuration.
         let mut app = App::start(&Launch {
             trader: name,
             wallet_dir,
             peer,
-            config: &[],
+            config,
             first,
         })
         .await?;
@@ -101,14 +106,19 @@ impl User {
     }
 
     /// Starts the app of the user `name` with a new wallet in a new directory.
-    async fn start(name: &'static str, node: TestEnv) -> anyhow::Result<Self> {
+    async fn start(
+        name: &'static str,
+        node: TestEnv,
+        config: Vec<(&'static str, String)>,
+    ) -> anyhow::Result<Self> {
         let wallet_dir = tempfile::tempdir()?;
-        let app = Self::launch(name, wallet_dir.path(), &node, true).await?;
+        let app = Self::launch(name, wallet_dir.path(), &node, &config, true).await?;
         Ok(Self {
             name,
             wallet: app.wallet,
             musig: app.musig,
             musigd: Some(app.process),
+            config,
             wallet_dir,
             node,
         })
@@ -171,7 +181,8 @@ impl User {
     /// user.
     pub async fn open_app(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(self.musigd.is_none(), "the app of {} runs", self.name);
-        let app = Self::launch(self.name, self.wallet_dir.path(), &self.node, false).await?;
+        let (wallet_dir, config) = (self.wallet_dir.path(), &self.config);
+        let app = Self::launch(self.name, wallet_dir, &self.node, config, false).await?;
         self.wallet = app.wallet;
         self.musig = app.musig;
         self.musigd = Some(app.process);
@@ -271,8 +282,15 @@ pub struct Setup {
 }
 
 impl Setup {
-    /// Starts the two nodes and the two `musigd` processes, and funds both wallets.
+    /// Starts the two nodes and the two `musigd` processes, and funds both wallets. The trade
+    /// engines of the apps run with their default configuration.
     pub async fn new() -> anyhow::Result<Self> {
+        Self::with_config(&[]).await
+    }
+
+    /// As [`Self::new`], with configuration values for the trade engines of both apps. The
+    /// values are environment variables of the `musigd` processes.
+    pub async fn with_config(config: &[(&'static str, String)]) -> anyhow::Result<Self> {
         let mut alices_node = TestEnv::new()?;
         let bobs_node = start_peer_node(&alices_node)?;
         // The coins of the test come from the block rewards of the node of Alice. A reward can
@@ -282,8 +300,8 @@ impl Setup {
         wait_for_tip(&bobs_node, tip).await?;
 
         let mut setup = Self {
-            alice: User::start("Alice", alices_node).await?,
-            bob: User::start("Bob", bobs_node).await?,
+            alice: User::start("Alice", alices_node, config.to_vec()).await?,
+            bob: User::start("Bob", bobs_node, config.to_vec()).await?,
         };
         for address in [
             setup.alice.new_address().await?,
@@ -304,6 +322,24 @@ impl Setup {
         let hash = self.alice.node.mine_block()?;
         wait_for_tip(&self.bob.node, hash).await?;
         Ok(self.bob.node.bitcoind_client().get_block(hash)?)
+    }
+
+    /// The height of the last block of the chain.
+    pub fn height(&self) -> anyhow::Result<u64> {
+        self.bob.node.block_count()
+    }
+
+    /// The height of the block that contains the transaction `txid`. The blocks are searched from
+    /// the last block of the chain backwards.
+    pub fn height_of(&self, txid: Txid) -> anyhow::Result<u64> {
+        let node = &self.bob.node;
+        for height in (0..=self.height()?).rev() {
+            let block = node.bitcoind_client().get_block(node.block_hash(height)?)?;
+            if block.txdata.iter().any(|tx| tx.compute_txid() == txid) {
+                return Ok(height);
+            }
+        }
+        anyhow::bail!("no block contains the transaction {txid}")
     }
 
     /// Waits until both nodes hold the unconfirmed transactions `txids`, and mines one block.
