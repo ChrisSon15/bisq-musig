@@ -27,6 +27,10 @@ use crate::common::musigd::{self, App, Launch, MusigdProcess, PASSWORD, wait_for
 
 /// The amount that each wallet holds after the setup.
 pub const FUNDING: Amount = Amount::ONE_BTC;
+/// The lock times of the apps in the tests of the dispute path, in blocks (see
+/// [`Setup::with_short_lock_times`]).
+pub const WARNING_LOCK_TIME: u16 = 20;
+pub const CLAIM_LOCK_TIME: u16 = 10;
 /// The upper limit of a fee that a test accepts: small compared to the amounts of the use cases.
 /// The apps choose the fees, so a test knows only a limit for them.
 const FEE_LIMIT: Amount = Amount::from_sat(10_000);
@@ -288,9 +292,24 @@ impl Setup {
         Self::with_config(&[]).await
     }
 
+    /// As [`Self::new`], with the lock times [`WARNING_LOCK_TIME`] and [`CLAIM_LOCK_TIME`] for
+    /// both apps. They are shorter than the defaults of 1440 and 720 blocks, so that a test of
+    /// the dispute path mines some 30 blocks and not 2160. The blocks must be mined one after
+    /// the other (see `trade::mine_to_height`), which takes too long for the defaults.
+    pub async fn with_short_lock_times() -> anyhow::Result<Self> {
+        Self::with_config(&[
+            (
+                "BISQ_MUSIG_WARNING_LOCK_TIME",
+                WARNING_LOCK_TIME.to_string(),
+            ),
+            ("BISQ_MUSIG_CLAIM_LOCK_TIME", CLAIM_LOCK_TIME.to_string()),
+        ])
+        .await
+    }
+
     /// As [`Self::new`], with configuration values for the trade engines of both apps. The
     /// values are environment variables of the `musigd` processes.
-    pub async fn with_config(config: &[(&'static str, String)]) -> anyhow::Result<Self> {
+    async fn with_config(config: &[(&'static str, String)]) -> anyhow::Result<Self> {
         let mut alices_node = TestEnv::new()?;
         let bobs_node = start_peer_node(&alices_node)?;
         // The coins of the test come from the block rewards of the node of Alice. A reward can

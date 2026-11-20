@@ -6,7 +6,8 @@ use anyhow::Context as _;
 use bdk_wallet::bitcoin::key::{Keypair, Secp256k1, TapTweak as _};
 use bdk_wallet::bitcoin::secp256k1::Message;
 use bdk_wallet::bitcoin::{
-    Amount, FeeRate, OutPoint, SignedAmount, Transaction, TxOut, Txid, XOnlyPublicKey, consensus,
+    Amount, FeeRate, OutPoint, Sequence, SignedAmount, Transaction, TxOut, Txid, XOnlyPublicKey,
+    consensus,
 };
 use futures_util::StreamExt as _;
 use protocol::params::MIN_CONFIRMATIONS;
@@ -24,7 +25,7 @@ use crate::common::trade::{self, DepositConfirmations};
 pub use crate::common::trade::{
     FEE_RATE, Terms, close_cooperatively, close_request, release, start_payment, trade_events,
 };
-use crate::setup::{self, Setup, User};
+use crate::setup::{self, Setup, User, WARNING_LOCK_TIME};
 
 impl Terms {
     /// The amount of the output of the deposit transaction that the buyer owns after a
@@ -257,6 +258,71 @@ pub async fn publish_warning(
     };
     let response = musig.publish_warning_tx(request).await?.into_inner();
     Ok(consensus::deserialize(&response.warning_tx)?)
+}
+
+/// The warning transaction of Bob in a block of the chain.
+pub struct ConfirmedWarning {
+    pub tx: Transaction,
+    /// The height of the block that contains the transaction.
+    pub height: u64,
+    pub fee: Amount,
+}
+
+/// Bob, the buyer, publishes his warning transaction. Blocks are mined until the deposit
+/// transaction `deposit_tx` has as many confirmations as the warning lock time, so that the next
+/// block can contain the warning transaction. Then Bob asks his app to publish the transaction,
+/// and it is confirmed.
+///
+/// Checks that Bob sent the warning transaction: his app reports it, and the transaction of the
+/// chain is the one that his app returned. It spends the two payout outputs of the deposit
+/// transaction, each with the warning lock time, and it pays its second output, the anchor, to
+/// the wallet of Bob.
+pub async fn bob_publishes_warning(
+    setup: &mut Setup,
+    trade_id: &str,
+    deposit_tx: &Transaction,
+    terms: &Terms,
+) -> anyhow::Result<ConfirmedWarning> {
+    let deposit_height = setup.height_of(deposit_tx.compute_txid())?;
+    let warning_valid_after = deposit_height + u64::from(WARNING_LOCK_TIME) - 1;
+    mine_to_height(setup, trade_id, warning_valid_after).await?;
+
+    let mut bobs_events = trade_events(&mut setup.bob.musig, trade_id).await?;
+    let bobs_warning_tx = publish_warning(&mut setup.bob.musig, trade_id).await?;
+    let warning_txid = wait_for_sent(&mut bobs_events, TradeTxKind::WarningTx).await?;
+    assert_eq!(warning_txid, bobs_warning_tx.compute_txid());
+    let bobs_state = trade::trade_state(&mut setup.bob.musig, trade_id).await?;
+    assert_eq!(bobs_state.state(), TradeStateKind::BuyersWarning);
+    let warning_tx = setup.mine(&[warning_txid]).await?.remove(0);
+    let height = setup.height()?;
+
+    assert_eq!(warning_tx, bobs_warning_tx);
+    let (bobs_payout, _) = payout_output(deposit_tx, terms.buyers_payout())?;
+    let (alices_payout, _) = payout_output(deposit_tx, terms.sellers_payout())?;
+    let spent: Vec<_> = warning_tx
+        .input
+        .iter()
+        .map(|input| (input.previous_output, input.sequence))
+        .collect();
+    let lock_time = Sequence::from_height(WARNING_LOCK_TIME);
+    assert_eq!(
+        spent,
+        [(bobs_payout, lock_time), (alices_payout, lock_time)]
+    );
+    let [_escrow, anchor] = &warning_tx.output[..] else {
+        panic!(
+            "the warning transaction has {} outputs",
+            warning_tx.output.len()
+        );
+    };
+    assert_eq!(gain_by(&mut setup.bob, &warning_tx).await?, anchor.value);
+    let fee = setup::fee(&setup.bob.node, &warning_tx)?;
+    setup::assert_small_fee(fee, "the fee of the warning transaction");
+    Ok(ConfirmedWarning {
+        tx: warning_tx,
+        height,
+        fee,
+    })
 }
 
 /// Waits until the event stream `events` of a trade reports that the app sent a transaction of

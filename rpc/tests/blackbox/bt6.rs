@@ -5,10 +5,9 @@
 
 use bdk_wallet::bitcoin::{Amount, OutPoint, Sequence};
 use protocol::params::MIN_CONFIRMATIONS;
-use rpc::pb::musigrpc::{ClosureKind, TradeStateKind, TradeTxKind};
+use rpc::pb::musigrpc::{ClosureKind, TradeTxKind};
 
-use crate::common::trade::trade_state;
-use crate::setup::{self, FUNDING, Setup};
+use crate::setup::{self, CLAIM_LOCK_TIME, FUNDING, Setup, WARNING_LOCK_TIME};
 use crate::trade::{self, Payouts, Terms};
 
 const TRADE_ID: &str = "bt6";
@@ -19,30 +18,15 @@ const TERMS: Terms = Terms {
     buyers_security_deposit: Amount::from_sat(1_000_000),
     sellers_security_deposit: Amount::from_sat(1_500_000),
 };
-/// The lock times of both apps, in blocks. They are shorter than the defaults of 1440 and 720
-/// blocks, so that the test mines 30 blocks and not 2160. The blocks must be mined one after the
-/// other (see [`trade::mine_to_height`]), which takes too long for the defaults.
-const WARNING_LOCK_TIME: u16 = 20;
-const CLAIM_LOCK_TIME: u16 = 10;
-
 #[tokio::test(flavor = "multi_thread")]
 async fn bt6_alice_stops_responding_and_bob_claims() -> anyhow::Result<()> {
     // Precondition: both wallets hold 1 BTC.
-    let mut setup = Setup::with_config(&[
-        (
-            "BISQ_MUSIG_WARNING_LOCK_TIME",
-            WARNING_LOCK_TIME.to_string(),
-        ),
-        ("BISQ_MUSIG_CLAIM_LOCK_TIME", CLAIM_LOCK_TIME.to_string()),
-    ])
-    .await?;
+    let mut setup = Setup::with_short_lock_times().await?;
 
     // UC6: the trade. Alice is the seller and Bob is the buyer. They set up the trade, and Bob
     // publishes the deposit transaction. The fee rate of the trade is 10 sat per vbyte.
     let deposit_tx = trade::set_up_and_confirm_deposit(&mut setup, TRADE_ID, &TERMS).await?;
     let deposit_height = setup.height_of(deposit_tx.compute_txid())?;
-    let (bobs_payout, _) = trade::payout_output(&deposit_tx, TERMS.buyers_payout())?;
-    let (alices_payout, _) = trade::payout_output(&deposit_tx, TERMS.sellers_payout())?;
     // No trader holds the key of a payout. Each trader paid his part of the deposit and a part of
     // the fee of the deposit transaction. The parts of the fee are calculated from the chain.
     let (alice, bob) = (&mut setup.alice, &mut setup.bob);
@@ -60,52 +44,12 @@ async fn bt6_alice_stops_responding_and_bob_claims() -> anyhow::Result<()> {
     let too_early = trade::publish_warning(&mut setup.bob.musig, TRADE_ID).await;
     assert!(too_early.is_err(), "the warning lock time has not passed");
 
-    // The warning lock time passes: blocks are mined until the deposit transaction has as many
-    // confirmations as the warning lock time. The next block can contain the warning
-    // transaction.
-    let warning_valid_after = deposit_height + u64::from(WARNING_LOCK_TIME) - 1;
-    trade::mine_to_height(&mut setup, TRADE_ID, warning_valid_after).await?;
-
-    // Bob asks his app to publish his warning transaction, and the app sends it.
+    // Postcondition: Bob sent the warning transaction. He asks his app for it when the warning
+    // lock time has passed.
     let mut bobs_events = trade::trade_events(&mut setup.bob.musig, TRADE_ID).await?;
-    let bobs_warning_tx = trade::publish_warning(&mut setup.bob.musig, TRADE_ID).await?;
-    let warning_txid = trade::wait_for_sent(&mut bobs_events, TradeTxKind::WarningTx).await?;
-    assert_eq!(warning_txid, bobs_warning_tx.compute_txid());
-    let bobs_state = trade_state(&mut setup.bob.musig, TRADE_ID).await?;
-    assert_eq!(bobs_state.state(), TradeStateKind::BuyersWarning);
-    let warning_tx = setup.mine(&[warning_txid]).await?.remove(0);
-    let warning_height = setup.height()?;
-
-    // Postcondition: Bob sent the warning transaction. The transaction of the chain is the one
-    // that the app of Bob returned. It spends the two payout outputs of the deposit transaction,
-    // each with the warning lock time, and it pays its second output, the anchor, to the wallet
-    // of Bob.
-    assert_eq!(warning_tx, bobs_warning_tx);
-    let spent: Vec<_> = warning_tx
-        .input
-        .iter()
-        .map(|input| (input.previous_output, input.sequence))
-        .collect();
-    let warning_lock_time = Sequence::from_height(WARNING_LOCK_TIME);
-    assert_eq!(
-        spent,
-        [
-            (bobs_payout, warning_lock_time),
-            (alices_payout, warning_lock_time)
-        ]
-    );
-    let [escrow, anchor] = &warning_tx.output[..] else {
-        panic!(
-            "the warning transaction has {} outputs",
-            warning_tx.output.len()
-        );
-    };
-    assert_eq!(
-        trade::gain_by(&mut setup.bob, &warning_tx).await?,
-        anchor.value
-    );
-    let warning_fee = setup::fee(&setup.bob.node, &warning_tx)?;
-    setup::assert_small_fee(warning_fee, "the fee of the warning transaction");
+    let warning = trade::bob_publishes_warning(&mut setup, TRADE_ID, &deposit_tx, &TERMS).await?;
+    let (warning_tx, warning_height, warning_fee) = (warning.tx, warning.height, warning.fee);
+    let escrow = &warning_tx.output[0];
 
     // The claim lock time passes: blocks are mined until the warning transaction has as many
     // confirmations as the claim lock time. Then the app of Bob sends the claim transaction on
