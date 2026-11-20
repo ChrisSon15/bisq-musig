@@ -1,19 +1,27 @@
 //! The parts of a trade that only the blackbox tests need: the trade of Alice and Bob up to the
-//! confirmed deposit, and the checks of the results on the chain and in the wallets. The steps
-//! of the trade protocol are in [`crate::common::trade`].
+//! confirmed deposit, the steps of a custom payout, and the checks of the results on the chain
+//! and in the wallets. The other steps of the trade protocol are in [`crate::common::trade`].
 
 use anyhow::Context as _;
 use bdk_wallet::bitcoin::key::{Keypair, Secp256k1, TapTweak as _};
 use bdk_wallet::bitcoin::secp256k1::Message;
-use bdk_wallet::bitcoin::{Amount, OutPoint, SignedAmount, Transaction, TxOut, XOnlyPublicKey};
+use bdk_wallet::bitcoin::{
+    Amount, FeeRate, OutPoint, SignedAmount, Transaction, TxOut, XOnlyPublicKey, consensus,
+};
 use futures_util::StreamExt as _;
 use protocol::params::MIN_CONFIRMATIONS;
-use rpc::pb::musigrpc::{ClosureKind, TradeStateKind};
+use rpc::pb::musigrpc::musig_client::MusigClient;
+use rpc::pb::musigrpc::{
+    ClosureKind, CustomCloseTradeRequest, CustomPayoutPsbt, CustomPayoutPsbtRequest, TradeStateKind,
+};
+use tonic::transport::Channel;
 use wallet::bmp_wallet::ImportedKey;
 
 use crate::common::musigd::{WAIT, wait_for};
 use crate::common::trade::{self, DepositConfirmations};
-pub use crate::common::trade::{Terms, close_cooperatively, close_request, release, start_payment};
+pub use crate::common::trade::{
+    FEE_RATE, Terms, close_cooperatively, close_request, release, start_payment,
+};
 use crate::setup::{self, Setup, User};
 
 impl Terms {
@@ -176,6 +184,38 @@ pub async fn gain_by(user: &mut User, tx: &Transaction) -> anyhow::Result<Amount
     let gain: SignedAmount = -user.loss_by(tx).await?;
     gain.to_unsigned()
         .context("the transaction reduced the coins of the wallet")
+}
+
+/// Step 1 of a custom payout: the trader signs the custom payout transaction that gives the
+/// seller `sellers_amount` before the fee. Returns the transaction with the signatures of the
+/// trader, its ID and the amounts of its two outputs.
+pub async fn sign_custom_payout(
+    musig: &mut MusigClient<Channel>,
+    trade_id: &str,
+    sellers_amount: Amount,
+    fee_rate: FeeRate,
+) -> anyhow::Result<CustomPayoutPsbt> {
+    let request = CustomPayoutPsbtRequest {
+        trade_id: trade_id.to_owned(),
+        sellers_payout_amount_excluding_fee: sellers_amount.to_sat(),
+        fee_rate: fee_rate.to_sat_per_kwu(),
+    };
+    Ok(musig.sign_custom_payout_tx(request).await?.into_inner())
+}
+
+/// Step 2 of a custom payout: the trader completes the transaction with the signatures of the
+/// peer, and his app publishes it. Returns the complete transaction.
+pub async fn finalise_custom_payout(
+    musig: &mut MusigClient<Channel>,
+    trade_id: &str,
+    peers_psbt: &CustomPayoutPsbt,
+) -> anyhow::Result<Transaction> {
+    let request = CustomCloseTradeRequest {
+        trade_id: trade_id.to_owned(),
+        peers_custom_payout_psbt: peers_psbt.psbt.clone(),
+    };
+    let response = musig.custom_close_trade(request).await?.into_inner();
+    Ok(consensus::deserialize(&response.custom_payout_tx)?)
 }
 
 /// Proves that `key` can spend the Taproot output `output` of the chain. A message of 32 random
