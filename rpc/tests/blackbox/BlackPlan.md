@@ -27,6 +27,12 @@ Alice and Bob are doing a trade. Alice sells Bitcoin worth 0.1 BTC to Bob.
 Alice and Bob are doing a trade. Alice sells Bitcoin worth 0.1 BTC to Bob.
 Alice uses the SwapTx.
 
+### UC5: custom trade
+
+Alice and Bob are doing a trade. Alice sells Bitcoin worth 0.2 BTC to Bob.
+Alice and Bob agree on a custom payout instead of closing the trade normally.
+Alice gets 0.15 BTC, Bob gets 0.05 BTC, both minus their fees.
+
 ## Tests
 
 Tests run on regtest.
@@ -98,3 +104,18 @@ Postconditions:
 - Check that Bob has 0.1 BTC more in the wallet and Alice less, minus the fees.
 - show that the adaptor signature was used to retrieve the private key for Bobs trade output. prove that that found key
   is actually the private key for his trade output.
+
+### BT5: custom payout
+
+Preconditions
+
+- setup
+- Alice as maker and Bob as taker, and security deposits of 0.01 BTC (Bob) and 0.015 BTC (Alice).
+- fee shall be 10sats/vbyte
+
+Test UC5.
+
+Postconditions:
+
+- check that Alice has 0.95 BTC in the wallet and Bob 1.05 BTC minus fees.
+- check that the right amounts are on chain, read the CustomPayoutTx and check the outputs. 
