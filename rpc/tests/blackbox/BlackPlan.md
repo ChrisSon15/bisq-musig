@@ -18,6 +18,11 @@ Alice sends Bob 0.1 BTC
 Alice and Bob are doing a trade. Alice sells Bitcoin worth 0.1 BTC to Bob.
 After the trade they both close the app.
 
+### UC3: happy trade with no wallet close
+
+Alice and Bob are doing a trade. Alice sells Bitcoin worth 0.1 BTC to Bob.
+After the trade they both close the app.
+
 ## Tests
 
 Tests run on regtest.
@@ -50,4 +55,17 @@ Postconditions:
 
 - Check that all coins of Alica and Bob are under the HD Wallet (their main wallet, nothing left in imported walet(s)).
 - Check that Bob has 0.1 BTC more in the wallet and Alice less, minus the fees.
+
+### BT3: happy trade no walelt close
+
+Precondition: setup
+
+Test UC2.
+
+Postconditions:
+
+- Check that Bob has 0.1 BTC more in the wallet and Alice less, minus the fees.
+- Cheeck that Alice and Bob have an imported wallet
+- make sure Alice and Bob have the key to spend the output of the trade outputs by signing a (random) message with the
+  key and profing the signatures correctness with the pubkey read from the blockchain.
 
