@@ -164,6 +164,11 @@ The host and port can be overridden with `-Dwallet.host=...` / `-Dwallet.port=..
 The Rust tests in `rpc/tests/test_musigd.rs` start real `musigd` processes. With the directory `MUSIGD_TEST_LOG_DIR` in
 the environment, every process writes its log at debug level to a file in that directory.
 
+The blackbox tests in `rpc/tests/blackbox/` play use cases of two users, Alice and Bob. Each user has an own Bitcoin
+node and an own `musigd` process, and the two nodes are peers of each other. The plan of these tests is
+`rpc/tests/blackbox/BlackPlan.md`. Run them with `cargo test -p rpc --test blackbox`. They write the logs of the
+`musigd` processes to `MUSIGD_TEST_LOG_DIR` in the same way, in files named after the user.
+
 The Java integration tests (`mvn verify`) are:
 
 - `BmpWalletServiceIntegrationTest` — funds and spends a `BMPWallet` through the `wallet.Wallet` service. Needs a running
