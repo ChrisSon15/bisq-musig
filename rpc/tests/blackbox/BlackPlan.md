@@ -37,7 +37,17 @@ Test UC1.
 
 Postcondition:
 Check that the transaction was mined
-Check if Alice has 0.1 less in her wallet.
+Check if Alice has 0.1 and the fees less in her wallet.
 Check if Bob has 0.1 BTC more in his wallet.
 
+### BT2: happy trade straight forward
+
+Precondition: setup
+
+Test UC2.
+
+Postconditions:
+
+- Check that all coins of Alica and Bob are under the HD Wallet (their main wallet, nothing left in imported walet(s)).
+- Check that Bob has 0.1 BTC more in the wallet and Alice less, minus the fees.
 
