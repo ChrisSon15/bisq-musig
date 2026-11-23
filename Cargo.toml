@@ -25,7 +25,7 @@ secp = "0.7.0"
 tempfile = "3.27.0"
 testenv = { path = "testenv" }
 thiserror = "2.0.19"
-tokio = "1.53.1"
+tokio = "1.54.1"
 tokio-stream = "0.1.19"
 tracing = "0.1.44"
 tracing-core = { version = "0.1.36", default-features = false }
