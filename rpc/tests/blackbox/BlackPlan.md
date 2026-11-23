@@ -155,11 +155,6 @@ Defects found (not fixed)
 
 The first BT6 version used the default lock times and mined each lock time in one call, as the plan suggests.
 
-1. The chain client can stop following the chain. After several hundred blocks at once, the compact block filter client
-   of musigd stayed below the chain tip in two runs, without an error and without a
-   reconnect. The claim was never sent. The cause is not established; my hypothesis is a race in the filter library when
-   the tip moves during a sync. Whether this can happen on a real network is not
-   checked.
 2. Requests then get no response. The wallet sync keeps the wallet locked while it waits, without a time limit, for the
    chain client to reach the tip. Every trade and wallet request waits for that
    lock. In one run SubscribeTradeEvents hung for 10 minutes and I had to stop the test by hand. This cause is confirmed
