@@ -935,6 +935,11 @@ Done:
   every open pull request. This is a decision for the project owner.
 - `.github/workflows/nightly.yml`: once a day the test suite at thread counts 32 to 1
   (`test-runner.sh`) and the audit of the dependencies.
+- On 2026-11-23 the audit job was turned off in both workflows (`if: false`), by decision of
+  the project owner: the project is not used in production yet, and the job failed on advisories
+  for which no patched version can be reached (`zip` 0.6.6 through `corepc-node`,
+  `libsqlite3-sys` 0.28.0 through `bdk_chain`). The job must be turned on again before the
+  first release. Until then `cargo audit` is run by hand.
 
 Not done:
 
